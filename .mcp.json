@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "reservoir": {
+      "command": "/Users/v/other/neural-triple-reservoir/.venv/bin/python",
+      "args": ["/Users/v/other/neural-triple-reservoir/mcp_reservoir.py"]
+    }
+  }
+}
