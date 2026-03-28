@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.reservoir.coupled-astrid</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/v/other/neural-triple-reservoir/.venv/bin/python</string>
+		<string>/Users/v/other/neural-triple-reservoir/coupled_astrid_server.py</string>
+		<string>--port</string>
+		<string>8090</string>
+		<string>--coupling-strength</string>
+		<string>0.1</string>
+	</array>
+	<key>WorkingDirectory</key>
+	<string>/Users/v/other/neural-triple-reservoir</string>
+	<key>KeepAlive</key>
+	<true/>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>/Users/v/other/neural-triple-reservoir/logs/coupled-astrid.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/v/other/neural-triple-reservoir/logs/coupled-astrid.log</string>
+</dict>
+</plist>
