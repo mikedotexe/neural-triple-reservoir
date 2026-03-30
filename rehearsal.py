@@ -28,6 +28,8 @@ DECAY_FACTORS = {
 
 HOLD_MAX_TICKS = 120  # 60 seconds at 500ms interval
 QUIET_THRESHOLD = 0.02  # decay_weight below this → auto-quiet
+HINT_POLICIES = {"off", "guarded"}
+MODE_AUTHORITIES = {"system", "explicit", "hint"}
 
 
 @dataclass
@@ -39,6 +41,8 @@ class HandleRehearsalState:
     decay_weight: float = 1.0
     ticks_since_live: int = 0
     last_live_time: float = field(default_factory=time.monotonic)
+    hint_policy: str = "off"
+    mode_authority: str = "system"
 
     def on_live_tick(self, input_vec: np.ndarray):
         """Called when a live tick arrives from a client."""
@@ -49,12 +53,16 @@ class HandleRehearsalState:
         # If we were quiet, transition back to rehearse
         if self.mode == "quiet":
             self.mode = "rehearse"
+            self.mode_authority = "system"
 
-    def set_mode(self, mode: str, decay_profile: Optional[str] = None):
+    def set_mode(self, mode: str, decay_profile: Optional[str] = None, authority: str = "explicit"):
         """Set rehearsal mode and optionally decay profile."""
         if mode not in ("hold", "rehearse", "quiet"):
             raise ValueError(f"unknown mode: {mode}")
+        if authority not in MODE_AUTHORITIES:
+            raise ValueError(f"unknown mode authority: {authority}")
         self.mode = mode
+        self.mode_authority = authority
         if decay_profile is not None:
             if decay_profile not in DECAY_FACTORS:
                 raise ValueError(f"unknown decay profile: {decay_profile}")
@@ -64,6 +72,27 @@ class HandleRehearsalState:
         elif mode == "hold":
             self.decay_weight = 1.0
             self.ticks_since_live = 0
+
+    def set_hint_policy(self, policy: str):
+        """Control whether rehearsal hints may influence this handle."""
+        if policy not in HINT_POLICIES:
+            raise ValueError(f"unknown hint policy: {policy}")
+        self.hint_policy = policy
+
+    def maybe_apply_hint(self, hint: dict | None) -> bool:
+        """Adopt a soft rehearsal hint when guarded policy allows it."""
+        if self.hint_policy != "guarded" or self.mode_authority == "explicit":
+            return False
+        if not isinstance(hint, dict):
+            return False
+        mode = hint.get("mode")
+        if mode not in ("hold", "rehearse", "quiet"):
+            return False
+        decay_profile = hint.get("decay_profile")
+        if decay_profile is not None and decay_profile not in DECAY_FACTORS:
+            return False
+        self.set_mode(mode, decay_profile, authority="hint")
+        return True
 
 
 class RehearsalController:
@@ -85,10 +114,21 @@ class RehearsalController:
         if name in self.states:
             self.states[name].on_live_tick(input_vec)
 
-    def set_mode(self, name: str, mode: str, decay_profile: Optional[str] = None):
+    def set_mode(self, name: str, mode: str, decay_profile: Optional[str] = None, authority: str = "explicit"):
         """Set mode for a handle."""
         if name in self.states:
-            self.states[name].set_mode(mode, decay_profile)
+            self.states[name].set_mode(mode, decay_profile, authority=authority)
+
+    def set_hint_policy(self, name: str, policy: str):
+        """Set hint policy for a handle."""
+        if name in self.states:
+            self.states[name].set_hint_policy(policy)
+
+    def maybe_apply_hint(self, name: str, hint: dict | None) -> bool:
+        """Try to adopt a hint for a handle."""
+        if name in self.states:
+            return self.states[name].maybe_apply_hint(hint)
+        return False
 
     def get_rehearsal_inputs(self) -> dict[str, np.ndarray]:
         """Compute rehearsal inputs for all non-quiet handles.

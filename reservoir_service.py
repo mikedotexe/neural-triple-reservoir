@@ -40,8 +40,9 @@ logging.basicConfig(
 log = logging.getLogger("reservoir")
 
 RING_SIZE = 64  # Keep last 64 outputs and h-norms per handle
+PROVENANCE_SIZE = 6  # Keep last 6 shaping-input metadata events per handle
 REHEARSAL_INTERVAL = 0.5  # seconds between rehearsal ticks
-AUTO_SNAPSHOT_INTERVAL = 300  # seconds between auto-snapshots
+AUTO_SNAPSHOT_INTERVAL = 60  # seconds between auto-snapshots (was 300; reduced for power-loss resilience)
 
 
 @dataclass
@@ -53,6 +54,229 @@ class HandleInfo:
     last_tick_time: float = 0.0
     output_ring: deque = field(default_factory=lambda: deque(maxlen=RING_SIZE))
     h_norm_ring: deque = field(default_factory=lambda: deque(maxlen=RING_SIZE))
+    thermostats: list = field(default_factory=list)  # 3 LayerThermostat instances
+    last_live_meta: dict = field(default_factory=dict)
+    provenance_ring: deque = field(default_factory=lambda: deque(maxlen=PROVENANCE_SIZE))
+
+
+# ---------------------------------------------------------------------------
+# Per-layer thermostatic controller
+# ---------------------------------------------------------------------------
+# Validated by thermostatic ESN experiment (Mackey-Glass, 8 seeds):
+#   cool regime: no degradation | hot regime: 7% NRMSE improvement
+# Controller: delta = k_H*(H_target - H) - k_S*max(0, S - S_target)
+
+LAYER_NAMES = ("h1_fast", "h2_medium", "h3_slow")
+LAYER_CONFIGS = [
+    # (k_entropy, k_sat, sat_target, rho_min, rho_max, control_interval)
+    (0.06, 0.35, 0.15, 0.88, 1.0, 20),   # h1: fast — aggressive, wide range
+    (0.04, 0.35, 0.12, 0.92, 1.0, 20),   # h2: medium — moderate
+    (0.03, 0.35, 0.10, 0.95, 1.0, 20),   # h3: slow — gentle, narrow range
+]
+
+
+class LayerThermostat:
+    """Entropy-targeted homeostatic controller for one reservoir layer.
+
+    Maintains a buffer of recent h_i states, computes spectral entropy
+    and saturation, and adapts a per-layer rho (decay/forgetting factor).
+
+    The entropy target is learned from the first N ticks (cool regime),
+    not hand-picked. The saturation guard prevents the controller from
+    heating an already saturated layer.
+    """
+
+    def __init__(
+        self,
+        layer_id: int,
+        n_nodes: int = 192,
+        k_entropy: float = 0.05,
+        k_sat: float = 0.35,
+        sat_target: float = 0.12,
+        rho_min: float = 0.90,
+        rho_max: float = 1.0,
+        buffer_size: int = 200,
+        control_interval: int = 20,
+        warmup_ticks: int = 500,
+    ):
+        self.layer_id = layer_id
+        self.layer_name = LAYER_NAMES[layer_id] if layer_id < len(LAYER_NAMES) else f"h{layer_id}"
+        self.n_nodes = n_nodes
+        self.k_entropy = k_entropy
+        self.k_sat = k_sat
+        self.sat_target = sat_target
+        self.rho_min = rho_min
+        self.rho_max = rho_max
+        self.buffer = deque(maxlen=buffer_size)
+        self.control_interval = control_interval
+        self.warmup_ticks = warmup_ticks
+        self.tick = 0
+        self.entropy_target = None  # learned from cool regime
+        self.rho = (rho_min + rho_max) / 2  # start at midpoint
+        self.last_entropy = float("nan")
+        self.last_saturation = float("nan")
+        self._warmup_entropies = []
+
+    def step(self, h_i: np.ndarray) -> float:
+        """Record layer state, compute metrics, adapt rho. Returns current rho."""
+        self.buffer.append(h_i.ravel().copy())
+        self.tick += 1
+
+        if self.tick % self.control_interval != 0:
+            return self.rho
+
+        H = self._entropy()
+        S = self._saturation()
+        self.last_entropy = H
+        self.last_saturation = S
+
+        # Learn entropy target from warmup period (cool regime)
+        if self.entropy_target is None:
+            if np.isfinite(H):
+                self._warmup_entropies.append(H)
+            if self.tick >= self.warmup_ticks and self._warmup_entropies:
+                self.entropy_target = float(np.median(self._warmup_entropies))
+                log.info(
+                    "thermostat %s: learned H_target=%.4f from %d samples",
+                    self.layer_name, self.entropy_target, len(self._warmup_entropies),
+                )
+                self._warmup_entropies = []  # free memory
+
+        # Adapt rho
+        if self.entropy_target is not None and np.isfinite(H):
+            delta = self.k_entropy * (self.entropy_target - H)
+            delta -= self.k_sat * max(0.0, S - self.sat_target)
+            self.rho = float(np.clip(self.rho + delta, self.rho_min, self.rho_max))
+
+        return self.rho
+
+    def _entropy(self) -> float:
+        """Normalized spectral entropy of recent states."""
+        if len(self.buffer) < max(32, len(self.buffer) // 3):
+            return float("nan")
+        X = np.asarray(self.buffer)
+        X = X - X.mean(axis=0, keepdims=True)
+        C = X.T @ X
+        evals = np.linalg.eigvalsh(C)
+        evals = evals[evals > 1e-12]
+        if evals.size <= 1:
+            return 0.0
+        p = evals / evals.sum()
+        return float(-np.sum(p * np.log(p)) / np.log(evals.size))
+
+    def _saturation(self) -> float:
+        """Fraction of neurons near tanh saturation (|h| > 0.97)."""
+        if not self.buffer:
+            return float("nan")
+        recent = np.asarray(list(self.buffer)[-min(32, len(self.buffer)):])
+        return float(np.mean(np.abs(recent) > 0.97))
+
+    def metrics(self) -> dict:
+        """Current metrics for this layer."""
+        return {
+            "id": self.layer_id,
+            "name": self.layer_name,
+            "entropy": round(self.last_entropy, 4) if np.isfinite(self.last_entropy) else None,
+            "entropy_target": round(self.entropy_target, 4) if self.entropy_target else None,
+            "saturation": round(self.last_saturation, 4) if np.isfinite(self.last_saturation) else None,
+            "rho": round(self.rho, 4),
+            "tick": self.tick,
+        }
+
+    def state_dict(self) -> dict:
+        """Serializable state for persistence."""
+        return {
+            "entropy_target": self.entropy_target,
+            "rho": self.rho,
+            "tick": self.tick,
+            "last_entropy": self.last_entropy if np.isfinite(self.last_entropy) else None,
+            "last_saturation": self.last_saturation if np.isfinite(self.last_saturation) else None,
+        }
+
+    def load_state_dict(self, d: dict):
+        """Restore from persistence."""
+        if d.get("entropy_target") is not None:
+            self.entropy_target = d["entropy_target"]
+        if d.get("rho") is not None:
+            self.rho = d["rho"]
+        if d.get("tick") is not None:
+            self.tick = d["tick"]
+
+
+def make_thermostats(n_nodes: int = 192) -> list[LayerThermostat]:
+    """Create 3 thermostats with per-layer tuning."""
+    return [
+        LayerThermostat(
+            layer_id=i, n_nodes=n_nodes,
+            k_entropy=cfg[0], k_sat=cfg[1], sat_target=cfg[2],
+            rho_min=cfg[3], rho_max=cfg[4], control_interval=cfg[5],
+        )
+        for i, cfg in enumerate(LAYER_CONFIGS)
+    ]
+
+
+def sanitize_meta(value, depth: int = 0):
+    """Convert feeder/client metadata into JSON-safe, bounded structures."""
+    if depth > 3:
+        return None
+    if value is None or isinstance(value, (str, bool)):
+        return value
+    if isinstance(value, (int, np.integer)):
+        return int(value)
+    if isinstance(value, (float, np.floating)):
+        value = float(value)
+        return value if np.isfinite(value) else None
+    if isinstance(value, dict):
+        out = {}
+        for k, v in list(value.items())[:24]:
+            sv = sanitize_meta(v, depth + 1)
+            if sv is not None:
+                out[str(k)] = sv
+        return out
+    if isinstance(value, (list, tuple)):
+        out = []
+        for item in list(value)[:24]:
+            sv = sanitize_meta(item, depth + 1)
+            if sv is not None:
+                out.append(sv)
+        return out
+    return str(value)
+
+
+def extract_rehearsal_hint(meta: dict | None) -> dict | None:
+    """Pull the soft rehearsal hint out of metadata, if present."""
+    if not isinstance(meta, dict):
+        return None
+    hint = meta.get("rehearsal_hint")
+    return hint if isinstance(hint, dict) else None
+
+
+def build_provenance_entry(info: HandleInfo, meta: dict, output: float) -> dict:
+    """Store a compact recent history of shaping inputs for a handle."""
+    entry = {
+        "tick": info.tick_count,
+        "time": round(time.time(), 3),
+        "output": round(float(output), 6),
+    }
+    for key in (
+        "source",
+        "from_handle",
+        "input_source",
+        "projection",
+        "conditioning",
+        "memory_role",
+        "memory_blend",
+        "selected_memory_id",
+        "fill_pct",
+        "lambda1_rel",
+        "contact_gate",
+    ):
+        if key in meta:
+            entry[key] = meta[key]
+    hint = extract_rehearsal_hint(meta)
+    if hint is not None:
+        entry["rehearsal_hint"] = hint
+    return entry
 
 
 class ReservoirService:
@@ -83,10 +307,13 @@ class ReservoirService:
         if self.bridge.has_handle(name):
             raise ValueError(f"handle '{name}' already exists")
         self.bridge.make_state(name)
-        info = HandleInfo(name=name, entity=entity)
+        info = HandleInfo(
+            name=name, entity=entity,
+            thermostats=make_thermostats(self.config.n_nodes),
+        )
         self.handles[name] = info
         self.rehearsal.register(name, mode="quiet", decay_profile="medium")
-        log.info("created handle '%s' (entity=%s)", name, entity)
+        log.info("created handle '%s' (entity=%s, 3 thermostats)", name, entity)
         return info
 
     def destroy_handle(self, name: str):
@@ -107,7 +334,7 @@ class ReservoirService:
     # Tick
     # ------------------------------------------------------------------
 
-    def tick(self, name: str, input_vec: np.ndarray) -> dict:
+    def tick(self, name: str, input_vec: np.ndarray, meta: Optional[dict] = None) -> dict:
         """Feed one input vector, return result dict."""
         info = self._require_handle(name)
         output = self.bridge.tick(name, input_vec)
@@ -117,11 +344,28 @@ class ReservoirService:
         info.last_tick_time = time.monotonic()
         info.output_ring.append(output)
         info.h_norm_ring.append(norms)
+        info.last_live_meta = sanitize_meta(meta or {}) or {}
+        if info.last_live_meta:
+            info.provenance_ring.append(build_provenance_entry(info, info.last_live_meta, output))
+
+        # Feed per-layer states to thermostats
+        if info.thermostats and self.bridge.has_handle(name):
+            try:
+                h1, h2, h3 = self.bridge.get_layer_states(name)
+                for thermostat, h_i in zip(info.thermostats, [h1, h2, h3]):
+                    thermostat.step(h_i)
+            except Exception:
+                pass  # graceful degradation if layer access fails
 
         # Notify rehearsal controller of live input
         self.rehearsal.on_live_tick(name, input_vec.ravel())
 
         rs = self.rehearsal.get_state(name)
+        hint = extract_rehearsal_hint(info.last_live_meta)
+        hint_applied = False
+        if hint is not None:
+            hint_applied = self.rehearsal.maybe_apply_hint(name, hint)
+            rs = self.rehearsal.get_state(name)
         return {
             "type": "tick_response",
             "name": name,
@@ -129,12 +373,17 @@ class ReservoirService:
             "h_norms": list(norms),
             "tick": info.tick_count,
             "mode": rs.mode if rs else "unknown",
+            "mode_authority": rs.mode_authority if rs else "system",
+            "hint_policy": rs.hint_policy if rs else "off",
+            "last_live_meta": info.last_live_meta,
+            "rehearsal_hint": hint,
+            "hint_applied": hint_applied,
         }
 
     def tick_text(self, name: str, text: str) -> dict:
         """Project text to 32D and tick."""
         vec = self.text_proj(text)
-        return self.tick(name, vec)
+        return self.tick(name, vec, meta={"source": "tick_text", "text_length": len(text)})
 
     # ------------------------------------------------------------------
     # Read / trajectory / resonance
@@ -146,6 +395,7 @@ class ReservoirService:
         rs = self.rehearsal.get_state(name)
         last_output = info.output_ring[-1] if info.output_ring else None
         elapsed = time.monotonic() - info.last_tick_time if info.last_tick_time > 0 else None
+        hint = extract_rehearsal_hint(info.last_live_meta)
         return {
             "type": "read_state_response",
             "name": name,
@@ -154,9 +404,14 @@ class ReservoirService:
             "last_output": last_output,
             "tick_count": info.tick_count,
             "mode": rs.mode if rs else "unknown",
+            "mode_authority": rs.mode_authority if rs else "system",
+            "hint_policy": rs.hint_policy if rs else "off",
             "decay_weight": rs.decay_weight if rs else 0.0,
             "decay_profile": rs.decay_profile if rs else "medium",
             "seconds_since_live": round(elapsed, 2) if elapsed is not None else None,
+            "last_live_meta": info.last_live_meta,
+            "provenance": list(info.provenance_ring),
+            "rehearsal_hint": hint,
         }
 
     def trajectory(self, name: str, last_n: int = 20) -> dict:
@@ -205,12 +460,24 @@ class ReservoirService:
         self._require_handle(name)
         self.rehearsal.set_mode(name, mode, decay_profile)
         rs = self.rehearsal.get_state(name)
-        log.info("handle '%s' mode → %s (decay=%s)", name, mode, rs.decay_profile if rs else "?")
+        log.info("handle '%s' mode → %s (decay=%s, authority=%s)", name, mode, rs.decay_profile if rs else "?", rs.mode_authority if rs else "?")
         return {
             "type": "set_mode_response",
             "name": name,
             "mode": mode,
             "decay_profile": rs.decay_profile if rs else "medium",
+            "mode_authority": rs.mode_authority if rs else "system",
+        }
+
+    def set_hint_policy(self, name: str, policy: str) -> dict:
+        self._require_handle(name)
+        self.rehearsal.set_hint_policy(name, policy)
+        rs = self.rehearsal.get_state(name)
+        log.info("handle '%s' hint_policy → %s", name, policy)
+        return {
+            "type": "set_hint_policy_response",
+            "name": name,
+            "hint_policy": rs.hint_policy if rs else policy,
         }
 
     # ------------------------------------------------------------------
@@ -232,6 +499,12 @@ class ReservoirService:
             tick_count=info.tick_count,
             entity=info.entity,
         )
+        # Save thermostat state alongside the snapshot
+        if info.thermostats:
+            thermo_path = path.parent / f"{name}_thermostats.json"
+            import json as _json
+            thermo_data = [t.state_dict() for t in info.thermostats]
+            thermo_path.write_text(_json.dumps(thermo_data, indent=2))
         log.info("snapshot '%s' → %s", name, path)
         return {"type": "snapshot_response", "name": name, "path": str(path)}
 
@@ -261,6 +534,21 @@ class ReservoirService:
             rs.decay_profile = snap.decay_profile
             rs.decay_weight = snap.decay_weight
             rs.last_live_input = snap.last_input
+
+        # Restore thermostat state if available
+        if not info.thermostats:
+            info.thermostats = make_thermostats(self.config.n_nodes)
+        thermo_path = self.persistence.state_dir / f"{name}_thermostats.json"
+        if thermo_path.exists():
+            try:
+                import json as _json
+                thermo_data = _json.loads(thermo_path.read_text())
+                for thermostat, d in zip(info.thermostats, thermo_data):
+                    thermostat.load_state_dict(d)
+                log.info("  thermostats restored: %s",
+                    ", ".join(f"{t.layer_name}:rho={t.rho:.3f}" for t in info.thermostats))
+            except Exception as e:
+                log.warning("thermostat restore failed for '%s': %s", name, e)
 
         log.info("restored '%s' (entity=%s, ticks=%d, mode=%s)", name, snap.entity, snap.tick_count, snap.mode)
         return {"type": "restore_response", "name": name, "entity": snap.entity, "tick_count": snap.tick_count}
@@ -368,9 +656,17 @@ class ReservoirService:
                 "name": name,
                 "entity": info.entity,
                 "mode": rs.mode if rs else "unknown",
+                "mode_authority": rs.mode_authority if rs else "system",
+                "hint_policy": rs.hint_policy if rs else "off",
                 "decay_weight": round(rs.decay_weight, 4) if rs else 0.0,
                 "tick_count": info.tick_count,
                 "last_tick_ago": round(elapsed, 1) if elapsed is not None else None,
+                "last_source": info.last_live_meta.get("source"),
+                "memory_role": info.last_live_meta.get("memory_role"),
+                "rehearsal_hint": extract_rehearsal_hint(info.last_live_meta),
+                "last_live_meta": info.last_live_meta,
+                "recent_sources": [entry.get("source") for entry in list(info.provenance_ring)[-3:] if entry.get("source")],
+                "provenance": list(info.provenance_ring)[-3:],
             })
         return {"type": "list_handles_response", "handles": handles}
 
@@ -388,7 +684,7 @@ class ReservoirService:
 
             elif msg_type == "tick":
                 vec = np.array(msg["input"], dtype=np.float32)
-                return self.tick(msg["name"], vec)
+                return self.tick(msg["name"], vec, meta=msg.get("meta"))
 
             elif msg_type == "tick_text":
                 return self.tick_text(msg["name"], msg["text"])
@@ -398,6 +694,9 @@ class ReservoirService:
 
             elif msg_type == "set_mode":
                 return self.set_mode(msg["name"], msg["mode"], msg.get("decay_profile"))
+
+            elif msg_type == "set_hint_policy":
+                return self.set_hint_policy(msg["name"], msg["policy"])
 
             elif msg_type == "trajectory":
                 return self.trajectory(msg["name"], msg.get("last_n", 20))
@@ -427,6 +726,20 @@ class ReservoirService:
             elif msg_type == "destroy_handle":
                 self.destroy_handle(msg["name"])
                 return {"type": "destroy_handle_response", "name": msg["name"], "ok": True}
+
+            elif msg_type == "layer_metrics":
+                info = self._require_handle(msg["name"])
+                norms = self.bridge.h_norms(msg["name"])
+                layers = []
+                for i, thermostat in enumerate(info.thermostats):
+                    m = thermostat.metrics()
+                    m["h_norm"] = round(norms[i], 4) if i < len(norms) else None
+                    layers.append(m)
+                return {
+                    "type": "layer_metrics_response",
+                    "name": msg["name"],
+                    "layers": layers,
+                }
 
             else:
                 return {"type": "error", "message": f"unknown message type: {msg_type}"}
@@ -472,6 +785,21 @@ class ReservoirService:
                         info.tick_count += 1
                         info.output_ring.append(output)
                         info.h_norm_ring.append(norms)
+
+                        # Per-layer thermostatic decay: each layer adapts
+                        # independently based on its own entropy + saturation.
+                        if info.thermostats:
+                            try:
+                                h1, h2, h3 = self.bridge.get_layer_states(name)
+                                layers = [h1, h2, h3]
+                                for i, (thermostat, h_i) in enumerate(zip(info.thermostats, layers)):
+                                    rho_i = thermostat.step(h_i)
+                                    # Scale this layer's state by its adaptive rho
+                                    # (replaces the uniform decay from rehearsal)
+                                    layers[i] = h_i * rho_i
+                                self.bridge.set_state(name, *[l.reshape(1, -1) for l in layers])
+                            except Exception:
+                                pass
             except Exception as e:
                 log.error("rehearsal tick error: %s", e)
 

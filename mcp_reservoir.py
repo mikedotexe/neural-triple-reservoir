@@ -112,6 +112,18 @@ TOOLS = [
         },
     },
     {
+        "name": "reservoir_set_hint_policy",
+        "description": "Control whether a handle may adopt feeder-supplied rehearsal hints. 'off' ignores hints. 'guarded' only adopts hints when the handle is not under explicit manual mode control.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Handle name"},
+                "policy": {"type": "string", "enum": ["off", "guarded"]},
+            },
+            "required": ["name", "policy"],
+        },
+    },
+    {
         "name": "reservoir_resonance",
         "description": "Compare two reservoir handles. Returns divergence (distance between latest outputs), correlation (Pearson over shared trajectory), and RMSD. Measures how similarly two entities' dynamical traces are evolving.",
         "inputSchema": {
@@ -201,6 +213,38 @@ class MCPReservoirServer:
             if entity == "claude":
                 await self._send({"type": "set_mode", "name": name, "mode": "rehearse", "decay_profile": "slow"})
 
+    @staticmethod
+    def _meta_summary(meta: dict | None) -> str | None:
+        if not isinstance(meta, dict) or not meta:
+            return None
+        parts = []
+        source = meta.get("source")
+        if source:
+            parts.append(f"source={source}")
+        input_source = meta.get("input_source")
+        if input_source:
+            parts.append(f"input={input_source}")
+        projection = meta.get("projection")
+        if projection:
+            parts.append(f"projection={projection}")
+        memory_role = meta.get("memory_role")
+        if memory_role:
+            parts.append(f"memory={memory_role}")
+        return ", ".join(parts) if parts else None
+
+    @staticmethod
+    def _hint_summary(hint: dict | None) -> str | None:
+        if not isinstance(hint, dict) or not hint:
+            return None
+        mode = hint.get("mode")
+        decay = hint.get("decay_profile")
+        reason = hint.get("reason")
+        if mode and decay and reason:
+            return f"{mode}/{decay} — {reason}"
+        if mode and decay:
+            return f"{mode}/{decay}"
+        return reason
+
     async def _full_status(self) -> str:
         """Build an interpretive overview of all handles and cross-entity resonance."""
         try:
@@ -224,7 +268,19 @@ class MCPReservoirServer:
             }.get(h["mode"], h["mode"])
 
             lines.append(f"**{h['name']}** ({h['entity']})")
-            lines.append(f"  {h['tick_count']} ticks, last live {ago}, {mode_desc}")
+            lines.append(
+                f"  {h['tick_count']} ticks, last live {ago}, {mode_desc}, "
+                f"authority={h.get('mode_authority', 'system')}, hint_policy={h.get('hint_policy', 'off')}"
+            )
+            meta_line = self._meta_summary(h.get("last_live_meta"))
+            if meta_line:
+                lines.append(f"  last input: {meta_line}")
+            hint_line = self._hint_summary(h.get("rehearsal_hint"))
+            if hint_line:
+                lines.append(f"  soft hint: {hint_line}")
+            recent_sources = h.get("recent_sources") or []
+            if recent_sources:
+                lines.append(f"  recent sources: {', '.join(recent_sources)}")
 
             # Get trajectory trend
             try:
@@ -290,11 +346,20 @@ class MCPReservoirServer:
                 lines = []
                 for h in handles:
                     ago = f"{h['last_tick_ago']}s ago" if h.get("last_tick_ago") is not None else "never"
-                    lines.append(
+                    line = (
                         f"  {h['name']} ({h['entity']}) — mode={h['mode']}, "
+                        f"authority={h.get('mode_authority', 'system')}, "
+                        f"hint_policy={h.get('hint_policy', 'off')}, "
                         f"decay={h.get('decay_weight', 0):.3f}, "
                         f"ticks={h['tick_count']}, last={ago}"
                     )
+                    meta_line = self._meta_summary(h.get("last_live_meta"))
+                    if meta_line:
+                        line += f", {meta_line}"
+                    hint_line = self._hint_summary(h.get("rehearsal_hint"))
+                    if hint_line:
+                        line += f", hint={hint_line}"
+                    lines.append(line)
                 return "Reservoir handles:\n" + "\n".join(lines)
 
             elif tool_name == "reservoir_create":
@@ -348,9 +413,32 @@ class MCPReservoirServer:
                     f"Handle '{result['name']}' ({result['entity']}):\n"
                     f"  mode={result['mode']}, decay_weight={result['decay_weight']:.4f}, "
                     f"decay_profile={result['decay_profile']}\n"
+                    f"  authority={result.get('mode_authority', 'system')}, "
+                    f"hint_policy={result.get('hint_policy', 'off')}\n"
                     f"  ticks={result['tick_count']}, last_live={elapsed_str}\n"
                     f"  last_output={result['last_output']}\n"
                     f"  h_norms=[{', '.join(f'{n:.3f}' for n in result['h_norms'])}]"
+                    + (
+                        f"\n  last_input={self._meta_summary(result.get('last_live_meta'))}"
+                        if self._meta_summary(result.get("last_live_meta")) else ""
+                    )
+                    + (
+                        f"\n  soft_hint={self._hint_summary(result.get('rehearsal_hint'))}"
+                        if self._hint_summary(result.get("rehearsal_hint")) else ""
+                    )
+                    + (
+                        "\n  recent_provenance:\n"
+                        + "\n".join(
+                            f"    - tick={entry.get('tick')} "
+                            f"{self._meta_summary(entry) or 'source=unknown'}"
+                            + (
+                                f" hint={self._hint_summary(entry.get('rehearsal_hint'))}"
+                                if self._hint_summary(entry.get("rehearsal_hint")) else ""
+                            )
+                            for entry in result.get("provenance", [])[-3:]
+                        )
+                        if result.get("provenance") else ""
+                    )
                 )
 
             elif tool_name == "reservoir_trajectory":
@@ -381,6 +469,16 @@ class MCPReservoirServer:
                 if result.get("type") == "error":
                     return f"Error: {result['message']}"
                 return f"Set '{arguments['name']}' to mode={result['mode']} (decay={result['decay_profile']})"
+
+            elif tool_name == "reservoir_set_hint_policy":
+                result = await self._send({
+                    "type": "set_hint_policy",
+                    "name": arguments["name"],
+                    "policy": arguments["policy"],
+                })
+                if result.get("type") == "error":
+                    return f"Error: {result['message']}"
+                return f"Set '{arguments['name']}' hint policy to {result['hint_policy']}"
 
             elif tool_name == "reservoir_resonance":
                 result = await self._send({

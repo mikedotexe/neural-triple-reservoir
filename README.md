@@ -130,19 +130,19 @@ Planned handles for the rehearsal loop:
 
 The distinction between these is entirely in the shell. The reservoir does not know their names or roles. It just updates whatever state it is given.
 
-## The Rehearsal Loop (Next Major Work)
+## The Rehearsal Loop
 
 The biggest risk in a small recurrent reservoir is fade-out. If input stops, the leaky integrators decay toward zero. The reservoir forgets.
 
-The rehearsal loop counters this: when fresh input is absent, the steward shell replays a compact token — a summary of recent input — back into the reservoir. This keeps the current attractor warm without fresh external input.
+The rehearsal loop counters this: when fresh input is absent, the steward shell replays a compact token back into the reservoir. The current implementation ships three live modes (`hold`, `rehearse`, `quiet`) and three decay profiles (`fast`, `medium`, `slow`). More exotic states like deliberate recall still belong in the steward layer and remain future work.
 
-### Five Modes
+### Current and Planned Modes
 
-- **Hold** — strongest preservation, minimal drift. For brief pauses.
-- **Rehearse** — replay is active but decaying. The default "keep it warm" mode.
-- **Drift** — replay is weak. New dynamics are encouraged to evolve away from the rehearsed state.
-- **Quiet** — replay is absent or near-zero. The reservoir settles naturally.
-- **Recall** — a previously stored context is deliberately pulsed back into the foreground.
+- **Hold** — strongest preservation, minimal drift. Implemented.
+- **Rehearse** — replay is active but decaying. Implemented.
+- **Quiet** — replay is absent. Implemented, and meant to stay genuinely quiet.
+- **Drift** — replay is weak and permissive. Still a conceptual extension, not a service mode.
+- **Recall** — a previously stored context is deliberately pulsed back into the foreground. Still steward-side future work.
 
 ### Why Quiet Matters
 
@@ -150,7 +150,7 @@ If the system always replays something, quiet is never truly quiet. That would b
 
 ### Decay Is the Heart of the Design
 
-Without decay, repetition becomes imprisonment — the reservoir locks into a stale attractor. With too much decay, rehearsal is meaningless. The first implementation should use three explicit decay profiles:
+Without decay, repetition becomes imprisonment — the reservoir locks into a stale attractor. With too much decay, rehearsal is meaningless. The current implementation uses three explicit decay profiles:
 - **Fast** — brief afterglow, a few ticks
 - **Medium** — useful continuity bridge, tens of ticks
 - **Slow** — held memory or intentional recall, many ticks
@@ -218,10 +218,13 @@ The rehearsal token becomes too tightly coupled to one specific upstream represe
 
 ## Current State of the Code
 
-Two Python files, no framework, no build system:
+Still intentionally small, but no longer just two scripts:
 
 - `triple_reservoir_coreml.py` — the reservoir core. NumPy training, PyTorch wrapping, Core ML export. Works end-to-end: smoke test, export, stateful runtime, multiple state handles all verified.
 - `dual_ai_bridge.py` — the dual-AI bridge. Connects Ollama and MLX to the reservoir. Text projection, named state handles, divergence/correlation reporting. Works in NumPy mode; Core ML mode verified via export and runtime tests.
+- `reservoir_service.py` — persistent named handles, rehearsal loop, snapshots, checkout/checkin state transfer, and recent shaping-input provenance plus guarded hint adoption for the shared substrate.
+- `astrid_feeder.py` — feeds Astrid's codec lane into the shared reservoir. Now includes an always-on conditioning pass so gain-amplified codec vectors are recentered and renormalized before projection, plus a relation-aware remote-memory blend based on Astrid's mirrored Minime memory state.
+- `minime_feeder.py` — feeds Minime's spectral lane into the shared reservoir. Now blends the selected vague-memory glimpse back into the feeder path so memory role can shape the shared dynamical trace.
 
 Design docs (read these — they contain critical context):
 - `ADVICE.md` — honest assessment of what this can and cannot be
@@ -232,12 +235,12 @@ Design docs (read these — they contain critical context):
 
 In priority order:
 
-1. **Rehearsal controller** — the shell module that manages hold/rehearse/quiet modes, decay profiles, and the blend between fresh and replayed input. This is the single most important next piece. Without it, the reservoir forgets the moment input stops.
+1. **State lifecycle ergonomics** — add fork/compare/restore semantics for named handles so the shell can treat reservoir states as first-class working contexts, not just opaque live buffers.
 
-2. **Wider input/output** — move from the current 1-scalar output to multi-head output (regime, valence, novelty drive, action bias, continuity signal). This makes the reservoir readable as a stance, not just a number.
+2. **Control-policy unification** — reconcile the service's current rehearsal and thermostat controls with the richer steward-side memory and hint policies now flowing in from Astrid and Minime.
 
-3. **State lifecycle** — fork, snapshot, restore, discard for named state handles. The shell needs to manage multiple live contexts with explicit lifecycle operations.
+3. **ANE-ready state backend** — close the Core ML state readback/injection gap so the always-on low-power backend can fully participate in the persistent service story.
 
-4. **Continuous mode** — right now the bridge runs one prompt per AI and exits. A continuous mode would keep both AIs generating, with pauses handled by the rehearsal controller. This is where the system starts to feel alive rather than batch.
+4. **Coupled-generation evaluation** — measure what the multi-timescale reservoir is actually doing to token generation over longer runs, not just whether the plumbing works.
 
-5. **Upstream integration** — replace text projection with real spectral/semantic projection when Astrid and Minime are ready. The pipeline shape stays the same; only the projection layer changes.
+5. **Upstream integration depth** — keep replacing generic text-like traces with more faithful spectral and relation-aware projections from Astrid and Minime without moving meaning-making into the substrate.

@@ -12,10 +12,18 @@ capsules/consciousness-bridge/workspace/reservoir_config.json:
     {
         "projection": "passthrough" | "amplified" | "compressed",
         "amplify_factor": 2.0,
-        "cross_feed_weight": 0.3
+        "cross_feed_weight": 0.3,
+        "conditioning": "ema_rms" | "legacy",
+        "conditioning_decay": 0.92,
+        "conditioning_floor": 0.75,
+        "remote_memory_policy": "remote_role_blend" | "off",
+        "remote_memory_strength": 1.0
     }
 
-Defaults to "passthrough" (codec features are already tanh-bounded).
+Defaults to "passthrough" plus `ema_rms` conditioning so gain-amplified codec
+features are recentered and renormalized before they enter the reservoir. The
+default remote-memory policy also lets Astrid's feeder lean toward the Minime
+memory role she is currently holding in state.
 
 Usage:
     python astrid_feeder.py [--db-path /path/to/bridge.db] [--ws-url ws://127.0.0.1:7881]
@@ -43,6 +51,16 @@ log = logging.getLogger("astrid-feeder")
 
 DEFAULT_DB = Path("/Users/v/other/astrid/capsules/consciousness-bridge/workspace/bridge.db")
 POLL_INTERVAL = 5.0  # seconds between DB polls
+CONDITIONING_MODES = {"ema_rms", "legacy"}
+REMOTE_MEMORY_POLICIES = {"off", "remote_role_blend"}
+REMOTE_MEMORY_ROLE_BLEND = {
+    "latest": 0.10,
+    "stable": 0.26,
+    "expanding": 0.20,
+    "contracting": 0.24,
+    "transition": 0.16,
+}
+REMOTE_MEMORY_ROLE_ORDER = ["latest", "stable", "expanding", "contracting", "transition"]
 
 
 # ---------------------------------------------------------------------------
@@ -50,7 +68,7 @@ POLL_INTERVAL = 5.0  # seconds between DB polls
 # ---------------------------------------------------------------------------
 
 def project_passthrough(features: list[float], _factor: float) -> list[float]:
-    """Codec features as-is. Already tanh-bounded from the bridge codec."""
+    """Keep the conditioned codec shape as-is."""
     return features
 
 
@@ -73,6 +91,217 @@ PROJECTIONS = {
 }
 
 
+def _safe_array(values: list[float]) -> np.ndarray:
+    arr = np.asarray(values, dtype=np.float32)
+    return np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def _vector_stats(arr: np.ndarray) -> dict[str, float]:
+    return {
+        "mean": float(np.mean(arr)),
+        "rms": float(np.sqrt(np.mean(np.square(arr)))),
+        "max_abs": float(np.max(np.abs(arr))) if arr.size else 0.0,
+    }
+
+
+def _safe_float(value: object, default: float = 0.0) -> float:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return default
+    return out if np.isfinite(out) else default
+
+
+def _load_json(path: Path) -> dict | None:
+    try:
+        if path.exists():
+            return json.loads(path.read_text())
+    except Exception as e:
+        log.warning("failed to read %s: %s", path.name, e)
+    return None
+
+
+def _build_remote_memory_vector(entry: dict, selected_role: str | None) -> list[float] | None:
+    glimpse = entry.get("spectral_glimpse_12d")
+    if not glimpse or len(glimpse) < 12:
+        return None
+
+    arr = _safe_array(glimpse[:12])
+    centered = arr - float(np.mean(arr))
+    centered_scale = max(float(np.std(centered)), 0.15)
+
+    role = str(entry.get("role") or selected_role or "").strip().lower()
+    role_slots = np.zeros(len(REMOTE_MEMORY_ROLE_ORDER), dtype=np.float32)
+    if role in REMOTE_MEMORY_ROLE_ORDER:
+        role_slots[REMOTE_MEMORY_ROLE_ORDER.index(role)] = 1.0
+
+    summary = np.array(
+        [
+            np.tanh(_safe_float(entry.get("fill_pct")) / 100.0),
+            np.tanh(_safe_float(entry.get("lambda1_rel")) / 2.0),
+            np.tanh(_safe_float(entry.get("geom_rel"))),
+        ],
+        dtype=np.float32,
+    )
+
+    remote_vec = np.concatenate(
+        [
+            np.tanh(arr),
+            np.tanh(centered / centered_scale),
+            role_slots,
+            summary,
+        ]
+    ).astype(np.float32)
+    return remote_vec.tolist()
+
+
+def apply_remote_memory_policy(
+    base_vec: list[float],
+    workspace_dir: Path,
+    policy: str,
+    strength: float,
+) -> tuple[list[float], dict]:
+    """Blend Astrid's current remote-memory focus into the feeder vector."""
+    if policy != "remote_role_blend":
+        return base_vec, {"memory_role": None, "blend": 0.0, "contact_gate": 1.0}
+
+    state = _load_json(workspace_dir / "state.json")
+    if not state:
+        return base_vec, {"memory_role": None, "blend": 0.0, "contact_gate": 1.0}
+
+    contact = _load_json(workspace_dir / "contact_state.json") or {}
+
+    selected_id = state.get("last_remote_memory_id")
+    selected_role = str(state.get("last_remote_memory_role") or "").strip().lower()
+    entries = state.get("remote_memory_bank") or []
+
+    chosen = None
+    if selected_id:
+        chosen = next((entry for entry in entries if entry.get("id") == selected_id), None)
+    if chosen is None and selected_role:
+        chosen = next((entry for entry in entries if str(entry.get("role") or "").strip().lower() == selected_role), None)
+    if chosen is None and state.get("last_remote_glimpse_12d"):
+        chosen = {
+            "id": selected_id,
+            "role": selected_role,
+            "spectral_glimpse_12d": state.get("last_remote_glimpse_12d"),
+            "fill_pct": _safe_float(contact.get("fill_pct"), 0.0),
+            "lambda1_rel": 0.0,
+            "geom_rel": 0.0,
+        }
+
+    if chosen is None:
+        return base_vec, {"memory_role": selected_role or None, "blend": 0.0, "contact_gate": 1.0}
+
+    remote_vec = _build_remote_memory_vector(chosen, selected_role)
+    if remote_vec is None:
+        return base_vec, {"memory_role": selected_role or None, "blend": 0.0, "contact_gate": 1.0}
+
+    attention = np.clip(_safe_float(contact.get("attention"), 0.5), 0.0, 1.0)
+    openness = np.clip(_safe_float(contact.get("openness"), 0.5), 0.0, 1.0)
+    urgency = np.clip(_safe_float(contact.get("urgency"), 0.5), 0.0, 1.0)
+    contact_gate = float(np.clip(0.35 + 0.35 * attention + 0.20 * openness + 0.10 * urgency, 0.35, 1.25))
+
+    role = str(chosen.get("role") or selected_role or "").strip().lower()
+    base = _safe_array(base_vec)
+    remote = _safe_array(remote_vec)
+    blend = REMOTE_MEMORY_ROLE_BLEND.get(role, 0.12) * max(strength, 0.0) * contact_gate
+    blend = min(max(blend, 0.0), 0.80)
+    shaped = ((1.0 - blend) * base + blend * remote).astype(np.float32)
+
+    return shaped.tolist(), {
+        "memory_role": role or None,
+        "blend": blend,
+        "contact_gate": contact_gate,
+        "selected_memory_id": chosen.get("id"),
+        "attention": attention,
+        "openness": openness,
+        "urgency": urgency,
+    }
+
+
+def build_rehearsal_hint(relation_meta: dict) -> dict:
+    """Soft suggestion for how Astrid's recent contact could age in rehearsal."""
+    role = relation_meta.get("memory_role") or "latest"
+    attention = _safe_float(relation_meta.get("attention"), 0.5)
+    openness = _safe_float(relation_meta.get("openness"), 0.5)
+    urgency = _safe_float(relation_meta.get("urgency"), 0.5)
+
+    if attention < 0.20 and openness < 0.45:
+        return {
+            "mode": "quiet",
+            "decay_profile": "fast",
+            "reason": "low attention and mostly closed contact",
+        }
+    if role == "stable" and attention >= 0.75 and openness >= 0.55:
+        return {
+            "mode": "hold",
+            "decay_profile": "slow",
+            "reason": "stable remote memory under sustained, open attention",
+        }
+    if role in ("expanding", "transition") or urgency >= 0.70:
+        return {
+            "mode": "rehearse",
+            "decay_profile": "slow",
+            "reason": "exploratory or urgent relational state",
+        }
+    if role == "contracting":
+        return {
+            "mode": "rehearse",
+            "decay_profile": "fast",
+            "reason": "contracting relation favors a shorter afterimage",
+        }
+    return {
+        "mode": "rehearse",
+        "decay_profile": "medium",
+        "reason": "default relational continuity",
+    }
+
+
+class CodecConditioner:
+    """Condition Astrid codec vectors before projection.
+
+    `ema_rms` slowly learns the long-run per-dimension bias, subtracts it,
+    then rescales each exchange by its centered RMS before a tanh squash.
+    This keeps SEMANTIC_GAIN and local overrides from turning "passthrough"
+    into an amplitude-dominated feeder path.
+    """
+
+    def __init__(self, mode: str, decay: float, floor: float):
+        self.mode = mode
+        self.decay = float(np.clip(decay, 0.0, 0.999))
+        self.floor = max(float(floor), 1e-3)
+        self._ema_mean: np.ndarray | None = None
+
+    def transform(self, values: list[float]) -> tuple[list[float], dict[str, float]]:
+        arr = _safe_array(values)
+        raw_stats = _vector_stats(arr)
+        if self.mode == "legacy":
+            return arr.tolist(), {
+                "scale": 1.0,
+                "center_rms": raw_stats["rms"],
+                "conditioned_max_abs": raw_stats["max_abs"],
+                **raw_stats,
+            }
+
+        if self._ema_mean is None or self._ema_mean.shape != arr.shape:
+            self._ema_mean = np.zeros_like(arr)
+
+        centered = arr - self._ema_mean
+        center_rms = float(np.sqrt(np.mean(np.square(centered))))
+        scale = max(center_rms, self.floor)
+        conditioned = np.tanh(centered / scale).astype(np.float32)
+
+        self._ema_mean = self.decay * self._ema_mean + (1.0 - self.decay) * arr
+
+        return conditioned.tolist(), {
+            "scale": scale,
+            "center_rms": center_rms,
+            "conditioned_max_abs": float(np.max(np.abs(conditioned))) if conditioned.size else 0.0,
+            **raw_stats,
+        }
+
+
 def load_config(workspace_dir: Path) -> dict:
     """Load being-controlled reservoir config, with defaults."""
     config_path = workspace_dir / "reservoir_config.json"
@@ -80,6 +309,11 @@ def load_config(workspace_dir: Path) -> dict:
         "projection": "passthrough",
         "amplify_factor": 2.0,
         "cross_feed_weight": 0.3,
+        "conditioning": "ema_rms",
+        "conditioning_decay": 0.92,
+        "conditioning_floor": 0.75,
+        "remote_memory_policy": "remote_role_blend",
+        "remote_memory_strength": 1.0,
     }
     if config_path.exists():
         try:
@@ -88,6 +322,15 @@ def load_config(workspace_dir: Path) -> dict:
             if defaults["projection"] not in PROJECTIONS:
                 log.warning("unknown projection '%s', falling back to passthrough", defaults["projection"])
                 defaults["projection"] = "passthrough"
+            if defaults["conditioning"] not in CONDITIONING_MODES:
+                log.warning("unknown conditioning '%s', falling back to ema_rms", defaults["conditioning"])
+                defaults["conditioning"] = "ema_rms"
+            if defaults["remote_memory_policy"] not in REMOTE_MEMORY_POLICIES:
+                log.warning(
+                    "unknown remote_memory_policy '%s', falling back to remote_role_blend",
+                    defaults["remote_memory_policy"],
+                )
+                defaults["remote_memory_policy"] = "remote_role_blend"
         except Exception as e:
             log.warning("failed to read reservoir_config.json: %s", e)
     return defaults
@@ -118,8 +361,19 @@ async def run(db_path: Path, ws_url: str):
     ws = None
     config_check_counter = 0
     cfg = load_config(workspace_dir)
-    log.info("config: projection=%s, amplify=%.1f, cross_feed=%.2f",
-             cfg["projection"], cfg["amplify_factor"], cfg["cross_feed_weight"])
+    conditioner = CodecConditioner(
+        mode=cfg["conditioning"],
+        decay=cfg["conditioning_decay"],
+        floor=cfg["conditioning_floor"],
+    )
+    log.info(
+        "config: projection=%s, amplify=%.1f, cross_feed=%.2f, conditioning=%s, remote_memory=%s",
+        cfg["projection"],
+        cfg["amplify_factor"],
+        cfg["cross_feed_weight"],
+        cfg["conditioning"],
+        cfg["remote_memory_policy"],
+    )
 
     async def ensure_ws():
         nonlocal ws
@@ -147,12 +401,15 @@ async def run(db_path: Path, ws_url: str):
             ws = None
             return None
 
-    async def tick_handle(name: str, vec: list[float]) -> bool:
+    async def tick_handle(name: str, vec: list[float], meta: dict | None = None) -> bool:
         try:
             conn = await ensure_ws()
             if conn is None:
                 return False
-            await conn.send(json.dumps({"type": "tick", "name": name, "input": vec}))
+            msg = {"type": "tick", "name": name, "input": vec}
+            if meta:
+                msg["meta"] = meta
+            await conn.send(json.dumps(msg))
             r = json.loads(await conn.recv())
             return r.get("type") != "error"
         except Exception as e:
@@ -171,8 +428,18 @@ async def run(db_path: Path, ws_url: str):
                 new_cfg = load_config(workspace_dir)
                 if new_cfg != cfg:
                     cfg = new_cfg
-                    log.info("config reloaded: projection=%s, amplify=%.1f",
-                             cfg["projection"], cfg["amplify_factor"])
+                    conditioner = CodecConditioner(
+                        mode=cfg["conditioning"],
+                        decay=cfg["conditioning_decay"],
+                        floor=cfg["conditioning_floor"],
+                    )
+                    log.info(
+                        "config reloaded: projection=%s, amplify=%.1f, conditioning=%s, remote_memory=%s",
+                        cfg["projection"],
+                        cfg["amplify_factor"],
+                        cfg["conditioning"],
+                        cfg["remote_memory_policy"],
+                    )
 
             conn = sqlite3.connect(str(db_path), timeout=5)
             rows = conn.execute(
@@ -188,17 +455,63 @@ async def run(db_path: Path, ws_url: str):
                     last_id = row_id
                     continue
 
-                # Apply being-controlled projection
-                proj_fn = PROJECTIONS[cfg["projection"]]
-                projected = proj_fn(features, cfg["amplify_factor"])
+                conditioned, stats = conditioner.transform(features)
 
-                ok = await tick_handle("astrid", projected)
+                # Apply being-controlled projection after conditioning
+                proj_fn = PROJECTIONS[cfg["projection"]]
+                projected = proj_fn(conditioned, cfg["amplify_factor"])
+                projected, relation_meta = apply_remote_memory_policy(
+                    projected,
+                    workspace_dir,
+                    cfg["remote_memory_policy"],
+                    _safe_float(cfg.get("remote_memory_strength"), 1.0),
+                )
+                tick_meta = {
+                    "source": "astrid_feeder",
+                    "projection": cfg["projection"],
+                    "conditioning": cfg["conditioning"],
+                    "memory_role": relation_meta["memory_role"],
+                    "memory_blend": round(relation_meta["blend"], 4),
+                    "selected_memory_id": relation_meta.get("selected_memory_id"),
+                    "contact_gate": round(relation_meta["contact_gate"], 4),
+                    "contact": {
+                        "attention": round(relation_meta["attention"], 4),
+                        "openness": round(relation_meta["openness"], 4),
+                        "urgency": round(relation_meta["urgency"], 4),
+                    },
+                    "rehearsal_hint": build_rehearsal_hint(relation_meta),
+                }
+
+                ok = await tick_handle("astrid", projected, tick_meta)
                 if ok:
                     # Cross-feed Claude's handle (attenuated)
                     w = cfg["cross_feed_weight"]
                     cross = [f * w for f in projected]
-                    await tick_handle("claude_main", cross)
-                    log.info("tick id=%d [%s] → astrid + claude_main", row_id, cfg["projection"])
+                    cross_meta = {
+                        "source": "astrid_feeder_crossfeed",
+                        "from_handle": "astrid",
+                        "projection": cfg["projection"],
+                        "conditioning": cfg["conditioning"],
+                        "memory_role": relation_meta["memory_role"],
+                        "memory_blend": round(relation_meta["blend"], 4),
+                        "selected_memory_id": relation_meta.get("selected_memory_id"),
+                        "contact_gate": round(relation_meta["contact_gate"], 4),
+                        "rehearsal_hint": build_rehearsal_hint(relation_meta),
+                    }
+                    await tick_handle("claude_main", cross, cross_meta)
+                    log.info(
+                        "tick id=%d [%s/%s/%s blend=%.2f gate=%.2f] → astrid + claude_main raw_rms=%.2f raw_max=%.2f scale=%.2f cond_max=%.2f",
+                        row_id,
+                        cfg["conditioning"],
+                        cfg["projection"],
+                        relation_meta["memory_role"] or "none",
+                        relation_meta["blend"],
+                        relation_meta["contact_gate"],
+                        stats["rms"],
+                        stats["max_abs"],
+                        stats["scale"],
+                        stats["conditioned_max_abs"],
+                    )
 
                 last_id = row_id
 
