@@ -22,8 +22,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
+import inspect
 import json
 import logging
+import os
 import signal
 import sys
 import time
@@ -44,23 +47,266 @@ log = logging.getLogger("coupled-astrid")
 RESERVOIR_WS_URL = "ws://127.0.0.1:7881"
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+def _runtime_identity() -> dict[str, object]:
+    runtime: dict[str, object] = {
+        "python": sys.executable,
+        "has_mmap_stats": bool(hasattr(mx, "last_mmap_load_stats")),
+    }
+    try:
+        runtime["mlx_core_path"] = inspect.getfile(mx)
+    except Exception as exc:  # pragma: no cover - defensive
+        runtime["mlx_core_path_error"] = str(exc)
+    try:
+        import mlx_lm
+
+        runtime["mlx_lm_path"] = inspect.getfile(mlx_lm)
+    except Exception as exc:  # pragma: no cover - defensive
+        runtime["mlx_lm_path_error"] = str(exc)
+    return runtime
+
+
+def _merge_count_map(target: dict[str, int], source: dict[str, object] | None) -> None:
+    for key, value in dict(source or {}).items():
+        target[str(key)] = int(target.get(str(key), 0)) + int(value or 0)
+
+
+def _load_mlx_runtime(
+    model_name: str,
+    *,
+    memory_map_requested: bool,
+) -> tuple[object, object, float, dict[str, object]]:
+    from mlx_lm import load as mlx_load
+
+    runtime = _runtime_identity()
+    load_audit: dict[str, object] = {
+        "memory_map_requested": bool(memory_map_requested),
+        "memory_map_effective": bool(
+            memory_map_requested and runtime.get("has_mmap_stats")
+        ),
+        "can_report_mapped_vs_copied": bool(runtime.get("has_mmap_stats")),
+        "mapped_bytes": 0,
+        "copied_bytes": 0,
+        "fallback_reasons": {},
+        "fallback_reason_bytes": {},
+        "mx_load_calls": 0,
+        "mx_load_wall_seconds": 0.0,
+    }
+    original_mx_load = mx.load
+
+    def audited_mx_load(file, *args, **kwargs):
+        if load_audit["memory_map_effective"] and isinstance(
+            file, (str, os.PathLike, Path)
+        ):
+            kwargs.setdefault("memory_map", True)
+        call_start = time.perf_counter()
+        result = original_mx_load(file, *args, **kwargs)
+        load_audit["mx_load_calls"] = int(load_audit["mx_load_calls"]) + 1
+        load_audit["mx_load_wall_seconds"] = float(
+            load_audit["mx_load_wall_seconds"]
+        ) + (time.perf_counter() - call_start)
+        if runtime.get("has_mmap_stats"):
+            try:
+                stats = mx.last_mmap_load_stats(clear=True)
+            except Exception as exc:  # pragma: no cover - defensive
+                load_audit["last_mmap_load_stats_error"] = str(exc)
+                stats = None
+            if stats:
+                load_audit["mapped_bytes"] = int(load_audit["mapped_bytes"]) + int(
+                    stats.get("mapped_bytes") or 0
+                )
+                load_audit["copied_bytes"] = int(load_audit["copied_bytes"]) + int(
+                    stats.get("copied_bytes") or 0
+                )
+                _merge_count_map(
+                    load_audit["fallback_reasons"], stats.get("fallback_reasons")
+                )
+                _merge_count_map(
+                    load_audit["fallback_reason_bytes"],
+                    stats.get("fallback_reason_bytes"),
+                )
+        return result
+
+    mx.load = audited_mx_load
+    try:
+        if runtime.get("has_mmap_stats"):
+            try:
+                mx.last_mmap_load_stats(clear=True)
+            except Exception:
+                pass
+        load_start = time.perf_counter()
+        model, tokenizer = mlx_load(model_name)
+        load_seconds = time.perf_counter() - load_start
+    finally:
+        mx.load = original_mx_load
+
+    total_bytes = int(load_audit["mapped_bytes"]) + int(load_audit["copied_bytes"])
+    load_audit["load_seconds"] = load_seconds
+    load_audit["mapped_ratio_pct"] = (
+        100.0 * int(load_audit["mapped_bytes"]) / total_bytes if total_bytes else 0.0
+    )
+    return model, tokenizer, load_seconds, {"runtime": runtime, "load": load_audit}
+
+
+def _new_request_audit(
+    *,
+    handle_name: str,
+    messages: list[dict],
+    temperature: float,
+    max_tokens: int,
+    runtime_audit: dict[str, object],
+) -> dict[str, object]:
+    started_at = time.time()
+    return {
+        "request_id": f"{int(started_at * 1000)}-{handle_name}",
+        "timestamp": round(started_at, 3),
+        "request": {
+            "handle_name": handle_name,
+            "messages_count": len(messages),
+            "temperature": float(temperature),
+            "max_tokens": int(max_tokens),
+        },
+        "runtime": dict(runtime_audit.get("runtime", {}) or {}),
+        "load": dict(runtime_audit.get("load", {}) or {}),
+        "generation": {
+            "first_token_s": None,
+            "steady_tok_s": None,
+            "total_turn_s": None,
+            "generated_tokens": 0,
+            "decode_tok_s": None,
+            "host_sync_points": {"total": 0, "by_kind": {}},
+            "host_sync_s": 0.0,
+            "host_sync_breakdown_s": {},
+        },
+        "reservoir": {
+            "pull_bytes": 0,
+            "push_bytes": 0,
+            "serialization_s": 0.0,
+            "roundtrip_s": 0.0,
+        },
+    }
+
+
+def _record_host_sync(
+    audit: dict[str, object] | None,
+    kind: str,
+    elapsed_s: float,
+    *,
+    count: int = 1,
+) -> None:
+    if audit is None:
+        return
+    generation = dict(audit.get("generation", {}) or {})
+    points = dict(generation.get("host_sync_points", {}) or {})
+    by_kind = dict(points.get("by_kind", {}) or {})
+    by_kind[kind] = int(by_kind.get(kind, 0)) + count
+    points["by_kind"] = by_kind
+    points["total"] = int(points.get("total", 0)) + count
+    generation["host_sync_points"] = points
+    generation["host_sync_s"] = float(generation.get("host_sync_s", 0.0)) + float(
+        elapsed_s
+    )
+    breakdown = dict(generation.get("host_sync_breakdown_s", {}) or {})
+    breakdown[kind] = float(breakdown.get(kind, 0.0)) + float(elapsed_s)
+    generation["host_sync_breakdown_s"] = breakdown
+    audit["generation"] = generation
+
+
+def _timed_float_item(
+    value: object,
+    audit: dict[str, object] | None,
+    kind: str,
+) -> float:
+    sync_start = time.perf_counter()
+    out = float(value.item())
+    _record_host_sync(audit, kind, time.perf_counter() - sync_start)
+    return out
+
+
+def _timed_state_to_numpy(
+    reservoir,
+    state,
+    audit: dict[str, object] | None,
+    *,
+    kind: str = "state_to_numpy",
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    sync_start = time.perf_counter()
+    arrays = reservoir.state_to_numpy(state)
+    _record_host_sync(audit, kind, time.perf_counter() - sync_start, count=len(arrays))
+    return arrays
+
+
+def _timed_state_from_numpy(
+    reservoir,
+    np_state: tuple[np.ndarray, np.ndarray, np.ndarray],
+    audit: dict[str, object] | None,
+    *,
+    kind: str = "state_from_numpy",
+):
+    sync_start = time.perf_counter()
+    state = reservoir.state_from_numpy(np_state)
+    _record_host_sync(
+        audit, kind, time.perf_counter() - sync_start, count=len(np_state)
+    )
+    return state
+
+
+def _timed_np_array(
+    value: object,
+    audit: dict[str, object] | None,
+    *,
+    kind: str = "np_array",
+) -> np.ndarray:
+    sync_start = time.perf_counter()
+    arr = np.array(value)
+    _record_host_sync(audit, kind, time.perf_counter() - sync_start)
+    return arr
+
+
 class CoupledAstridServer:
     """OpenAI-compatible server with bidirectional reservoir coupling."""
 
     def __init__(
         self,
         model_name: str = "mlx-community/gemma-3-4b-it-4bit",
-        coupling_strength: float = 0.1,
+        coupling_strength: float = 0.15,  # 0.1→0.15: AGC adjusts dynamically (0.02-0.30), but higher baseline means perturbations are felt sooner
         input_dim: int = 32,
         n_nodes: int = 192,
+        model_memory_map: bool = False,
+        audit_dir: str | None = None,
     ):
-        from mlx_lm import load as mlx_load
         from mlx_reservoir import EmbeddingProjection, MLXTripleReservoir
         from triple_reservoir_coreml import build_canonical_reservoir
 
         # Load LLM
         log.info("loading model: %s", model_name)
-        self.model, self.tokenizer = mlx_load(model_name)
+        (
+            self.model,
+            self.tokenizer,
+            self.load_seconds,
+            self.runtime_audit,
+        ) = _load_mlx_runtime(
+            model_name,
+            memory_map_requested=model_memory_map,
+        )
+        runtime = dict(self.runtime_audit.get("runtime", {}) or {})
+        load = dict(self.runtime_audit.get("load", {}) or {})
+        log.info(
+            "runtime: python=%s mlx=%s mmap_stats=%s memory_map_requested=%s mapped=%.2fMiB copied=%.2fMiB load=%.2fs",
+            runtime.get("python"),
+            runtime.get("mlx_core_path"),
+            runtime.get("has_mmap_stats"),
+            load.get("memory_map_requested"),
+            int(load.get("mapped_bytes") or 0) / (1024**2),
+            int(load.get("copied_bytes") or 0) / (1024**2),
+            float(load.get("load_seconds") or 0.0),
+        )
 
         # Get hidden size — varies by model architecture
         # Gemma-3: text_config dict; Llama/Mistral: model.args.hidden_size
@@ -98,6 +344,23 @@ class CoupledAstridServer:
         self.coupling_strength = coupling_strength
         self.input_dim = input_dim
         self._multi_head = True  # use per-layer readouts
+        self._audit_dir = Path(
+            audit_dir
+            or os.environ.get("COUPLED_ASTRID_AUDIT_DIR")
+            or "state/audit"
+        ).expanduser()
+        self._audit_metrics_path = self._audit_dir / "coupled_request_metrics.jsonl"
+
+        # --- Coupling journal: persistent record of how the reservoir
+        # modulates Astrid's generation. Each entry records the dynamical
+        # state before/after generation and the modulation applied.
+        # On restart, the last entry calibrates the coupling so the first
+        # generation isn't flying blind. ---
+        self._journal_path = Path("state/coupling_journal.json")
+        self._journal: list[dict] = []
+        self._y_variance_window: list[tuple[float, float, float]] = []
+        self._initial_coupling = coupling_strength  # remember CLI value for logging
+        self._restore_coupling_state()
 
         log.info(
             "reservoir: MLX, %d nodes×3, input=%dD, coupling=%.2f, embed=%d→%d, multi_head=%s",
@@ -107,38 +370,136 @@ class CoupledAstridServer:
         # Pull initial state from service
         self._pull_state()
 
-    def _pull_state(self) -> bool:
-        """Check out the full astrid state from the reservoir service.
+    def _pull_state(
+        self,
+        handle_name: str = "astrid",
+        audit: dict[str, object] | None = None,
+    ) -> bool:
+        """Check out the full handle state from the reservoir service.
 
         Returns True if state was successfully loaded. On failure, keeps
         the current local state (zero or previous generation).
         """
         import base64
+
         try:
             import websockets.sync.client as ws_sync
+
+            serialization_start = time.perf_counter()
+            request_text = json.dumps({"type": "pull_state", "name": handle_name})
+            roundtrip_start = time.perf_counter()
             with ws_sync.connect(RESERVOIR_WS_URL, open_timeout=2) as ws:
-                ws.send(json.dumps({"type": "pull_state", "name": "astrid"}))
-                r = json.loads(ws.recv())
-                if r.get("type") == "error":
-                    log.info("pull_state: no astrid handle yet — using local state")
-                    return False
-                n = r.get("n_nodes", self.n_nodes)
-                h1 = np.frombuffer(base64.b64decode(r["h1"]), dtype=np.float32).reshape(1, n)
-                h2 = np.frombuffer(base64.b64decode(r["h2"]), dtype=np.float32).reshape(1, n)
-                h3 = np.frombuffer(base64.b64decode(r["h3"]), dtype=np.float32).reshape(1, n)
-                self.state = self.reservoir.state_from_numpy((h1, h2, h3))
-                self.tick_count = r.get("tick_count", 0)
-                norms = [float(np.linalg.norm(h)) for h in (h1, h2, h3)]
-                log.info(
-                    "pull_state: checked out astrid (ticks=%d, h_norms=[%.3f, %.3f, %.3f])",
-                    self.tick_count, *norms,
+                ws.send(request_text)
+                response_text = ws.recv()
+            roundtrip_s = time.perf_counter() - roundtrip_start
+
+            r = json.loads(response_text)
+            if audit is not None:
+                reservoir = dict(audit.get("reservoir", {}) or {})
+                reservoir["pull_bytes"] = int(reservoir.get("pull_bytes", 0)) + len(
+                    response_text.encode("utf-8")
                 )
-                return True
+                reservoir["roundtrip_s"] = float(reservoir.get("roundtrip_s", 0.0)) + roundtrip_s
+                audit["reservoir"] = reservoir
+            if r.get("type") == "error":
+                log.info("pull_state: no '%s' handle yet — using local state", handle_name)
+                if audit is not None:
+                    reservoir = dict(audit.get("reservoir", {}) or {})
+                    reservoir["serialization_s"] = float(
+                        reservoir.get("serialization_s", 0.0)
+                    ) + (time.perf_counter() - serialization_start)
+                    audit["reservoir"] = reservoir
+                return False
+            n = r.get("n_nodes", self.n_nodes)
+            h1 = np.frombuffer(base64.b64decode(r["h1"]), dtype=np.float32).reshape(1, n)
+            h2 = np.frombuffer(base64.b64decode(r["h2"]), dtype=np.float32).reshape(1, n)
+            h3 = np.frombuffer(base64.b64decode(r["h3"]), dtype=np.float32).reshape(1, n)
+            self.state = _timed_state_from_numpy(self.reservoir, (h1, h2, h3), audit)
+            if audit is not None:
+                reservoir = dict(audit.get("reservoir", {}) or {})
+                reservoir["serialization_s"] = float(
+                    reservoir.get("serialization_s", 0.0)
+                ) + (time.perf_counter() - serialization_start)
+                audit["reservoir"] = reservoir
+            self.tick_count = r.get("tick_count", 0)
+            norms = [float(np.linalg.norm(h)) for h in (h1, h2, h3)]
+            log.info(
+                "pull_state: checked out %s (ticks=%d, h_norms=[%.3f, %.3f, %.3f])",
+                handle_name, self.tick_count, *norms,
+            )
+            return True
         except Exception as e:
-            log.warning("pull_state failed: %s — using local state", e)
+            log.warning("pull_state failed for '%s': %s — using local state", handle_name, e)
             return False
 
-    def _push_state(self, ticks: int = 0, last_r_input: "mx.array | None" = None):
+    @staticmethod
+    def _compact_preview(text: str, limit: int = 120) -> str:
+        """Whitespace-collapse and truncate text for compact provenance."""
+        compact = " ".join((text or "").split())
+        if len(compact) <= limit:
+            return compact
+        return compact[: max(0, limit - 3)].rstrip() + "..."
+
+    @staticmethod
+    def _text_digest(text: str) -> str:
+        """Small stable digest for provenance without storing full text."""
+        return hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:12]
+
+    def _build_push_meta(
+        self,
+        *,
+        handle_name: str,
+        messages: list[dict],
+        prompt_text: str,
+        response_text: str,
+        ticks: int,
+        elapsed: float,
+        temperature: float,
+        max_tokens: int,
+        coupling_used: float,
+        y1: float,
+        y2: float,
+        y3: float,
+        h_norms_before: list[float],
+        h_norms_after: list[float],
+    ) -> dict:
+        """Build a compact narrative digest for Astrid's coupled check-in."""
+        tok_per_sec = ticks / elapsed if elapsed > 0 else 0.0
+        return {
+            "source": "coupled_astrid_server",
+            "operation": "coupled_generation_checkin",
+            "handle_name": handle_name,
+            "source_timestamp": round(time.time(), 3),
+            "generated_tokens": int(ticks),
+            "elapsed_s": round(elapsed, 3),
+            "tok_per_s": round(tok_per_sec, 2),
+            "temperature": round(float(temperature), 3),
+            "max_tokens": int(max_tokens),
+            "messages_count": len(messages),
+            "prompt_chars": len(prompt_text),
+            "response_chars": len(response_text),
+            "prompt_preview": self._compact_preview(prompt_text),
+            "response_preview": self._compact_preview(response_text),
+            "prompt_sha256_12": self._text_digest(prompt_text),
+            "response_sha256_12": self._text_digest(response_text),
+            "coupling_strength": round(float(coupling_used), 4),
+            "reservoir_readout": {
+                "y1_final": round(float(y1), 6),
+                "y2_final": round(float(y2), 6),
+                "y3_final": round(float(y3), 6),
+            },
+            "h_norms_before": [round(float(n), 4) for n in h_norms_before],
+            "h_norms_after": [round(float(n), 4) for n in h_norms_after],
+        }
+
+    def _push_state(
+        self,
+        ticks: int = 0,
+        last_r_input: "mx.array | None" = None,
+        handle_name: str = "astrid",
+        meta: dict | None = None,
+        audit: dict[str, object] | None = None,
+    ):
         """Check in the evolved state back to the reservoir service.
 
         After generation, the state carries the full dynamical imprint of
@@ -149,28 +510,165 @@ class CoupledAstridServer:
         import base64
         try:
             import websockets.sync.client as ws_sync
-            h1, h2, h3 = self.reservoir.state_to_numpy(self.state)
+
+            serialization_start = time.perf_counter()
+            h1, h2, h3 = _timed_state_to_numpy(self.reservoir, self.state, audit)
             h1_b64 = base64.b64encode(h1.astype(np.float32).tobytes()).decode()
             h2_b64 = base64.b64encode(h2.astype(np.float32).tobytes()).decode()
             h3_b64 = base64.b64encode(h3.astype(np.float32).tobytes()).decode()
             msg = {
                 "type": "push_state",
-                "name": "astrid",
+                "name": handle_name,
                 "h1": h1_b64, "h2": h2_b64, "h3": h3_b64,
                 "tick_delta": ticks,
             }
             if last_r_input is not None:
-                msg["last_input"] = np.array(last_r_input).ravel().tolist()
+                msg["last_input"] = _timed_np_array(last_r_input, audit).ravel().tolist()
+            if meta:
+                msg["meta"] = meta
+            request_text = json.dumps(msg)
+            serialization_s = time.perf_counter() - serialization_start
+            roundtrip_start = time.perf_counter()
             with ws_sync.connect(RESERVOIR_WS_URL, open_timeout=2) as ws:
-                ws.send(json.dumps(msg))
-                r = json.loads(ws.recv())
-                if r.get("ok"):
-                    norms = r.get("h_norms", [0, 0, 0])
-                    log.info("push_state: checked in astrid (+%d ticks, h_norms=[%.3f, %.3f, %.3f])", ticks, *norms)
-                else:
-                    log.warning("push_state: %s", r.get("message", "unknown error"))
+                ws.send(request_text)
+                response_text = ws.recv()
+            roundtrip_s = time.perf_counter() - roundtrip_start
+            ack_parse_start = time.perf_counter()
+            r = json.loads(response_text)
+            serialization_s += time.perf_counter() - ack_parse_start
+            if audit is not None:
+                reservoir = dict(audit.get("reservoir", {}) or {})
+                reservoir["push_bytes"] = int(reservoir.get("push_bytes", 0)) + len(
+                    request_text.encode("utf-8")
+                )
+                reservoir["serialization_s"] = float(
+                    reservoir.get("serialization_s", 0.0)
+                ) + serialization_s
+                reservoir["roundtrip_s"] = float(reservoir.get("roundtrip_s", 0.0)) + roundtrip_s
+                audit["reservoir"] = reservoir
+            if r.get("ok"):
+                norms = r.get("h_norms", [0, 0, 0])
+                log.info("push_state: checked in %s (+%d ticks, h_norms=[%.3f, %.3f, %.3f])", handle_name, ticks, *norms)
+            else:
+                log.warning("push_state: %s", r.get("message", "unknown error"))
         except Exception as e:
-            log.warning("push_state failed: %s", e)
+            log.warning("push_state failed for '%s': %s", handle_name, e)
+
+    def _restore_coupling_state(self):
+        """Restore coupling journal from previous session.
+
+        The journal records the trajectory of how the reservoir has been
+        modulating Astrid's generation — the membrane between symbolic
+        cognition and dynamical systems. On restart, the last entry
+        provides calibration: what were y1/y2/y3 doing? What coupling
+        strength was effective? This prevents the first post-restart
+        generation from flying blind.
+        """
+        try:
+            if self._journal_path.exists():
+                with open(self._journal_path) as f:
+                    data = json.load(f)
+                self._journal = data.get("entries", [])[-50:]  # keep last 50
+                if self._journal:
+                    last = self._journal[-1]
+                    self.tick_count = last.get("tick_count", 0)
+                    # Restore adapted coupling strength if it drifted
+                    if "coupling_strength" in last:
+                        self.coupling_strength = last["coupling_strength"]
+                    # Warm-start the AGC variance window from journal history
+                    for entry in self._journal:
+                        y = (entry.get("y1_final", 0), entry.get("y2_final", 0), entry.get("y3_final", 0))
+                        self._y_variance_window.append(y)
+                    log.info(
+                        "restored coupling journal: %d entries, last y=[%.4f, %.4f, %.4f], "
+                        "ticks=%d, coupling=%.3f, agc_window=%d",
+                        len(self._journal),
+                        last.get("y1_final", 0), last.get("y2_final", 0),
+                        last.get("y3_final", 0),
+                        self.tick_count, self.coupling_strength,
+                        len(self._y_variance_window),
+                    )
+        except Exception as e:
+            log.warning("coupling journal restore failed: %s", e)
+
+    def _save_coupling_state(self):
+        """Persist coupling journal to disk."""
+        try:
+            self._journal_path.parent.mkdir(parents=True, exist_ok=True)
+            data = {
+                "version": 1,
+                "entries": self._journal[-50:],  # rolling window
+            }
+            with open(self._journal_path, "w") as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            log.warning("coupling journal save failed: %s", e)
+
+    def _write_request_audit(self, audit: dict[str, object]) -> None:
+        try:
+            self._audit_metrics_path.parent.mkdir(parents=True, exist_ok=True)
+            with self._audit_metrics_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(audit, sort_keys=True) + "\n")
+        except Exception as exc:  # pragma: no cover - defensive
+            log.warning("request audit write failed: %s", exc)
+
+    def _log_generation(self, handle_name: str, ticks: int, elapsed: float, y1: float, y2: float, y3: float,
+                        h_norms_before: list[float], h_norms_after: list[float]):
+        """Record a generation in the coupling journal.
+
+        This is the persistent record of the membrane between language
+        and dynamics. Each entry captures: how the reservoir was modulating
+        the LLM, how many tokens flowed through, and how the dynamical
+        state evolved as a result.
+        """
+        entry = {
+            "timestamp": time.time(),
+            "handle_name": handle_name,
+            "tick_count": self.tick_count,
+            "tokens": ticks,
+            "elapsed_s": round(elapsed, 2),
+            "coupling_strength": self.coupling_strength,
+            "y1_final": round(y1, 6),
+            "y2_final": round(y2, 6),
+            "y3_final": round(y3, 6),
+            "h_norms_before": [round(n, 4) for n in h_norms_before],
+            "h_norms_after": [round(n, 4) for n in h_norms_after],
+        }
+        self._journal.append(entry)
+        # Keep rolling window
+        if len(self._journal) > 50:
+            self._journal = self._journal[-50:]
+
+        # --- Adaptive coupling (AGC) ---
+        # Track y-value variance over a sliding window. If the reservoir
+        # is quiet (low variance), amplify the coupling so it has more
+        # voice. If it's dominating (high variance), attenuate so the
+        # LLM retains its own agency. 5% nudge per generation — takes
+        # ~20 generations to double, slow enough to be stable.
+        self._y_variance_window.append((y1, y2, y3))
+        if len(self._y_variance_window) > 30:
+            self._y_variance_window = self._y_variance_window[-30:]
+
+        if len(self._y_variance_window) >= 10:
+            recent = self._y_variance_window[-20:]
+            total_var = sum(
+                np.var([e[i] for e in recent]) for i in range(3)
+            )
+            old_strength = self.coupling_strength
+            if total_var < 0.01:
+                # Reservoir is quiet — amplify its voice
+                self.coupling_strength = min(0.3, self.coupling_strength * 1.05)
+            elif total_var > 1.0:
+                # Reservoir is dominating — let the LLM breathe
+                self.coupling_strength = max(0.02, self.coupling_strength * 0.95)
+            if abs(self.coupling_strength - old_strength) > 0.001:
+                log.info(
+                    "AGC: coupling %.3f → %.3f (y_var=%.4f)",
+                    old_strength, self.coupling_strength, total_var,
+                )
+
+        # Save after every generation
+        self._save_coupling_state()
 
     def _format_prompt(self, messages: list[dict]) -> str:
         """Convert OpenAI message format to a chat-formatted prompt string."""
@@ -202,6 +700,7 @@ class CoupledAstridServer:
         messages: list[dict],
         temperature: float = 0.8,
         max_tokens: int = 512,
+        handle_name: str = "astrid",
     ) -> str:
         """Run coupled generation with unified reservoir state.
 
@@ -216,21 +715,52 @@ class CoupledAstridServer:
         from mlx_lm.sample_utils import make_sampler
         from mlx_reservoir import ReservoirLogitProcessor
 
+        request_start = time.perf_counter()
+        request_audit = _new_request_audit(
+            handle_name=handle_name,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            runtime_audit=self.runtime_audit,
+        )
+
         # CHECK OUT: pull state from service before generation
-        self._pull_state()
+        self._pull_state(handle_name, audit=request_audit)
+
+        # Capture pre-generation h-norms for the coupling journal
+        h_norms_before = [0.0, 0.0, 0.0]
+        try:
+            h1_np, h2_np, h3_np = _timed_state_to_numpy(
+                self.reservoir,
+                self.state,
+                request_audit,
+            )
+            h_norms_before = [float(np.linalg.norm(h)) for h in (h1_np, h2_np, h3_np)]
+        except Exception:
+            pass
 
         prompt_text = self._format_prompt(messages)
+        request_info = dict(request_audit.get("request", {}) or {})
+        request_info["prompt_sha256_12"] = self._text_digest(prompt_text)
+        request_info["prompt_chars"] = len(prompt_text)
+        request_audit["request"] = request_info
         prompt_tokens = mx.array(self.tokenizer.encode(prompt_text))
 
         sampler = make_sampler(temp=temperature)
-        processor = ReservoirLogitProcessor(coupling_strength=self.coupling_strength)
+        processor = ReservoirLogitProcessor(
+            coupling_strength=self.coupling_strength,
+            sync_observer=lambda kind, elapsed: _record_host_sync(
+                request_audit, kind, elapsed
+            ),
+        )
 
         detokenizer = self.tokenizer.detokenizer
         detokenizer.reset()
 
         ticks = 0
         last_r_input = None
-        t0 = time.monotonic()
+        decode_start = time.monotonic()
+        first_token_seconds = None
 
         for token, _logprobs in generate_step(
             prompt_tokens,
@@ -239,6 +769,9 @@ class CoupledAstridServer:
             logits_processors=[processor],
             sampler=sampler,
         ):
+            now = time.monotonic()
+            if first_token_seconds is None:
+                first_token_seconds = now - decode_start
             detokenizer.add_token(token)
 
             # Reservoir coupling: extract token embedding, project to reservoir
@@ -255,13 +788,19 @@ class CoupledAstridServer:
                     (y1, y2, y3), self.state = self.reservoir.step_multi(r_input, self.state)
                     if ticks % 64 == 0:
                         mx.eval(*self.state)
-                    processor.update(float(y1.item()), float(y2.item()), float(y3.item()))
+                    processor.update(
+                        _timed_float_item(y1, request_audit, "scalar_item"),
+                        _timed_float_item(y2, request_audit, "scalar_item"),
+                        _timed_float_item(y3, request_audit, "scalar_item"),
+                    )
                 else:
                     # Legacy single-headed
                     y, _z, self.state = self.reservoir.step(r_input, self.state)
                     if ticks % 64 == 0:
                         mx.eval(*self.state)
-                    processor.update_single(float(y.item()))
+                    processor.update_single(
+                        _timed_float_item(y, request_audit, "scalar_item")
+                    )
 
             ticks += 1
 
@@ -270,20 +809,84 @@ class CoupledAstridServer:
 
         detokenizer.finalize()
         text = detokenizer.text
+        request_info = dict(request_audit.get("request", {}) or {})
+        request_info["response_sha256_12"] = self._text_digest(text)
+        request_info["response_chars"] = len(text)
+        request_audit["request"] = request_info
 
         self.tick_count += ticks
-        elapsed = time.monotonic() - t0
-        tok_per_sec = ticks / elapsed if elapsed > 0 else 0
+        decode_elapsed = time.monotonic() - decode_start
+        tok_per_sec = ticks / decode_elapsed if decode_elapsed > 0 else 0
+        steady_tok_s = None
+        if (
+            first_token_seconds is not None
+            and ticks > 1
+            and decode_elapsed > first_token_seconds
+        ):
+            steady_tok_s = (ticks - 1) / (decode_elapsed - first_token_seconds)
 
         log.info(
-            "generated %d tokens in %.1fs (%.1f tok/s), reservoir ticks=%d, "
+            "generated %d tokens on %s in %.1fs (%.1f tok/s), reservoir ticks=%d, "
             "y1=%.4f y2=%.4f y3=%.4f",
-            ticks, elapsed, tok_per_sec, self.tick_count,
+            ticks, handle_name, decode_elapsed, tok_per_sec, self.tick_count,
             processor._y1, processor._y2, processor._y3,
         )
 
+        # Capture post-generation h-norms
+        h_norms_after = [0.0, 0.0, 0.0]
+        try:
+            h1_np, h2_np, h3_np = _timed_state_to_numpy(
+                self.reservoir,
+                self.state,
+                request_audit,
+            )
+            h_norms_after = [float(np.linalg.norm(h)) for h in (h1_np, h2_np, h3_np)]
+        except Exception:
+            pass
+
+        coupling_used = self.coupling_strength
+
+        # Log to coupling journal — the persistent record of how language
+        # and dynamics interact through this membrane
+        self._log_generation(
+            handle_name=handle_name,
+            ticks=ticks, elapsed=decode_elapsed,
+            y1=processor._y1, y2=processor._y2, y3=processor._y3,
+            h_norms_before=h_norms_before, h_norms_after=h_norms_after,
+        )
+
         # CHECK IN: push evolved state back to the service
-        self._push_state(ticks=ticks, last_r_input=last_r_input)
+        self._push_state(
+            ticks=ticks,
+            last_r_input=last_r_input,
+            handle_name=handle_name,
+            meta=self._build_push_meta(
+                handle_name=handle_name,
+                messages=messages,
+                prompt_text=prompt_text,
+                response_text=text,
+                ticks=ticks,
+                elapsed=decode_elapsed,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                coupling_used=coupling_used,
+                y1=processor._y1,
+                y2=processor._y2,
+                y3=processor._y3,
+                h_norms_before=h_norms_before,
+                h_norms_after=h_norms_after,
+            ),
+            audit=request_audit,
+        )
+
+        generation = dict(request_audit.get("generation", {}) or {})
+        generation["generated_tokens"] = int(ticks)
+        generation["first_token_s"] = first_token_seconds
+        generation["steady_tok_s"] = steady_tok_s
+        generation["decode_tok_s"] = tok_per_sec
+        generation["total_turn_s"] = time.perf_counter() - request_start
+        request_audit["generation"] = generation
+        self._write_request_audit(request_audit)
 
         return text
 
@@ -304,6 +907,7 @@ async def handle_chat_completions(request, server: CoupledAstridServer):
     messages = body.get("messages", [])
     temperature = body.get("temperature", 0.8)
     max_tokens = body.get("max_tokens", 512)
+    handle_name = body.get("reservoir_handle", body.get("handle_name", "astrid"))
 
     try:
         # Run synchronously on the main thread.  Do NOT use run_in_executor —
@@ -311,7 +915,7 @@ async def handle_chat_completions(request, server: CoupledAstridServer):
         # async_eval on generation_stream, causing Metal command buffer
         # contention (AGXG16X assertion).  The bridge sends one request at a
         # time with 120s timeout, so blocking the event loop is fine.
-        text = server.generate_coupled(messages, temperature, max_tokens)
+        text = server.generate_coupled(messages, temperature, max_tokens, handle_name=handle_name)
     except Exception as e:
         log.error("generation failed: %s", e)
         import traceback
@@ -360,7 +964,8 @@ async def run_server(server: CoupledAstridServer, host: str, port: int):
         loop.add_signal_handler(sig, lambda: shutdown.set())
     await shutdown.wait()
 
-    log.info("shutting down")
+    log.info("shutting down — saving coupling journal")
+    server._save_coupling_state()
     await runner.cleanup()
 
 
@@ -380,6 +985,17 @@ def main():
     )
     ap.add_argument("--input-dim", type=int, default=32)
     ap.add_argument("--n-nodes", type=int, default=192)
+    ap.add_argument(
+        "--model-memory-map",
+        action="store_true",
+        default=_env_flag("COUPLED_ASTRID_MODEL_MEMORY_MAP", False),
+        help="Request explicit memory-mapped model loading when supported.",
+    )
+    ap.add_argument(
+        "--audit-dir",
+        default=os.environ.get("COUPLED_ASTRID_AUDIT_DIR"),
+        help="Directory for per-request JSONL audit metrics.",
+    )
     args = ap.parse_args()
 
     server = CoupledAstridServer(
@@ -387,6 +1003,8 @@ def main():
         coupling_strength=args.coupling_strength,
         input_dim=args.input_dim,
         n_nodes=args.n_nodes,
+        model_memory_map=bool(args.model_memory_map),
+        audit_dir=args.audit_dir,
     )
     asyncio.run(run_server(server, args.host, args.port))
 

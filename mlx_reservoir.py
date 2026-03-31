@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import argparse
 import time
-from typing import Optional
+from typing import Callable, Optional
 
 import mlx.core as mx
 import numpy as np
@@ -204,8 +204,13 @@ class ReservoirLogitProcessor:
     how Astrid thinks.
     """
 
-    def __init__(self, coupling_strength: float = 0.1):
+    def __init__(
+        self,
+        coupling_strength: float = 0.1,
+        sync_observer: Optional[Callable[[str, float], None]] = None,
+    ):
         self.coupling_strength = coupling_strength
+        self._sync_observer = sync_observer
         self._y1 = 0.0  # fast: token confidence
         self._y2 = 0.0  # medium: repetition
         self._y3 = 0.0  # slow: tonal drift
@@ -226,6 +231,10 @@ class ReservoirLogitProcessor:
     def _sigmoid(x: float) -> float:
         import math
         return 1.0 / (1.0 + math.exp(-max(-20.0, min(20.0, x))))
+
+    def _observe_sync(self, kind: str, elapsed_s: float) -> None:
+        if self._sync_observer is not None:
+            self._sync_observer(kind, elapsed_s)
 
     def __call__(self, tokens: mx.array, logits: mx.array) -> mx.array:
         """Apply multi-timescale reservoir modulation to logits."""
@@ -254,7 +263,9 @@ class ReservoirLogitProcessor:
         tail_scale = 1.0 - s * (2.0 * sig3 - 1.0) * 0.3  # ±3% tail scaling
         if tail_scale != 1.0:
             # Scale logits below median down (or up) by tail_scale
+            sync_start = time.perf_counter()
             median_val = float(mx.median(logits).item())
+            self._observe_sync("median_item", time.perf_counter() - sync_start)
             mask = logits < median_val
             logits = mx.where(mask, logits * tail_scale, logits)
 
