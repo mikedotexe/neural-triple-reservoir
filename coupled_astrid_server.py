@@ -344,12 +344,13 @@ class CoupledAstridServer:
         self.coupling_strength = coupling_strength
         self.input_dim = input_dim
         self._multi_head = True  # use per-layer readouts
-        self._audit_dir = Path(
-            audit_dir
-            or os.environ.get("COUPLED_ASTRID_AUDIT_DIR")
-            or "state/audit"
-        ).expanduser()
-        self._audit_metrics_path = self._audit_dir / "coupled_request_metrics.jsonl"
+        configured_audit_dir = audit_dir or os.environ.get("COUPLED_ASTRID_AUDIT_DIR")
+        self._audit_dir = Path(configured_audit_dir).expanduser() if configured_audit_dir else None
+        self._audit_metrics_path = (
+            self._audit_dir / "coupled_request_metrics.jsonl"
+            if self._audit_dir is not None
+            else None
+        )
 
         # --- Coupling journal: persistent record of how the reservoir
         # modulates Astrid's generation. Each entry records the dynamical
@@ -605,6 +606,8 @@ class CoupledAstridServer:
             log.warning("coupling journal save failed: %s", e)
 
     def _write_request_audit(self, audit: dict[str, object]) -> None:
+        if self._audit_metrics_path is None:
+            return
         try:
             self._audit_metrics_path.parent.mkdir(parents=True, exist_ok=True)
             with self._audit_metrics_path.open("a", encoding="utf-8") as handle:
@@ -994,7 +997,7 @@ def main():
     ap.add_argument(
         "--audit-dir",
         default=os.environ.get("COUPLED_ASTRID_AUDIT_DIR"),
-        help="Directory for per-request JSONL audit metrics.",
+        help="Directory for per-request JSONL audit metrics. Disabled unless set.",
     )
     args = ap.parse_args()
 

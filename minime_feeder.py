@@ -12,7 +12,7 @@ workspace/reservoir_config.json:
     {
         "projection": "raw" | "tanh_scaled" | "normalized" | "ranked",
         "scale": 100.0,
-        "cross_feed_weight": 0.15,
+        "cross_feed_weight": 0.30,
         "source": "fingerprint" | "eigenvalues+fill" | "custom_blend",
         "memory_policy": "role_blend" | "off",
         "memory_strength": 1.0
@@ -265,7 +265,7 @@ def load_config(workspace: Path) -> dict:
     defaults = {
         "projection": "tanh_scaled",
         "scale": 100.0,
-        "cross_feed_weight": 0.15,
+        "cross_feed_weight": 0.30,  # 0.15→0.30: PERTURB signal was attenuated to ~1% at Astrid's logits
         "source": "fingerprint",
         "memory_policy": "role_blend",
         "memory_strength": 1.0,
@@ -391,8 +391,10 @@ async def run(workspace: Path, ws_url: str):
 
                         fill = _safe_float(data.get("fill_pct"), 0.0)
                         l1 = _safe_float(data.get("lambda1_rel"), 0.0)
+                        source_timestamp = round(time.time(), 3)
                         tick_meta = {
                             "source": "minime_feeder",
+                            "source_timestamp": source_timestamp,
                             "input_source": cfg["source"],
                             "projection": cfg["projection"],
                             "memory_role": memory_meta["role"],
@@ -411,6 +413,7 @@ async def run(workspace: Path, ws_url: str):
                             cross = [v * w for v in vec]
                             cross_meta = {
                                 "source": "minime_feeder_crossfeed",
+                                "source_timestamp": source_timestamp,
                                 "from_handle": "minime",
                                 "input_source": cfg["source"],
                                 "projection": cfg["projection"],

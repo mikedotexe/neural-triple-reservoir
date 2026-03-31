@@ -286,6 +286,22 @@ class ReservoirBridge:
             float(np.linalg.norm(h3)),
         )
 
+    def get_layer_states(self, name: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return numpy arrays of (h1, h2, h3) for per-layer metrics."""
+        if self.use_mlx:
+            h1, h2, h3 = self.states[name]
+            return (
+                np.array(h1).ravel(),
+                np.array(h2).ravel(),
+                np.array(h3).ravel(),
+            )
+        h1, h2, h3 = self.states[name]
+        return (
+            np.asarray(h1).ravel(),
+            np.asarray(h2).ravel(),
+            np.asarray(h3).ravel(),
+        )
+
     def has_handle(self, name: str) -> bool:
         """Check if a named handle exists."""
         return name in self.states

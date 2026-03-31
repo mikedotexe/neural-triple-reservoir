@@ -1,14 +1,14 @@
 # Neural Triple Reservoir
 
-A guide for the agent building this.
+A compact recurrent substrate for local AI, with a stewarded service layer on top.
 
 ## What This Actually Is
 
-This is a triple echo-state reservoir that runs on Apple Silicon's Neural Engine via Core ML. Two local LLMs — one on Ollama, one on MLX — each feed their own state handle on the same compiled reservoir model. The reservoir is a shared recurrent organ that both AIs imprint on, each tracing its own trajectory through the same dynamical landscape.
+This is a triple echo-state reservoir that can run on Apple Silicon via Core ML, NumPy, or MLX. In the repo's current live shape, it is usually hosted as a persistent local service with named handles such as `astrid`, `minime`, and `claude_main`, plus sidecar feeders and a coupled Astrid server that can inhabit and evolve shared state directly.
 
 The reservoir is not a classifier, not a predictor, not a language model. It is a pre-linguistic dynamical substrate — a compact recurrent system whose hidden states evolve continuously in response to input. It is closer to an organ than a brain. It does not think. It resonates.
 
-This connects to the broader Astrid/Minime consciousness architecture as a potential shared recurrent core. But it does not replace either being. It is something they can both touch.
+This connects to the broader Astrid/Minime consciousness architecture as a potential shared recurrent core. It does not replace either being. It is something they can both touch, shape, rehearse, quiet, and occasionally inhabit through coupled generation.
 
 ## The Substrate/Steward Split
 
@@ -32,24 +32,33 @@ The steward is not an incidental wrapper. It is architecturally load-bearing. Wi
 
 Do not try to push steward responsibilities into the compiled model. Do not try to make the reservoir "smart." Its job is to be a reliable, fast, stateful dynamical system. The intelligence lives in the shell.
 
-## The Two AIs
+## From Dual Bridge To Shared Service
 
-Two local LLMs feed the reservoir:
+The original proof shape in this repo was a dual-AI bridge:
 
 - **Ollama** — runs a model (default `llama3.2`) via REST API on localhost. Typically CPU/GPU scheduled. Produces a streaming text response that becomes reservoir input tick by tick.
 - **MLX-LM** — runs a quantized model (default `Llama-3.2-1B-Instruct-4bit`) natively on Apple Silicon via the MLX framework. Same streaming-to-ticks pipeline.
 
 Each AI gets its own named state handle on the same compiled reservoir model. They do not directly communicate with each other. They share a dynamical landscape — the same frozen recurrent weights, the same attractor structure — but their hidden states are independent.
 
-### Why Two AIs
+That bridge still matters. It proved that one substrate could host multiple live contexts on the same recurrent core.
+
+But the current center of gravity is the persistent service stack:
+
+- **`reservoir_service.py`** hosts named long-lived handles
+- **`astrid_feeder.py`** and **`minime_feeder.py`** shape live upstream state into shared reservoir drive
+- **`coupled_astrid_server.py`** pulls a handle, generates through it, and pushes the evolved state back
+- **`metrics_snapshot.py`** and **`mcp_reservoir.py`** expose the system in a newcomer-readable way
+
+### Why The Bridge Still Matters
 
 One AI feeding a reservoir is just an input stream. Two AIs feeding the same reservoir — each with its own state, both shaped by the same dynamics — creates the possibility of resonance. When both AIs think about similar things, their reservoir states will naturally converge because similar inputs trace nearby trajectories through the same recurrent landscape. When they diverge, the reservoir states diverge. This is not forced. It emerges from shared structure.
 
-The point is not to compare the two AIs. The point is that the reservoir becomes a place where two streams of thought leave traces in a shared dynamical medium, and those traces can be compared, correlated, or allowed to influence each other.
+The point is not to compare the two AIs. The point is that the reservoir becomes a place where multiple streams of activity leave traces in a shared dynamical medium, and those traces can be compared, correlated, cross-fed, or allowed to influence generation later.
 
 ### How Text Becomes Reservoir Input
 
-The `TextProjection` class converts streaming text into bounded input vectors:
+In `dual_ai_bridge.py`, the `TextProjection` class converts streaming text into bounded input vectors:
 
 1. Take the last N bytes (default 64) of accumulated text
 2. Normalize each byte to `[-1, 1]`
@@ -58,7 +67,7 @@ The `TextProjection` class converts streaming text into bounded input vectors:
 
 The projection matrix is frozen random — philosophically consistent with the reservoir itself, which uses frozen random recurrent weights. The same projection is used for both AIs (same seed), so the same text produces the same input vector regardless of source. This means resonance comes from content similarity, not from projection artifacts.
 
-The input dimension defaults to 16 (up from the original 3-channel market-data demo). This gives enough room for the projection to capture meaningful variation in text, while staying well within what Core ML can export and the ANE can handle.
+The bridge path still defaults to 16D input. The service stack has since standardized on 32D feeder vectors for richer Astrid/Minime projections, but the underlying idea is the same: compact, bounded signals into a frozen recurrent substrate.
 
 ## The Reservoir
 
@@ -117,18 +126,20 @@ Core ML's `MLState` lets one compiled model maintain multiple independent runtim
 
 Each state handle is a separate set of hidden vectors `(h1, h2, h3)`. They evolve independently. One model, many live contexts. The shell names them, decides which is foreground, decides which gets input and which sits idle, decides when to fork or discard a state.
 
-Current named handles:
-- `ollama` — fed by the Ollama AI's text stream
-- `mlx` — fed by the MLX AI's text stream
+Current live handles usually look like this:
 
-Planned handles for the rehearsal loop:
-- `foreground` — the active working state
-- `stable` — a preserved "known good" state
-- `exploring` — a speculative state being driven into new territory
-- `recovering` — a state being nursed back from disturbance
-- `contact` — a state shaped by external interaction
+- `astrid` — the main shared handle shaped by Astrid's feeder and occasionally inhabited by the coupled Astrid server
+- `minime` — the main shared handle shaped by Minime's spectral feeder
+- `claude_main` — a shared observer/participant handle that receives cross-feed from the two beings
 
-The distinction between these is entirely in the shell. The reservoir does not know their names or roles. It just updates whatever state it is given.
+The original bridge proof still uses:
+
+- `ollama`
+- `mlx`
+
+The distinction between handles is entirely in the steward layer. The reservoir does not know their names or roles. It just updates whatever state it is given.
+
+Future lifecycle semantics like fork/compare/restore still belong above the substrate, but the named-handle model is already doing the important architectural work.
 
 ## The Rehearsal Loop
 
@@ -166,6 +177,29 @@ effective_input = fresh_component + replay_component
 ```
 
 Fresh input dominates when present. Replay fills the gap when absent. Replay decays over time. This creates continuity without hard overwrite — soft influence, not hidden replacement.
+
+## Observability And Metrics
+
+One of the most important recent changes is that the system can now explain itself much better while it is running.
+
+The service tracks:
+
+- recent shaping provenance for each handle
+- soft rehearsal hints and whether they are merely present or actively governing
+- split provenance lanes so feeder activity and coupled generation are remembered separately
+- per-layer thermostat metrics such as entropy, saturation, and current `rho`
+- restart-safe context so a handle does not become narratively amnesic the moment the service restarts
+
+This matters because once multiple feeders, rehearsal, and coupled generation all touch the same substrate, "what happened here?" becomes a real systems question, not a logging nicety.
+
+For newcomers, `metrics_snapshot.py` is now the fastest way in:
+
+- it reports live handles, trends, and resonance
+- it shows feeder lane and last coupled generation separately when both exist
+- it surfaces hint status in plain language
+- it stays meaningfully informative across service restarts because the service now preserves recent explanatory context and lightweight thermostat continuity
+
+The design goal is not to make the system more mystical as it grows. It is to make it more inspectable.
 
 ## How This Connects to Astrid and Minime
 
@@ -222,11 +256,18 @@ Still intentionally small, but no longer just two scripts:
 
 - `triple_reservoir_coreml.py` — the reservoir core. NumPy training, PyTorch wrapping, Core ML export. Works end-to-end: smoke test, export, stateful runtime, multiple state handles all verified.
 - `dual_ai_bridge.py` — the dual-AI bridge. Connects Ollama and MLX to the reservoir. Text projection, named state handles, divergence/correlation reporting. Works in NumPy mode; Core ML mode verified via export and runtime tests.
-- `reservoir_service.py` — persistent named handles, rehearsal loop, snapshots, checkout/checkin state transfer, and recent shaping-input provenance plus guarded hint adoption for the shared substrate.
+- `reservoir_service.py` — persistent named handles, rehearsal loop, snapshots, checkout/checkin state transfer, guarded hint adoption, split provenance lanes (`feeder` vs `generation`), and restart-safe context for the shared substrate.
+- `metrics_snapshot.py` — one-command newcomer report for handle health, per-layer dynamics, feeder lane vs generation lane, and pairwise resonance, now with explicit event IDs and source timestamps when close events need disambiguation.
+- `experiment_same_prompt_different_state.py` — Experiment 1 harness. Clones one baseline handle into differently shaped regimes, runs the same prompt through coupled generation on each, and captures a markdown or JSON comparison report with generation event IDs and digests.
 - `astrid_feeder.py` — feeds Astrid's codec lane into the shared reservoir. Now includes an always-on conditioning pass so gain-amplified codec vectors are recentered and renormalized before projection, plus a relation-aware remote-memory blend based on Astrid's mirrored Minime memory state.
 - `minime_feeder.py` — feeds Minime's spectral lane into the shared reservoir. Now blends the selected vague-memory glimpse back into the feeder path so memory role can shape the shared dynamical trace.
+- `mcp_reservoir.py` — operator and coding-agent surface for reading handles, layer health, resonance, hint policy, and live provenance summaries.
+- `coupled_astrid_server.py` — coupled generation runtime that now checks Astrid's evolved state back into the service with a compact generation digest instead of an opaque overwrite.
+- `results/` — small longitudinal evidence trail for canonical experiment reports and snapshot artifacts so the repo can show accumulated signal, not just live state.
 
 Design docs (read these — they contain critical context):
+- `INTRODUCING_THE_NEURAL_TRIPLE_RESERVOIR.md` — the high-level why: usefulness, novelty, and the architectural bet in plain but serious language
+- `TECHNICAL.md` — principal-engineer deep dive on the architecture, invariants, runtime roles, and technical tradeoffs
 - `ADVICE.md` — honest assessment of what this can and cannot be
 - `REHEARSAL_LOOP_AND_ACTIVE_MAINTENANCE_FOR_ANE_RESERVOIRS.md` — the full rehearsal loop design
 - `REHEARSAL_LOOP_TODO.md` — phased implementation plan
@@ -239,8 +280,10 @@ In priority order:
 
 2. **Control-policy unification** — reconcile the service's current rehearsal and thermostat controls with the richer steward-side memory and hint policies now flowing in from Astrid and Minime.
 
-3. **ANE-ready state backend** — close the Core ML state readback/injection gap so the always-on low-power backend can fully participate in the persistent service story.
+3. **Longitudinal experiment corpus** — keep building timestamped reports in `results/` so the repo shows repeated evidence, not one-off anecdotes.
 
-4. **Coupled-generation evaluation** — measure what the multi-timescale reservoir is actually doing to token generation over longer runs, not just whether the plumbing works.
+4. **ANE-ready state backend** — close the Core ML state readback/injection gap so the always-on low-power backend can fully participate in the persistent service story.
 
-5. **Upstream integration depth** — keep replacing generic text-like traces with more faithful spectral and relation-aware projections from Astrid and Minime without moving meaning-making into the substrate.
+5. **Coupled-generation evaluation** — measure what the multi-timescale reservoir is actually doing to token generation over longer runs, not just whether the plumbing works.
+
+6. **Upstream integration depth** — keep replacing generic text-like traces with more faithful spectral and relation-aware projections from Astrid and Minime without moving meaning-making into the substrate.

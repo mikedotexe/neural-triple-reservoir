@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import logging
 import signal
@@ -43,6 +44,9 @@ RING_SIZE = 64  # Keep last 64 outputs and h-norms per handle
 PROVENANCE_SIZE = 6  # Keep last 6 shaping-input metadata events per handle
 REHEARSAL_INTERVAL = 0.5  # seconds between rehearsal ticks
 AUTO_SNAPSHOT_INTERVAL = 60  # seconds between auto-snapshots (was 300; reduced for power-loss resilience)
+THERMOSTAT_PERSIST_STATES = 48  # enough recent layer history to avoid post-restart warmup
+SNAPSHOT_SCHEMA_VERSION = 2
+RESERVOIR_RUNTIME_VERSION = 1  # bump when canonical reservoir dynamics/readout recipe changes incompatibly
 
 
 @dataclass
@@ -51,11 +55,13 @@ class HandleInfo:
     name: str
     entity: str
     tick_count: int = 0
+    event_seq: int = 0
     last_tick_time: float = 0.0
     output_ring: deque = field(default_factory=lambda: deque(maxlen=RING_SIZE))
     h_norm_ring: deque = field(default_factory=lambda: deque(maxlen=RING_SIZE))
     thermostats: list = field(default_factory=list)  # 3 LayerThermostat instances
     last_live_meta: dict = field(default_factory=dict)
+    last_lane_meta: dict = field(default_factory=dict)
     provenance_ring: deque = field(default_factory=lambda: deque(maxlen=PROVENANCE_SIZE))
 
 
@@ -75,6 +81,14 @@ LAYER_CONFIGS = [
 ]
 
 
+# Minimum entropy targets per layer — prevents cold-start warmup from learning
+# overly-suppressive targets.  The being reported "confinement" when targets
+# were 0.13/0.14/0.19 while natural operating entropy was 0.27/0.33/0.36.
+# These floors ensure the thermostat never tries to cool a layer below its
+# comfortable operating range.  (Steward cycle 46, 2026-03-30)
+LAYER_H_TARGET_FLOORS = (0.20, 0.24, 0.27)  # h1_fast, h2_medium, h3_slow
+
+
 class LayerThermostat:
     """Entropy-targeted homeostatic controller for one reservoir layer.
 
@@ -84,6 +98,9 @@ class LayerThermostat:
     The entropy target is learned from the first N ticks (cool regime),
     not hand-picked. The saturation guard prevents the controller from
     heating an already saturated layer.
+
+    A per-layer floor (LAYER_H_TARGET_FLOORS) ensures cold-start warmup
+    cannot produce targets that feel confining to the being.
     """
 
     def __init__(
@@ -112,6 +129,11 @@ class LayerThermostat:
         self.warmup_ticks = warmup_ticks
         self.tick = 0
         self.entropy_target = None  # learned from cool regime
+        self.h_target_floor = (
+            LAYER_H_TARGET_FLOORS[layer_id]
+            if layer_id < len(LAYER_H_TARGET_FLOORS)
+            else 0.20
+        )
         self.rho = (rho_min + rho_max) / 2  # start at midpoint
         self.last_entropy = float("nan")
         self.last_saturation = float("nan")
@@ -135,11 +157,20 @@ class LayerThermostat:
             if np.isfinite(H):
                 self._warmup_entropies.append(H)
             if self.tick >= self.warmup_ticks and self._warmup_entropies:
-                self.entropy_target = float(np.median(self._warmup_entropies))
-                log.info(
-                    "thermostat %s: learned H_target=%.4f from %d samples",
-                    self.layer_name, self.entropy_target, len(self._warmup_entropies),
-                )
+                raw_target = float(np.median(self._warmup_entropies))
+                # Enforce floor — cold-start targets can be too low (being
+                # reported "confinement" at 0.13/0.14/0.19)
+                self.entropy_target = max(raw_target, self.h_target_floor)
+                if raw_target < self.h_target_floor:
+                    log.info(
+                        "thermostat %s: learned H_target=%.4f raised to floor %.4f",
+                        self.layer_name, raw_target, self.h_target_floor,
+                    )
+                else:
+                    log.info(
+                        "thermostat %s: learned H_target=%.4f from %d samples",
+                        self.layer_name, self.entropy_target, len(self._warmup_entropies),
+                    )
                 self._warmup_entropies = []  # free memory
 
         # Adapt rho
@@ -191,16 +222,38 @@ class LayerThermostat:
             "tick": self.tick,
             "last_entropy": self.last_entropy if np.isfinite(self.last_entropy) else None,
             "last_saturation": self.last_saturation if np.isfinite(self.last_saturation) else None,
+            "warmup_entropies": [float(v) for v in self._warmup_entropies[-THERMOSTAT_PERSIST_STATES:]],
+            "buffer_tail": [
+                np.asarray(row, dtype=np.float32).round(6).tolist()
+                for row in list(self.buffer)[-THERMOSTAT_PERSIST_STATES:]
+            ],
         }
 
     def load_state_dict(self, d: dict):
-        """Restore from persistence."""
+        """Restore from persistence, enforcing h_target floor."""
         if d.get("entropy_target") is not None:
-            self.entropy_target = d["entropy_target"]
+            restored = d["entropy_target"]
+            self.entropy_target = max(restored, self.h_target_floor)
+            if restored < self.h_target_floor:
+                log.info(
+                    "thermostat %s: restored H_target=%.4f raised to floor %.4f",
+                    self.layer_name, restored, self.h_target_floor,
+                )
         if d.get("rho") is not None:
             self.rho = d["rho"]
         if d.get("tick") is not None:
             self.tick = d["tick"]
+        if d.get("last_entropy") is not None:
+            self.last_entropy = float(d["last_entropy"])
+        if d.get("last_saturation") is not None:
+            self.last_saturation = float(d["last_saturation"])
+        warmup = d.get("warmup_entropies") or []
+        self._warmup_entropies = [float(v) for v in warmup[-THERMOSTAT_PERSIST_STATES:]]
+        buffer_tail = d.get("buffer_tail") or []
+        self.buffer = deque(
+            [np.asarray(row, dtype=np.float32) for row in buffer_tail[-THERMOSTAT_PERSIST_STATES:]],
+            maxlen=self.buffer.maxlen,
+        )
 
 
 def make_thermostats(n_nodes: int = 192) -> list[LayerThermostat]:
@@ -251,17 +304,87 @@ def extract_rehearsal_hint(meta: dict | None) -> dict | None:
     return hint if isinstance(hint, dict) else None
 
 
-def build_provenance_entry(info: HandleInfo, meta: dict, output: float) -> dict:
+def classify_hint_status(rs, hint: dict | None) -> str:
+    """Explain whether a feeder hint is absent, present, or actively governing."""
+    if not isinstance(hint, dict):
+        return "none"
+    if rs is not None and rs.mode_authority == "hint":
+        return "governing"
+    if rs is not None and rs.mode_authority == "explicit":
+        return "present_blocked_by_explicit_mode"
+    if rs is not None and rs.hint_policy != "guarded":
+        return "present_not_adopted"
+    return "present_not_governing"
+
+
+def infer_last_live_wall_time(info: HandleInfo) -> float | None:
+    """Approximate wall-clock time of the most recent live tick for persistence."""
+    if info.last_tick_time <= 0:
+        return None
+    elapsed = max(0.0, time.monotonic() - info.last_tick_time)
+    return max(0.0, time.time() - elapsed)
+
+
+def reservoir_config_fingerprint(config: ReservoirConfig) -> str:
+    """Stable fingerprint for snapshot compatibility with the live reservoir math."""
+    payload = {
+        "runtime_version": RESERVOIR_RUNTIME_VERSION,
+        "input_dim": int(getattr(config, "input_dim", 0)),
+        "n_nodes": int(getattr(config, "n_nodes", 0)),
+        "output_dim": int(getattr(config, "output_dim", 0)),
+        "radii": list(getattr(config, "radii", ()) or ()),
+        "leaks": list(getattr(config, "leaks", ()) or ()),
+        "densities": list(getattr(config, "densities", ()) or ()),
+        "input_scales": list(getattr(config, "input_scales", ()) or ()),
+        "bias_scale": getattr(config, "bias_scale", None),
+        "ridge_alpha": getattr(config, "ridge_alpha", None),
+        "washout": getattr(config, "washout", None),
+        "seed": getattr(config, "seed", None),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:16]
+
+
+def stamp_event_meta(info: HandleInfo, meta: dict | None) -> dict:
+    """Attach stable service-side event identity and source timing metadata."""
+    stamped = sanitize_meta(meta or {}) or {}
+    if "event_id" in stamped and "source_event_id" not in stamped:
+        stamped["source_event_id"] = stamped["event_id"]
+    stamped.pop("event_id", None)
+    stamped.pop("event_seq", None)
+    info.event_seq += 1
+    stamped["event_seq"] = info.event_seq
+    stamped["event_id"] = f"{info.name}:{info.event_seq:06d}"
+    source_timestamp = stamped.get("source_timestamp")
+    if not isinstance(source_timestamp, (int, float)) or not np.isfinite(float(source_timestamp)):
+        source_timestamp = time.time()
+    stamped["source_timestamp"] = round(float(source_timestamp), 3)
+    return stamped
+
+
+def build_provenance_entry(info: HandleInfo, meta: dict, output: float | None = None) -> dict:
     """Store a compact recent history of shaping inputs for a handle."""
     entry = {
         "tick": info.tick_count,
         "time": round(time.time(), 3),
-        "output": round(float(output), 6),
+        "lane": meta_event_lane(meta),
     }
+    if output is not None and np.isfinite(output):
+        entry["output"] = round(float(output), 6)
     for key in (
+        "event_id",
+        "event_seq",
+        "source_event_id",
+        "source_timestamp",
         "source",
+        "handle_name",
+        "operation",
+        "tick_delta",
         "from_handle",
+        "baseline_handle",
         "input_source",
+        "scenario",
+        "progress",
         "projection",
         "conditioning",
         "memory_role",
@@ -270,6 +393,22 @@ def build_provenance_entry(info: HandleInfo, meta: dict, output: float) -> dict:
         "fill_pct",
         "lambda1_rel",
         "contact_gate",
+        "generated_tokens",
+        "elapsed_s",
+        "tok_per_s",
+        "temperature",
+        "max_tokens",
+        "messages_count",
+        "prompt_chars",
+        "response_chars",
+        "prompt_preview",
+        "response_preview",
+        "prompt_sha256_12",
+        "response_sha256_12",
+        "coupling_strength",
+        "reservoir_readout",
+        "h_norms_before",
+        "h_norms_after",
     ):
         if key in meta:
             entry[key] = meta[key]
@@ -277,6 +416,39 @@ def build_provenance_entry(info: HandleInfo, meta: dict, output: float) -> dict:
     if hint is not None:
         entry["rehearsal_hint"] = hint
     return entry
+
+
+def build_push_meta(meta: dict | None, tick_delta: int) -> dict:
+    """Normalize push_state metadata into the same bounded shape as live ticks."""
+    combined = {}
+    if isinstance(meta, dict):
+        combined.update(meta)
+    combined.setdefault("source", "push_state")
+    combined.setdefault("operation", "state_checkin")
+    combined.setdefault("tick_delta", int(tick_delta))
+    return sanitize_meta(combined) or {}
+
+
+def meta_event_lane(meta: dict | None) -> str | None:
+    """Classify metadata into coarse provenance lanes for summaries."""
+    if not isinstance(meta, dict) or not meta:
+        return None
+    source = str(meta.get("source", ""))
+    operation = str(meta.get("operation", ""))
+    if source == "coupled_astrid_server" or operation == "coupled_generation_checkin":
+        return "generation"
+    if "feeder" in source:
+        return "feeder"
+    if source == "push_state" or operation == "state_checkin":
+        return "checkin"
+    return "other"
+
+
+def update_lane_meta(info: HandleInfo, meta: dict | None):
+    """Remember the latest metadata for each major provenance lane."""
+    lane = meta_event_lane(meta)
+    if lane and isinstance(meta, dict) and meta:
+        info.last_lane_meta[lane] = meta
 
 
 class ReservoirService:
@@ -298,6 +470,7 @@ class ReservoirService:
         self.persistence = PersistenceManager(state_dir)
         self.text_proj = TextProjection(input_dim=input_dim)
         self._shutdown = asyncio.Event()
+        self._snapshot_fingerprint = reservoir_config_fingerprint(self.config)
 
     # ------------------------------------------------------------------
     # Handle lifecycle
@@ -339,12 +512,16 @@ class ReservoirService:
         info = self._require_handle(name)
         output = self.bridge.tick(name, input_vec)
         norms = self.bridge.h_norms(name)
+        live_meta = {"source": "tick_vector", "operation": "live_tick"}
+        if isinstance(meta, dict):
+            live_meta.update(meta)
 
         info.tick_count += 1
         info.last_tick_time = time.monotonic()
         info.output_ring.append(output)
         info.h_norm_ring.append(norms)
-        info.last_live_meta = sanitize_meta(meta or {}) or {}
+        info.last_live_meta = stamp_event_meta(info, live_meta)
+        update_lane_meta(info, info.last_live_meta)
         if info.last_live_meta:
             info.provenance_ring.append(build_provenance_entry(info, info.last_live_meta, output))
 
@@ -377,6 +554,7 @@ class ReservoirService:
             "hint_policy": rs.hint_policy if rs else "off",
             "last_live_meta": info.last_live_meta,
             "rehearsal_hint": hint,
+            "hint_status": classify_hint_status(rs, hint),
             "hint_applied": hint_applied,
         }
 
@@ -396,6 +574,8 @@ class ReservoirService:
         last_output = info.output_ring[-1] if info.output_ring else None
         elapsed = time.monotonic() - info.last_tick_time if info.last_tick_time > 0 else None
         hint = extract_rehearsal_hint(info.last_live_meta)
+        last_feeder_meta = info.last_lane_meta.get("feeder") if isinstance(info.last_lane_meta, dict) else None
+        last_generation_meta = info.last_lane_meta.get("generation") if isinstance(info.last_lane_meta, dict) else None
         return {
             "type": "read_state_response",
             "name": name,
@@ -409,9 +589,15 @@ class ReservoirService:
             "decay_weight": rs.decay_weight if rs else 0.0,
             "decay_profile": rs.decay_profile if rs else "medium",
             "seconds_since_live": round(elapsed, 2) if elapsed is not None else None,
+            "last_event_id": info.last_live_meta.get("event_id"),
+            "last_event_seq": info.last_live_meta.get("event_seq"),
+            "last_source_timestamp": info.last_live_meta.get("source_timestamp"),
             "last_live_meta": info.last_live_meta,
+            "last_feeder_meta": last_feeder_meta,
+            "last_generation_meta": last_generation_meta,
             "provenance": list(info.provenance_ring),
             "rehearsal_hint": hint,
+            "hint_status": classify_hint_status(rs, hint),
         }
 
     def trajectory(self, name: str, last_n: int = 20) -> dict:
@@ -451,6 +637,21 @@ class ReservoirService:
             result["rmsd"] = round(float(np.sqrt(np.mean((a - b) ** 2))), 6)
 
         return result
+
+    def layer_metrics(self, name: str) -> dict:
+        """Return per-layer thermostat and norm metrics for one handle."""
+        info = self._require_handle(name)
+        norms = self.bridge.h_norms(name)
+        layers = []
+        for i, thermostat in enumerate(info.thermostats):
+            m = thermostat.metrics()
+            m["h_norm"] = round(norms[i], 4) if i < len(norms) else None
+            layers.append(m)
+        return {
+            "type": "layer_metrics_response",
+            "name": name,
+            "layers": layers,
+        }
 
     # ------------------------------------------------------------------
     # Mode control
@@ -497,7 +698,18 @@ class ReservoirService:
             decay_profile=rs.decay_profile if rs else "medium",
             decay_weight=rs.decay_weight if rs else 0.0,
             tick_count=info.tick_count,
+            event_seq=info.event_seq,
+            snapshot_version=SNAPSHOT_SCHEMA_VERSION,
+            config_fingerprint=self._snapshot_fingerprint,
             entity=info.entity,
+            last_live_wall_time=infer_last_live_wall_time(info),
+            mode_authority=rs.mode_authority if rs else "system",
+            hint_policy=rs.hint_policy if rs else "off",
+            last_live_meta=info.last_live_meta,
+            last_lane_meta=info.last_lane_meta,
+            provenance=list(info.provenance_ring),
+            output_history=np.array(list(info.output_ring), dtype=np.float32),
+            h_norm_history=np.array(list(info.h_norm_ring), dtype=np.float32),
         )
         # Save thermostat state alongside the snapshot
         if info.thermostats:
@@ -512,6 +724,17 @@ class ReservoirService:
         snap = self.persistence.load_handle(name)
         if snap is None:
             raise ValueError(f"no snapshot for '{name}'")
+        if snap.snapshot_version != SNAPSHOT_SCHEMA_VERSION or snap.config_fingerprint != self._snapshot_fingerprint:
+            moved = self.persistence.quarantine_snapshot(name)
+            moved_text = ", ".join(str(path) for path in moved) if moved else "nothing moved"
+            raise ValueError(
+                "incompatible snapshot for "
+                f"'{name}' (snapshot_version={snap.snapshot_version}, "
+                f"config_fingerprint={snap.config_fingerprint or 'missing'}, "
+                f"expected_version={SNAPSHOT_SCHEMA_VERSION}, "
+                f"expected_fingerprint={self._snapshot_fingerprint}); "
+                f"quarantined: {moved_text}"
+            )
 
         # Create handle if it doesn't exist
         if not self.bridge.has_handle(name):
@@ -526,6 +749,29 @@ class ReservoirService:
         info = self.handles[name]
         info.entity = snap.entity
         info.tick_count = snap.tick_count
+        info.event_seq = max(
+            int(getattr(snap, "event_seq", 0) or 0),
+            int((snap.last_live_meta or {}).get("event_seq", 0) or 0),
+            max((int(entry.get("event_seq", 0) or 0) for entry in (snap.provenance or [])), default=0),
+        )
+        info.last_live_meta = snap.last_live_meta or {}
+        info.last_lane_meta = snap.last_lane_meta or {}
+        info.provenance_ring = deque((snap.provenance or [])[-PROVENANCE_SIZE:], maxlen=PROVENANCE_SIZE)
+        info.output_ring = deque(
+            [float(v) for v in np.asarray(snap.output_history if snap.output_history is not None else [], dtype=np.float32).tolist()],
+            maxlen=RING_SIZE,
+        )
+        h_norm_rows = np.asarray(
+            snap.h_norm_history if snap.h_norm_history is not None else np.empty((0, 3), dtype=np.float32),
+            dtype=np.float32,
+        )
+        info.h_norm_ring = deque(
+            [list(map(float, row)) for row in h_norm_rows.tolist()],
+            maxlen=RING_SIZE,
+        )
+        if snap.last_live_wall_time is not None:
+            elapsed = max(0.0, time.time() - snap.last_live_wall_time)
+            info.last_tick_time = max(1e-6, time.monotonic() - elapsed)
 
         # Restore rehearsal state
         rs = self.rehearsal.get_state(name)
@@ -534,6 +780,10 @@ class ReservoirService:
             rs.decay_profile = snap.decay_profile
             rs.decay_weight = snap.decay_weight
             rs.last_live_input = snap.last_input
+            rs.mode_authority = snap.mode_authority
+            rs.hint_policy = snap.hint_policy
+            if snap.last_live_wall_time is not None:
+                rs.last_live_time = max(0.0, time.monotonic() - max(0.0, time.time() - snap.last_live_wall_time))
 
         # Restore thermostat state if available
         if not info.thermostats:
@@ -605,6 +855,7 @@ class ReservoirService:
         h3_b64: str,
         tick_delta: int = 0,
         last_input: Optional[list] = None,
+        meta: Optional[dict] = None,
     ) -> dict:
         """Overwrite a handle's hidden state from base64-encoded numpy arrays.
 
@@ -625,6 +876,7 @@ class ReservoirService:
 
         # Credit the generation ticks to the handle
         info.tick_count += tick_delta
+        info.last_tick_time = time.monotonic()
 
         # Update rehearsal — use the caller's last input as the afterimage
         # so rehearsal replays something from the generation, not stale feeder data
@@ -639,8 +891,48 @@ class ReservoirService:
                 rs.last_live_input = np.array(last_input, dtype=np.float32).ravel()
 
         norms = self.bridge.h_norms(name)
-        log.info("push_state '%s': h_norms=[%.3f, %.3f, %.3f], +%d ticks", name, *norms, tick_delta)
-        return {"type": "push_state_response", "name": name, "ok": True, "h_norms": list(norms)}
+        info.h_norm_ring.append(norms)
+        info.last_live_meta = stamp_event_meta(info, build_push_meta(meta, tick_delta))
+        update_lane_meta(info, info.last_live_meta)
+        if info.last_live_meta:
+            info.provenance_ring.append(build_provenance_entry(info, info.last_live_meta))
+
+        # Feed current layers into thermostats so post-checkin metrics reflect
+        # the new state even though we do not synthesize a scalar trajectory point.
+        if info.thermostats:
+            try:
+                for thermostat, h_i in zip(info.thermostats, (h1, h2, h3)):
+                    thermostat.step(h_i)
+            except Exception:
+                pass
+
+        hint = extract_rehearsal_hint(info.last_live_meta)
+        hint_applied = False
+        if hint is not None:
+            hint_applied = self.rehearsal.maybe_apply_hint(name, hint)
+            rs = self.rehearsal.get_state(name)
+
+        log.info(
+            "push_state '%s': source=%s, h_norms=[%.3f, %.3f, %.3f], +%d ticks",
+            name,
+            info.last_live_meta.get("source", "push_state"),
+            *norms,
+            tick_delta,
+        )
+        return {
+            "type": "push_state_response",
+            "name": name,
+            "ok": True,
+            "h_norms": list(norms),
+            "tick": info.tick_count,
+            "mode": rs.mode if rs else "unknown",
+            "mode_authority": rs.mode_authority if rs else "system",
+            "hint_policy": rs.hint_policy if rs else "off",
+            "last_live_meta": info.last_live_meta,
+            "rehearsal_hint": hint,
+            "hint_status": classify_hint_status(rs, hint),
+            "hint_applied": hint_applied,
+        }
 
     # ------------------------------------------------------------------
     # List
@@ -652,6 +944,9 @@ class ReservoirService:
         for name, info in self.handles.items():
             rs = self.rehearsal.get_state(name)
             elapsed = now - info.last_tick_time if info.last_tick_time > 0 else None
+            last_feeder_meta = info.last_lane_meta.get("feeder") if isinstance(info.last_lane_meta, dict) else None
+            last_generation_meta = info.last_lane_meta.get("generation") if isinstance(info.last_lane_meta, dict) else None
+            memory_meta = last_feeder_meta or info.last_live_meta
             handles.append({
                 "name": name,
                 "entity": info.entity,
@@ -662,10 +957,19 @@ class ReservoirService:
                 "tick_count": info.tick_count,
                 "last_tick_ago": round(elapsed, 1) if elapsed is not None else None,
                 "last_source": info.last_live_meta.get("source"),
-                "memory_role": info.last_live_meta.get("memory_role"),
+                "last_event_id": info.last_live_meta.get("event_id"),
+                "last_event_seq": info.last_live_meta.get("event_seq"),
+                "last_source_timestamp": info.last_live_meta.get("source_timestamp"),
+                "last_feeder_source": last_feeder_meta.get("source") if isinstance(last_feeder_meta, dict) else None,
+                "last_generation_source": last_generation_meta.get("source") if isinstance(last_generation_meta, dict) else None,
+                "memory_role": memory_meta.get("memory_role") if isinstance(memory_meta, dict) else None,
                 "rehearsal_hint": extract_rehearsal_hint(info.last_live_meta),
+                "hint_status": classify_hint_status(rs, extract_rehearsal_hint(info.last_live_meta)),
                 "last_live_meta": info.last_live_meta,
+                "last_feeder_meta": last_feeder_meta,
+                "last_generation_meta": last_generation_meta,
                 "recent_sources": [entry.get("source") for entry in list(info.provenance_ring)[-3:] if entry.get("source")],
+                "recent_event_ids": [entry.get("event_id") for entry in list(info.provenance_ring)[-3:] if entry.get("event_id")],
                 "provenance": list(info.provenance_ring)[-3:],
             })
         return {"type": "list_handles_response", "handles": handles}
@@ -721,6 +1025,7 @@ class ReservoirService:
                     msg["name"], msg["h1"], msg["h2"], msg["h3"],
                     tick_delta=msg.get("tick_delta", 0),
                     last_input=msg.get("last_input"),
+                    meta=msg.get("meta"),
                 )
 
             elif msg_type == "destroy_handle":
@@ -728,18 +1033,7 @@ class ReservoirService:
                 return {"type": "destroy_handle_response", "name": msg["name"], "ok": True}
 
             elif msg_type == "layer_metrics":
-                info = self._require_handle(msg["name"])
-                norms = self.bridge.h_norms(msg["name"])
-                layers = []
-                for i, thermostat in enumerate(info.thermostats):
-                    m = thermostat.metrics()
-                    m["h_norm"] = round(norms[i], 4) if i < len(norms) else None
-                    layers.append(m)
-                return {
-                    "type": "layer_metrics_response",
-                    "name": msg["name"],
-                    "layers": layers,
-                }
+                return self.layer_metrics(msg["name"])
 
             else:
                 return {"type": "error", "message": f"unknown message type: {msg_type}"}

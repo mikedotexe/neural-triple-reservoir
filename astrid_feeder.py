@@ -466,8 +466,11 @@ async def run(db_path: Path, ws_url: str):
                     cfg["remote_memory_policy"],
                     _safe_float(cfg.get("remote_memory_strength"), 1.0),
                 )
+                source_timestamp = round(time.time(), 3)
                 tick_meta = {
                     "source": "astrid_feeder",
+                    "source_timestamp": source_timestamp,
+                    "source_event_id": f"codec_impact:{row_id}",
                     "projection": cfg["projection"],
                     "conditioning": cfg["conditioning"],
                     "memory_role": relation_meta["memory_role"],
@@ -489,6 +492,8 @@ async def run(db_path: Path, ws_url: str):
                     cross = [f * w for f in projected]
                     cross_meta = {
                         "source": "astrid_feeder_crossfeed",
+                        "source_timestamp": source_timestamp,
+                        "source_event_id": f"codec_impact:{row_id}",
                         "from_handle": "astrid",
                         "projection": cfg["projection"],
                         "conditioning": cfg["conditioning"],

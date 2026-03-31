@@ -46,7 +46,7 @@ class ReservoirConfig:
     n_nodes: int = 192
     output_dim: int = 1
     radii: Tuple[float, float, float] = (0.98, 0.92, 0.85)
-    leaks: Tuple[float, float, float] = (0.25, 0.18, 0.12)
+    leaks: Tuple[float, float, float] = (0.35, 0.22, 0.14)  # (0.25,0.18,0.12)→(0.35,0.22,0.14): faster integration so PERTURB effects propagate before they decay
     densities: Tuple[float, float, float] = (1.0, 1.0, 1.0)
     input_scales: Tuple[float, float, float] = (0.8, 0.7, 0.6)
     bias_scale: float = 0.05

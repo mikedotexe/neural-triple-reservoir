@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+import time
 from typing import Any
 
 import numpy as np
@@ -99,6 +100,17 @@ TOOLS = [
         },
     },
     {
+        "name": "reservoir_layer_metrics",
+        "description": "Get per-layer thermostat metrics for a handle. Returns h_norm, spectral entropy, entropy target, saturation, rho, and a simple interpretation label for each layer.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Handle name"},
+            },
+            "required": ["name"],
+        },
+    },
+    {
         "name": "reservoir_set_mode",
         "description": "Set the rehearsal mode for a handle. Modes: 'hold' (full replay, prevents fade), 'rehearse' (decaying replay, default), 'quiet' (genuine silence, natural drift). Decay profiles: 'fast' (~7s half-life), 'medium' (~17s), 'slow' (~70s).",
         "inputSchema": {
@@ -167,7 +179,7 @@ TOOLS = [
     },
     {
         "name": "reservoir_push_state",
-        "description": "Overwrite a handle's hidden state with base64-encoded h1/h2/h3 arrays. Use with care — this replaces the handle's entire dynamical history. Intended for restoring a saved state or injecting a known configuration.",
+        "description": "Overwrite a handle's hidden state with base64-encoded h1/h2/h3 arrays. Use with care — this replaces the handle's entire dynamical history. Intended for restoring a saved state or injecting a known configuration. Optional compact metadata can annotate the check-in for observability.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -175,6 +187,7 @@ TOOLS = [
                 "h1": {"type": "string", "description": "Base64-encoded float32 array for layer 1"},
                 "h2": {"type": "string", "description": "Base64-encoded float32 array for layer 2"},
                 "h3": {"type": "string", "description": "Base64-encoded float32 array for layer 3"},
+                "meta": {"type": "object", "description": "Optional compact provenance metadata for the push_state event"},
             },
             "required": ["name", "h1", "h2", "h3"],
         },
@@ -214,6 +227,15 @@ class MCPReservoirServer:
                 await self._send({"type": "set_mode", "name": name, "mode": "rehearse", "decay_profile": "slow"})
 
     @staticmethod
+    def _preview(text: str | None, max_chars: int = 64) -> str | None:
+        if not isinstance(text, str) or not text:
+            return None
+        compact = " ".join(text.split())
+        if len(compact) <= max_chars:
+            return compact
+        return compact[: max(0, max_chars - 3)].rstrip() + "..."
+
+    @staticmethod
     def _meta_summary(meta: dict | None) -> str | None:
         if not isinstance(meta, dict) or not meta:
             return None
@@ -221,6 +243,43 @@ class MCPReservoirServer:
         source = meta.get("source")
         if source:
             parts.append(f"source={source}")
+        if source == "coupled_astrid_server":
+            tokens = meta.get("generated_tokens")
+            elapsed = meta.get("elapsed_s")
+            tok_per_s = meta.get("tok_per_s")
+            if tokens is not None:
+                generation = f"generation={tokens}tok"
+                if isinstance(elapsed, (int, float)):
+                    generation += f"/{float(elapsed):.1f}s"
+                if isinstance(tok_per_s, (int, float)):
+                    generation += f" @{float(tok_per_s):.1f}tok/s"
+                parts.append(generation)
+            coupling = meta.get("coupling_strength")
+            if isinstance(coupling, (int, float)):
+                parts.append(f"coupling={float(coupling):.3f}")
+            readout = meta.get("reservoir_readout")
+            if isinstance(readout, dict):
+                y1 = readout.get("y1_final")
+                y2 = readout.get("y2_final")
+                y3 = readout.get("y3_final")
+                if all(isinstance(v, (int, float)) for v in (y1, y2, y3)):
+                    parts.append(f"y=[{float(y1):+.3f},{float(y2):+.3f},{float(y3):+.3f}]")
+            preview = MCPReservoirServer._preview(meta.get("response_preview"))
+            if preview:
+                parts.append(f"preview={preview!r}")
+            event_id = meta.get("event_id")
+            if event_id:
+                parts.append(f"event={event_id}")
+            source_timestamp = meta.get("source_timestamp")
+            if isinstance(source_timestamp, (int, float)):
+                parts.append(f"at={time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(float(source_timestamp)))}")
+            return ", ".join(parts) if parts else None
+        operation = meta.get("operation")
+        if operation:
+            parts.append(f"operation={operation}")
+        tick_delta = meta.get("tick_delta")
+        if isinstance(tick_delta, int):
+            parts.append(f"tick_delta={tick_delta}")
         input_source = meta.get("input_source")
         if input_source:
             parts.append(f"input={input_source}")
@@ -230,6 +289,12 @@ class MCPReservoirServer:
         memory_role = meta.get("memory_role")
         if memory_role:
             parts.append(f"memory={memory_role}")
+        event_id = meta.get("event_id")
+        if event_id:
+            parts.append(f"event={event_id}")
+        source_timestamp = meta.get("source_timestamp")
+        if isinstance(source_timestamp, (int, float)):
+            parts.append(f"at={time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(float(source_timestamp)))}")
         return ", ".join(parts) if parts else None
 
     @staticmethod
@@ -244,6 +309,33 @@ class MCPReservoirServer:
         if mode and decay:
             return f"{mode}/{decay}"
         return reason
+
+    @staticmethod
+    def _hint_status_summary(status: str | None) -> str | None:
+        mapping = {
+            "none": None,
+            "governing": "governing current mode",
+            "present_not_adopted": "present, not governing",
+            "present_not_governing": "present, not governing",
+            "present_blocked_by_explicit_mode": "present, blocked by explicit mode",
+        }
+        return mapping.get(status or "none", status)
+
+    @staticmethod
+    def _layer_state(layer: dict) -> str:
+        entropy = layer.get("entropy")
+        target = layer.get("entropy_target")
+        saturation = layer.get("saturation")
+        if target is None or entropy is None:
+            return "warming_up"
+        if saturation is not None and saturation >= 0.20:
+            return "high_saturation"
+        delta = float(entropy) - float(target)
+        if delta <= -0.08:
+            return "below_target"
+        if delta >= 0.08:
+            return "above_target"
+        return "near_target"
 
     async def _full_status(self) -> str:
         """Build an interpretive overview of all handles and cross-entity resonance."""
@@ -274,10 +366,18 @@ class MCPReservoirServer:
             )
             meta_line = self._meta_summary(h.get("last_live_meta"))
             if meta_line:
-                lines.append(f"  last input: {meta_line}")
+                lines.append(f"  last live: {meta_line}")
+            feeder_line = self._meta_summary(h.get("last_feeder_meta"))
+            if feeder_line:
+                lines.append(f"  feeder lane: {feeder_line}")
+            generation_line = self._meta_summary(h.get("last_generation_meta"))
+            if generation_line:
+                lines.append(f"  last generation: {generation_line}")
             hint_line = self._hint_summary(h.get("rehearsal_hint"))
             if hint_line:
-                lines.append(f"  soft hint: {hint_line}")
+                status_line = self._hint_status_summary(h.get("hint_status"))
+                suffix = f" [{status_line}]" if status_line else ""
+                lines.append(f"  soft hint: {hint_line}{suffix}")
             recent_sources = h.get("recent_sources") or []
             if recent_sources:
                 lines.append(f"  recent sources: {', '.join(recent_sources)}")
@@ -356,9 +456,18 @@ class MCPReservoirServer:
                     meta_line = self._meta_summary(h.get("last_live_meta"))
                     if meta_line:
                         line += f", {meta_line}"
+                    feeder_line = self._meta_summary(h.get("last_feeder_meta"))
+                    if feeder_line and feeder_line != meta_line:
+                        line += f", feeder={feeder_line}"
+                    generation_line = self._meta_summary(h.get("last_generation_meta"))
+                    if generation_line:
+                        line += f", generation={generation_line}"
                     hint_line = self._hint_summary(h.get("rehearsal_hint"))
                     if hint_line:
+                        status_line = self._hint_status_summary(h.get("hint_status"))
                         line += f", hint={hint_line}"
+                        if status_line:
+                            line += f" ({status_line})"
                     lines.append(line)
                 return "Reservoir handles:\n" + "\n".join(lines)
 
@@ -419,11 +528,23 @@ class MCPReservoirServer:
                     f"  last_output={result['last_output']}\n"
                     f"  h_norms=[{', '.join(f'{n:.3f}' for n in result['h_norms'])}]"
                     + (
-                        f"\n  last_input={self._meta_summary(result.get('last_live_meta'))}"
+                        f"\n  last_live={self._meta_summary(result.get('last_live_meta'))}"
                         if self._meta_summary(result.get("last_live_meta")) else ""
                     )
                     + (
+                        f"\n  feeder_lane={self._meta_summary(result.get('last_feeder_meta'))}"
+                        if self._meta_summary(result.get("last_feeder_meta")) else ""
+                    )
+                    + (
+                        f"\n  last_generation={self._meta_summary(result.get('last_generation_meta'))}"
+                        if self._meta_summary(result.get("last_generation_meta")) else ""
+                    )
+                    + (
                         f"\n  soft_hint={self._hint_summary(result.get('rehearsal_hint'))}"
+                        + (
+                            f" [{self._hint_status_summary(result.get('hint_status'))}]"
+                            if self._hint_status_summary(result.get("hint_status")) else ""
+                        )
                         if self._hint_summary(result.get("rehearsal_hint")) else ""
                     )
                     + (
@@ -455,6 +576,26 @@ class MCPReservoirServer:
                 lines = [f"Trajectory for '{result['name']}' (last {len(outputs)} of {result['ticks']} ticks):"]
                 for i, (o, hn) in enumerate(zip(outputs, result.get("h_norms", []))):
                     lines.append(f"  [{i:3d}] output={o:+.6f}  h=[{', '.join(f'{n:.3f}' for n in hn)}]")
+                return "\n".join(lines)
+
+            elif tool_name == "reservoir_layer_metrics":
+                result = await self._send({"type": "layer_metrics", "name": arguments["name"]})
+                if result.get("type") == "error":
+                    return f"Error: {result['message']}"
+                layers = result.get("layers", [])
+                if not layers:
+                    return f"No layer metrics for '{arguments['name']}'."
+                lines = [f"Layer metrics for '{arguments['name']}':"]
+                for layer in layers:
+                    lines.append(
+                        f"  {layer['name']}: "
+                        f"h_norm={layer.get('h_norm')}, "
+                        f"entropy={layer.get('entropy')}, "
+                        f"target={layer.get('entropy_target')}, "
+                        f"saturation={layer.get('saturation')}, "
+                        f"rho={layer.get('rho')}, "
+                        f"state={self._layer_state(layer)}"
+                    )
                 return "\n".join(lines)
 
             elif tool_name == "reservoir_set_mode":
@@ -530,13 +671,16 @@ class MCPReservoirServer:
                 return "\n".join(lines)
 
             elif tool_name == "reservoir_push_state":
-                result = await self._send({
+                msg: dict[str, Any] = {
                     "type": "push_state",
                     "name": arguments["name"],
                     "h1": arguments["h1"],
                     "h2": arguments["h2"],
                     "h3": arguments["h3"],
-                })
+                }
+                if "meta" in arguments:
+                    msg["meta"] = arguments["meta"]
+                result = await self._send(msg)
                 if result.get("type") == "error":
                     return f"Error: {result['message']}"
                 norms = result.get("h_norms", [0, 0, 0])
