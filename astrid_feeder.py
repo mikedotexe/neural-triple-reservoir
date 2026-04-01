@@ -205,6 +205,12 @@ def apply_remote_memory_policy(
     role = str(chosen.get("role") or selected_role or "").strip().lower()
     base = _safe_array(base_vec)
     remote = _safe_array(remote_vec)
+    # Handle dimension mismatch: remote memories may be 32D (legacy) while
+    # current codec outputs 48D. Pad or truncate remote to match base.
+    if remote.shape[0] < base.shape[0]:
+        remote = np.pad(remote, (0, base.shape[0] - remote.shape[0]))
+    elif remote.shape[0] > base.shape[0]:
+        remote = remote[: base.shape[0]]
     blend = REMOTE_MEMORY_ROLE_BLEND.get(role, 0.12) * max(strength, 0.0) * contact_gate
     blend = min(max(blend, 0.0), 0.80)
     shaped = ((1.0 - blend) * base + blend * remote).astype(np.float32)
@@ -442,15 +448,28 @@ async def run(db_path: Path, ws_url: str):
                     )
 
             conn = sqlite3.connect(str(db_path), timeout=5)
-            rows = conn.execute(
-                "SELECT id, features_json FROM codec_impact WHERE id > ? ORDER BY id",
-                (last_id,),
-            ).fetchall()
+            try:
+                rows = conn.execute(
+                    "SELECT id, features_json, chunk_index, chunk_total FROM codec_impact WHERE id > ? ORDER BY id",
+                    (last_id,),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                # Schema doesn't have chunk columns yet — fall back.
+                rows = [
+                    (r[0], r[1], 0, 1)
+                    for r in conn.execute(
+                        "SELECT id, features_json FROM codec_impact WHERE id > ? ORDER BY id",
+                        (last_id,),
+                    ).fetchall()
+                ]
             conn.close()
 
-            for row_id, features_json in rows:
+            for row in rows:
+                row_id, features_json = row[0], row[1]
+                chunk_index = row[2] if len(row) > 2 else 0
+                chunk_total = row[3] if len(row) > 3 else 1
                 features = json.loads(features_json)
-                if len(features) != 32:
+                if len(features) not in (32, 48):
                     log.warning("unexpected feature dim %d at id=%d", len(features), row_id)
                     last_id = row_id
                     continue
@@ -471,6 +490,8 @@ async def run(db_path: Path, ws_url: str):
                     "source": "astrid_feeder",
                     "source_timestamp": source_timestamp,
                     "source_event_id": f"codec_impact:{row_id}",
+                    "chunk_index": chunk_index,
+                    "chunk_total": chunk_total,
                     "projection": cfg["projection"],
                     "conditioning": cfg["conditioning"],
                     "memory_role": relation_meta["memory_role"],
