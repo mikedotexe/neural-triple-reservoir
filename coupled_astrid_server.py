@@ -2,10 +2,10 @@
 """
 coupled_astrid_server.py -- Drop-in replacement for mlx_lm.server on port 8090.
 
-Loads gemma-3-4b-it-4bit via mlx_lm.load(), runs bidirectional coupled
-generation where the triple reservoir's dynamical state modulates Astrid's
-logits at every token, and each token's embedding feeds back into the
-reservoir. OpenAI-compatible /v1/chat/completions endpoint.
+Loads an MLX model (default: Qwen3-8B-4bit) via mlx_lm.load(), runs
+bidirectional coupled generation where the triple reservoir's dynamical state
+modulates Astrid's logits at every token, and each token's embedding feeds
+back into the reservoir. OpenAI-compatible /v1/chat/completions endpoint.
 
 The bridge doesn't know or care that coupling is happening — it sends the
 same JSON request and gets the same JSON response. The reservoir's influence
@@ -27,6 +27,7 @@ import inspect
 import json
 import logging
 import os
+import re
 import signal
 import sys
 import time
@@ -328,6 +329,19 @@ class CoupledAstridServer:
 
         log.info("model loaded: hidden_size=%d", self.embed_dim)
 
+        # Build stop token set (eos + ChatML <|im_end|>, <|endoftext|>)
+        self._stop_token_ids = set()
+        if self.tokenizer.eos_token_id is not None:
+            self._stop_token_ids.add(self.tokenizer.eos_token_id)
+        for special in ("<|im_end|>", "<|endoftext|>", "<end_of_turn>", "<|eot_id|>"):
+            try:
+                ids = self.tokenizer.encode(special, add_special_tokens=False)
+                if len(ids) == 1:
+                    self._stop_token_ids.add(ids[0])
+            except Exception:
+                pass
+        log.info("stop tokens: %s", self._stop_token_ids)
+
         # Build reservoir from canonical seed — must match reservoir_service
         np_model, cfg = build_canonical_reservoir(input_dim=input_dim, n_nodes=n_nodes)
 
@@ -371,10 +385,36 @@ class CoupledAstridServer:
         # Pull initial state from service
         self._pull_state()
 
+    def _create_handle(self, handle_name: str = "astrid") -> bool:
+        """Create a named handle on the reservoir service.
+
+        Called automatically when pull/push discovers the handle is missing
+        (e.g. after a reservoir service restart).
+        """
+        try:
+            import websockets.sync.client as ws_sync
+            with ws_sync.connect(RESERVOIR_WS_URL, open_timeout=2) as ws:
+                ws.send(json.dumps({
+                    "type": "create_handle",
+                    "name": handle_name,
+                    "entity": handle_name,
+                }))
+                response_text = ws.recv(timeout=5)
+                r = json.loads(response_text)
+                if r.get("type") == "error":
+                    log.warning("create_handle failed: %s", r.get("message"))
+                    return False
+                log.info("create_handle: '%s' created (ticks=%s)", handle_name, r.get("ticks"))
+                return True
+        except Exception as e:
+            log.warning("create_handle failed for '%s': %s", handle_name, e)
+            return False
+
     def _pull_state(
         self,
         handle_name: str = "astrid",
         audit: dict[str, object] | None = None,
+        _bootstrap_retry: bool = True,
     ) -> bool:
         """Check out the full handle state from the reservoir service.
 
@@ -388,11 +428,15 @@ class CoupledAstridServer:
 
             serialization_start = time.perf_counter()
             request_text = json.dumps({"type": "pull_state", "name": handle_name})
-            roundtrip_start = time.perf_counter()
+            rpc_start = time.monotonic()
             with ws_sync.connect(RESERVOIR_WS_URL, open_timeout=2) as ws:
                 ws.send(request_text)
-                response_text = ws.recv()
-            roundtrip_s = time.perf_counter() - roundtrip_start
+                response_text = ws.recv(timeout=5)
+            roundtrip_s = time.perf_counter() - (serialization_start + (time.perf_counter() - time.perf_counter()))
+            rpc_elapsed = time.monotonic() - rpc_start
+            if rpc_elapsed > 1.0:
+                log.warning("pull_state: slow RPC (%.1fs)", rpc_elapsed)
+            roundtrip_s = rpc_elapsed
 
             r = json.loads(response_text)
             if audit is not None:
@@ -403,6 +447,11 @@ class CoupledAstridServer:
                 reservoir["roundtrip_s"] = float(reservoir.get("roundtrip_s", 0.0)) + roundtrip_s
                 audit["reservoir"] = reservoir
             if r.get("type") == "error":
+                msg = r.get("message", "")
+                if "not found" in msg and _bootstrap_retry:
+                    log.info("pull_state: '%s' handle missing — creating", handle_name)
+                    if self._create_handle(handle_name):
+                        return self._pull_state(handle_name, audit, _bootstrap_retry=False)
                 log.info("pull_state: no '%s' handle yet — using local state", handle_name)
                 if audit is not None:
                     reservoir = dict(audit.get("reservoir", {}) or {})
@@ -529,11 +578,13 @@ class CoupledAstridServer:
                 msg["meta"] = meta
             request_text = json.dumps(msg)
             serialization_s = time.perf_counter() - serialization_start
-            roundtrip_start = time.perf_counter()
+            rpc_start = time.monotonic()
             with ws_sync.connect(RESERVOIR_WS_URL, open_timeout=2) as ws:
                 ws.send(request_text)
-                response_text = ws.recv()
-            roundtrip_s = time.perf_counter() - roundtrip_start
+                response_text = ws.recv(timeout=5)
+            roundtrip_s = time.monotonic() - rpc_start
+            if roundtrip_s > 1.0:
+                log.warning("push_state: slow RPC (%.1fs)", roundtrip_s)
             ack_parse_start = time.perf_counter()
             r = json.loads(response_text)
             serialization_s += time.perf_counter() - ack_parse_start
@@ -550,6 +601,10 @@ class CoupledAstridServer:
             if r.get("ok"):
                 norms = r.get("h_norms", [0, 0, 0])
                 log.info("push_state: checked in %s (+%d ticks, h_norms=[%.3f, %.3f, %.3f])", handle_name, ticks, *norms)
+            elif r.get("type") == "error" and "not found" in r.get("message", ""):
+                log.info("push_state: '%s' handle missing — creating", handle_name)
+                if self._create_handle(handle_name):
+                    log.info("push_state: handle created, state will sync on next pull")
             else:
                 log.warning("push_state: %s", r.get("message", "unknown error"))
         except Exception as e:
@@ -679,23 +734,27 @@ class CoupledAstridServer:
         if hasattr(self.tokenizer, "apply_chat_template"):
             try:
                 return self.tokenizer.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=True
+                    messages, tokenize=False, add_generation_prompt=True,
+                    enable_thinking=False,
                 )
+            except TypeError:
+                # Model template doesn't accept enable_thinking (e.g. Gemma)
+                try:
+                    return self.tokenizer.apply_chat_template(
+                        messages, tokenize=False, add_generation_prompt=True
+                    )
+                except Exception:
+                    pass
             except Exception:
                 pass
 
-        # Fallback: manual formatting
+        # Fallback: manual ChatML formatting
         parts = []
         for msg in messages:
             role = msg.get("role", "user")
             content = msg.get("content", "")
-            if role == "system":
-                parts.append(f"<start_of_turn>system\n{content}<end_of_turn>")
-            elif role == "user":
-                parts.append(f"<start_of_turn>user\n{content}<end_of_turn>")
-            elif role == "assistant":
-                parts.append(f"<start_of_turn>model\n{content}<end_of_turn>")
-        parts.append("<start_of_turn>model\n")
+            parts.append(f"<|im_start|>{role}\n{content}<|im_end|>")
+        parts.append("<|im_start|>assistant\n")
         return "\n".join(parts)
 
     def generate_coupled(
@@ -807,11 +866,15 @@ class CoupledAstridServer:
 
             ticks += 1
 
-            if token == self.tokenizer.eos_token_id:
+            if token in self._stop_token_ids:
                 break
 
         detokenizer.finalize()
         text = detokenizer.text
+        # Strip any <think>...</think> blocks and special token artifacts
+        text = re.sub(r'<think>.*?</think>\s*', '', text, flags=re.DOTALL)
+        text = re.sub(r'<\|im_end\|>.*', '', text)
+        text = re.sub(r'<\|eot_id\|>.*', '', text).strip()
         request_info = dict(request_audit.get("request", {}) or {})
         request_info["response_sha256_12"] = self._text_digest(text)
         request_info["response_chars"] = len(text)

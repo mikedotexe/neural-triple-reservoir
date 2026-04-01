@@ -244,6 +244,7 @@ class ReservoirLogitProcessor:
         # Positive y1 → lower temp (more confident), negative → higher (exploratory)
         sig1 = self._sigmoid(self._y1)
         t_mod = 1.0 - s * (2.0 * sig1 - 1.0)
+        t_mod = max(0.5, min(2.0, t_mod))  # defensive clamp
         logits = logits * (1.0 / t_mod)
 
         # Layer 2 (medium): repetition penalty modulation
