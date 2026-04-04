@@ -46,6 +46,7 @@ log = logging.getLogger("minime-feeder")
 
 DEFAULT_WORKSPACE = Path("/Users/v/other/minime/workspace")
 POLL_INTERVAL = 1.0  # seconds between reads
+SHADOW_SUFFIX = "__lsm"
 MEMORY_POLICIES = {"off", "role_blend"}
 MEMORY_ROLE_BLEND = {
     "latest": 0.10,
@@ -98,6 +99,10 @@ PROJECTIONS = {
     "normalized": project_normalized,
     "ranked": project_ranked,
 }
+
+
+def shadow_name(name: str) -> str:
+    return f"{name}{SHADOW_SUFFIX}"
 
 
 def _safe_array(values: list[float]) -> np.ndarray:
@@ -317,18 +322,42 @@ async def run(workspace: Path, ws_url: str):
         try:
             ws = await websockets.connect(ws_url)
             log.info("connected to reservoir service")
-            for name, entity in [("minime", "minime"), ("claude_main", "claude")]:
-                await ws.send(json.dumps({"type": "create_handle", "name": name, "entity": entity}))
-                r = json.loads(await ws.recv())
-                if r.get("type") == "error" and "already exists" in r.get("message", ""):
-                    pass
-                elif r.get("ok"):
-                    log.info("created handle '%s'", name)
-                    if name == "minime":
-                        await ws.send(json.dumps({"type": "set_mode", "name": name, "mode": "rehearse", "decay_profile": "fast"}))
-                        await ws.recv()
-                    elif name == "claude_main":
-                        await ws.send(json.dumps({"type": "set_mode", "name": name, "mode": "rehearse", "decay_profile": "slow"}))
+            specs = [
+                ("minime", "minime", "rehearse", "fast"),
+                ("claude_main", "claude", "rehearse", "slow"),
+            ]
+            for name, entity, mode, decay_profile in specs:
+                for handle_name, handle_backend in (
+                    (name, None),
+                    (shadow_name(name), "lsm_shadow"),
+                ):
+                    payload = {
+                        "type": "create_handle",
+                        "name": handle_name,
+                        "entity": entity,
+                    }
+                    if handle_backend is not None:
+                        payload["backend"] = handle_backend
+                    await ws.send(json.dumps(payload))
+                    r = json.loads(await ws.recv())
+                    if r.get("type") == "error" and "already exists" in r.get("message", ""):
+                        continue
+                    if r.get("ok"):
+                        log.info(
+                            "created handle '%s' (%s)",
+                            handle_name,
+                            r.get("backend", handle_backend or "default"),
+                        )
+                        await ws.send(
+                            json.dumps(
+                                {
+                                    "type": "set_mode",
+                                    "name": handle_name,
+                                    "mode": mode,
+                                    "decay_profile": decay_profile,
+                                }
+                            )
+                        )
                         await ws.recv()
             return ws
         except Exception as e:
@@ -352,6 +381,17 @@ async def run(workspace: Path, ws_url: str):
             log.warning("tick failed for '%s': %s", name, e)
             ws = None
             return False
+
+    async def tick_with_shadow(name: str, vec: list[float], meta: dict | None = None) -> bool:
+        ok = await tick_handle(name, vec, meta)
+        if not ok:
+            return False
+        shadow_meta = dict(meta or {})
+        shadow_meta["shadow_of"] = name
+        shadow_ok = await tick_handle(shadow_name(name), vec, shadow_meta)
+        if not shadow_ok:
+            log.warning("shadow tick failed for '%s' while live handle succeeded", name)
+        return True
 
     log.info("watching %s every %.0fs", spectral_path, POLL_INTERVAL)
 
@@ -405,7 +445,7 @@ async def run(workspace: Path, ws_url: str):
                             "rehearsal_hint": build_rehearsal_hint(data, memory_meta),
                         }
 
-                        ok = await tick_handle("minime", vec, tick_meta)
+                        ok = await tick_with_shadow("minime", vec, tick_meta)
                         if ok:
                             tick_count += 1
                             # Cross-feed Claude (attenuated)
@@ -424,7 +464,7 @@ async def run(workspace: Path, ws_url: str):
                                 "lambda1_rel": round(l1, 4),
                                 "rehearsal_hint": build_rehearsal_hint(data, memory_meta),
                             }
-                            await tick_handle("claude_main", cross, cross_meta)
+                            await tick_with_shadow("claude_main", cross, cross_meta)
 
                             if tick_count % 60 == 1:
                                 role = memory_meta["role"] or "none"

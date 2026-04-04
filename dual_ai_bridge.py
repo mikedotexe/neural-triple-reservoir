@@ -34,7 +34,7 @@ import json
 import sys
 import urllib.request
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import Any, Iterator, Optional
 
 import numpy as np
 
@@ -155,8 +155,197 @@ class MLXSource:
 # Reservoir bridge — one model, multiple named state handles
 # ---------------------------------------------------------------------------
 
+class BackendOperationUnsupported(RuntimeError):
+    """Raised when a backend cannot fulfill a requested operation."""
+
+
+def _build_synthetic_training_data(config: ReservoirConfig) -> tuple[np.ndarray, np.ndarray]:
+    from triple_reservoir_coreml import CANONICAL_SEED
+
+    rng = np.random.default_rng(CANONICAL_SEED)
+    d = config.input_dim
+    x = np.tanh(rng.standard_normal((3000, d))).astype(np.float32)
+    y = np.zeros((3000, config.output_dim), dtype=np.float32)
+    latent = 0.0
+    for t in range(3000):
+        latent = 0.9 * latent + 0.3 * float(x[t, : min(4, d)].sum())
+        y[t, 0] = latent
+    return x, y
+
+
+class _BaseBackend:
+    name = "unknown"
+    label = "Unknown"
+    supports_pull_push = True
+
+    def __init__(self, config: ReservoirConfig):
+        self.config = config
+
+    def make_state(self) -> Any:
+        raise NotImplementedError
+
+    def tick(self, state: Any, x: np.ndarray) -> tuple[Any, float]:
+        raise NotImplementedError
+
+    def read_state(self, state: Any) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        raise NotImplementedError
+
+    def set_state(self, h1: np.ndarray, h2: np.ndarray, h3: np.ndarray) -> Any:
+        raise NotImplementedError
+
+    def h_norms(self, state: Any) -> tuple[float, float, float]:
+        h1, h2, h3 = self.read_state(state)
+        return (
+            float(np.linalg.norm(h1)),
+            float(np.linalg.norm(h2)),
+            float(np.linalg.norm(h3)),
+        )
+
+    def get_layer_states(self, state: Any) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        h1, h2, h3 = self.read_state(state)
+        return (
+            np.asarray(h1).ravel(),
+            np.asarray(h2).ravel(),
+            np.asarray(h3).ravel(),
+        )
+
+
+class _NumpyBackend(_BaseBackend):
+    name = "numpy"
+    label = "NumPy"
+
+    def __init__(self, config: ReservoirConfig):
+        super().__init__(config)
+        self._model = TripleReservoir(config)
+        x, y = _build_synthetic_training_data(config)
+        self._model.fit_readout(x, y)
+
+    def make_state(self) -> Any:
+        return self._model.zero_state()
+
+    def tick(self, state: Any, x: np.ndarray) -> tuple[Any, float]:
+        y, _, new_state = self._model.step_numpy(x.astype(np.float32), state)
+        return new_state, float(y.ravel()[0])
+
+    def read_state(self, state: Any) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        h1, h2, h3 = state
+        return h1.copy(), h2.copy(), h3.copy()
+
+    def set_state(self, h1: np.ndarray, h2: np.ndarray, h3: np.ndarray) -> Any:
+        return (
+            np.asarray(h1, dtype=np.float32),
+            np.asarray(h2, dtype=np.float32),
+            np.asarray(h3, dtype=np.float32),
+        )
+
+
+class _MLXBackend(_BaseBackend):
+    name = "mlx"
+    label = "MLX (Metal)"
+
+    def __init__(self, config: ReservoirConfig):
+        super().__init__(config)
+        import mlx.core as mx
+        from mlx_reservoir import MLXTripleReservoir
+
+        self._mx = mx
+        np_model = TripleReservoir(config)
+        x, y = _build_synthetic_training_data(config)
+        np_model.fit_readout(x, y)
+        self._model = MLXTripleReservoir(np_model)
+        self._tick_count = 0
+
+    def make_state(self) -> Any:
+        return self._model.zero_state()
+
+    def tick(self, state: Any, x: np.ndarray) -> tuple[Any, float]:
+        x_mx = self._mx.array(x.astype(np.float32))
+        y, _, new_state = self._model.step(x_mx, state)
+        self._tick_count += 1
+        if self._tick_count % 64 == 0:
+            self._mx.eval(*new_state)
+        return new_state, float(y.item())
+
+    def read_state(self, state: Any) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        return self._model.state_to_numpy(state)
+
+    def set_state(self, h1: np.ndarray, h2: np.ndarray, h3: np.ndarray) -> Any:
+        return self._model.state_from_numpy((h1, h2, h3))
+
+    def h_norms(self, state: Any) -> tuple[float, float, float]:
+        h1, h2, h3 = state
+        return (
+            float(self._mx.sqrt(self._mx.sum(h1 * h1)).item()),
+            float(self._mx.sqrt(self._mx.sum(h2 * h2)).item()),
+            float(self._mx.sqrt(self._mx.sum(h3 * h3)).item()),
+        )
+
+
+class _CoreMLBackend(_BaseBackend):
+    name = "coreml"
+    label = "Core ML (ANE)"
+    supports_pull_push = False
+
+    def __init__(self, config: ReservoirConfig, mlpackage: Path, compute_units: str):
+        super().__init__(config)
+        import coremltools as ct
+
+        cu_map = {
+            "all": ct.ComputeUnit.ALL,
+            "cpu_only": ct.ComputeUnit.CPU_ONLY,
+            "cpu_and_gpu": ct.ComputeUnit.CPU_AND_GPU,
+            "cpu_and_ne": ct.ComputeUnit.CPU_AND_NE,
+        }
+        self._coreml = ct.models.MLModel(str(mlpackage), compute_units=cu_map[compute_units])
+
+    def make_state(self) -> Any:
+        return self._coreml.make_state()
+
+    def tick(self, state: Any, x: np.ndarray) -> tuple[Any, float]:
+        out = self._coreml.predict({"x": x.astype(np.float16)}, state=state)
+        return state, float(np.asarray(out["y"]).ravel()[0])
+
+    def read_state(self, state: Any) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        raise BackendOperationUnsupported("CoreML state readback not supported yet")
+
+    def set_state(self, h1: np.ndarray, h2: np.ndarray, h3: np.ndarray) -> Any:
+        raise BackendOperationUnsupported("CoreML state injection not supported yet")
+
+    def h_norms(self, state: Any) -> tuple[float, float, float]:
+        return (0.0, 0.0, 0.0)
+
+    def get_layer_states(self, state: Any) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        zeros = np.zeros((self.config.n_nodes,), dtype=np.float32)
+        return zeros.copy(), zeros.copy(), zeros.copy()
+
+
+class _LSMShadowBackend(_BaseBackend):
+    name = "lsm_shadow"
+    label = "LSM Shadow"
+    supports_pull_push = False
+
+    def __init__(self, config: ReservoirConfig):
+        super().__init__(config)
+        from lsm_reservoir import build_trained_lsm
+
+        self._model = build_trained_lsm(config)
+
+    def make_state(self) -> Any:
+        return self._model.zero_state()
+
+    def tick(self, state: Any, x: np.ndarray) -> tuple[Any, float]:
+        y, _, new_state = self._model.step(x.astype(np.float32), state)
+        return new_state, float(y.ravel()[0])
+
+    def read_state(self, state: Any) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        return self._model.public_state(state)
+
+    def set_state(self, h1: np.ndarray, h2: np.ndarray, h3: np.ndarray) -> Any:
+        return self._model.state_from_public(h1, h2, h3)
+
+
 class ReservoirBridge:
-    """Wraps one reservoir (Core ML, MLX, or NumPy) with named state handles."""
+    """Wrap multiple reservoir backends behind named state handles."""
 
     def __init__(
         self,
@@ -164,143 +353,88 @@ class ReservoirBridge:
         config: Optional[ReservoirConfig] = None,
         compute_units: str = "cpu_and_ne",
         use_mlx: bool = False,
+        backend: Optional[str] = None,
     ):
         self.config = config or ReservoirConfig(input_dim=16)
-        self.use_coreml = mlpackage is not None
-        self.use_mlx = (not self.use_coreml) and use_mlx
-        self.states: dict = {}
+        requested_backend = backend
+        if requested_backend is None:
+            if mlpackage is not None:
+                requested_backend = "coreml"
+            elif use_mlx:
+                requested_backend = "mlx"
+            else:
+                requested_backend = "numpy"
+
+        self.default_backend = requested_backend
+        self.states: dict[str, Any] = {}
         self.outputs: dict[str, list[float]] = {}
-        self._tick_count = 0
+        self.handle_backends: dict[str, str] = {}
+        self.backends: dict[str, _BaseBackend] = {
+            "numpy": _NumpyBackend(self.config),
+            "lsm_shadow": _LSMShadowBackend(self.config),
+        }
+        if requested_backend == "mlx":
+            self.backends["mlx"] = _MLXBackend(self.config)
+        if mlpackage is not None or requested_backend == "coreml":
+            if mlpackage is None:
+                raise ValueError("mlpackage is required for coreml backend")
+            self.backends["coreml"] = _CoreMLBackend(self.config, mlpackage, compute_units)
+        if requested_backend not in self.backends:
+            raise ValueError(f"unsupported backend: {requested_backend}")
 
-        if self.use_coreml:
-            import coremltools as ct
+        self.use_coreml = requested_backend == "coreml"
+        self.use_mlx = requested_backend == "mlx"
 
-            cu_map = {
-                "all": ct.ComputeUnit.ALL,
-                "cpu_only": ct.ComputeUnit.CPU_ONLY,
-                "cpu_and_gpu": ct.ComputeUnit.CPU_AND_GPU,
-                "cpu_and_ne": ct.ComputeUnit.CPU_AND_NE,
-            }
-            self._coreml = ct.models.MLModel(
-                str(mlpackage), compute_units=cu_map[compute_units]
-            )
-        elif self.use_mlx:
-            import mlx.core as mx
-            from mlx_reservoir import MLXTripleReservoir
+    def available_backends(self) -> list[str]:
+        return sorted(self.backends)
 
-            self._np_model = TripleReservoir(self.config)
-            self._train_synthetic()
-            self._mlx_model = MLXTripleReservoir(self._np_model)
-            self._mx = mx
-        else:
-            self._np_model = TripleReservoir(self.config)
-            self._train_synthetic()
+    def backend_for_handle(self, name: str) -> str:
+        return self.handle_backends[name]
 
-    def _train_synthetic(self):
-        """Fit readout on synthetic data so the model is valid."""
-        from triple_reservoir_coreml import CANONICAL_SEED
-        rng = np.random.default_rng(CANONICAL_SEED)
-        d = self.config.input_dim
-        x = np.tanh(rng.standard_normal((3000, d))).astype(np.float32)
-        y = np.zeros((3000, self.config.output_dim), dtype=np.float32)
-        latent = 0.0
-        for t in range(3000):
-            latent = 0.9 * latent + 0.3 * float(x[t, : min(4, d)].sum())
-            y[t, 0] = latent
-        self._np_model.fit_readout(x, y)
+    def supports_pull_push(self, name: str) -> bool:
+        return self._backend_for(name).supports_pull_push
 
-    def make_state(self, name: str):
+    def backend_label(self, name: Optional[str] = None) -> str:
+        backend_name = self.default_backend if name is None else self.backend_for_handle(name)
+        return self.backends[backend_name].label
+
+    def _backend_for(self, name: str) -> _BaseBackend:
+        backend_name = self.handle_backends[name]
+        return self.backends[backend_name]
+
+    def make_state(self, name: str, backend: Optional[str] = None):
         """Create a fresh named state handle."""
-        if self.use_coreml:
-            self.states[name] = self._coreml.make_state()
-        elif self.use_mlx:
-            self.states[name] = self._mlx_model.zero_state()
-        else:
-            self.states[name] = self._np_model.zero_state()
+        backend_name = backend or self.default_backend
+        if backend_name not in self.backends:
+            raise ValueError(f"unsupported backend: {backend_name}")
+        self.handle_backends[name] = backend_name
+        self.states[name] = self.backends[backend_name].make_state()
         self.outputs[name] = []
 
     def tick(self, name: str, x: np.ndarray) -> float:
         """Feed one input vector into the named state, return scalar output."""
-        x = np.asarray(x).reshape(1, -1)
-        if self.use_coreml:
-            out = self._coreml.predict(
-                {"x": x.astype(np.float16)}, state=self.states[name]
-            )
-            val = float(np.asarray(out["y"]).ravel()[0])
-        elif self.use_mlx:
-            mx = self._mx
-            x_mx = mx.array(x.astype(np.float32))
-            y, _, new_state = self._mlx_model.step(x_mx, self.states[name])
-            self.states[name] = new_state
-            self._tick_count += 1
-            if self._tick_count % 64 == 0:
-                mx.eval(*new_state)
-            val = float(y.item())
-        else:
-            y, _, new_state = self._np_model.step_numpy(
-                x.astype(np.float32), self.states[name]
-            )
-            self.states[name] = new_state
-            val = float(y.ravel()[0])
+        backend = self._backend_for(name)
+        x = np.asarray(x, dtype=np.float32).reshape(1, -1)
+        new_state, val = backend.tick(self.states[name], x)
+        self.states[name] = new_state
         self.outputs[name].append(val)
         return val
 
     def read_state(self, name: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Return (h1, h2, h3) numpy arrays for a named handle."""
-        if self.use_coreml:
-            raise NotImplementedError("CoreML state readback not supported yet")
-        if self.use_mlx:
-            return self._mlx_model.state_to_numpy(self.states[name])
-        h1, h2, h3 = self.states[name]
-        return h1.copy(), h2.copy(), h3.copy()
+        return self._backend_for(name).read_state(self.states[name])
 
     def set_state(self, name: str, h1: np.ndarray, h2: np.ndarray, h3: np.ndarray):
         """Restore hidden state for a named handle from numpy arrays."""
-        if self.use_coreml:
-            raise NotImplementedError("CoreML state injection not supported yet")
-        if self.use_mlx:
-            self.states[name] = self._mlx_model.state_from_numpy((h1, h2, h3))
-            return
-        self.states[name] = (
-            h1.astype(np.float32),
-            h2.astype(np.float32),
-            h3.astype(np.float32),
-        )
+        self.states[name] = self._backend_for(name).set_state(h1, h2, h3)
 
     def h_norms(self, name: str) -> tuple[float, float, float]:
         """Return L2 norms of (h1, h2, h3) for a named handle."""
-        if self.use_coreml:
-            return (0.0, 0.0, 0.0)  # Not accessible from CoreML
-        if self.use_mlx:
-            mx = self._mx
-            h1, h2, h3 = self.states[name]
-            return (
-                float(mx.sqrt(mx.sum(h1 * h1)).item()),
-                float(mx.sqrt(mx.sum(h2 * h2)).item()),
-                float(mx.sqrt(mx.sum(h3 * h3)).item()),
-            )
-        h1, h2, h3 = self.states[name]
-        return (
-            float(np.linalg.norm(h1)),
-            float(np.linalg.norm(h2)),
-            float(np.linalg.norm(h3)),
-        )
+        return self._backend_for(name).h_norms(self.states[name])
 
     def get_layer_states(self, name: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Return numpy arrays of (h1, h2, h3) for per-layer metrics."""
-        if self.use_mlx:
-            h1, h2, h3 = self.states[name]
-            return (
-                np.array(h1).ravel(),
-                np.array(h2).ravel(),
-                np.array(h3).ravel(),
-            )
-        h1, h2, h3 = self.states[name]
-        return (
-            np.asarray(h1).ravel(),
-            np.asarray(h2).ravel(),
-            np.asarray(h3).ravel(),
-        )
+        return self._backend_for(name).get_layer_states(self.states[name])
 
     def has_handle(self, name: str) -> bool:
         """Check if a named handle exists."""
@@ -310,6 +444,7 @@ class ReservoirBridge:
         """Remove a named handle."""
         self.states.pop(name, None)
         self.outputs.pop(name, None)
+        self.handle_backends.pop(name, None)
 
 
 # ---------------------------------------------------------------------------

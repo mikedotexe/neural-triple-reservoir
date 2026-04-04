@@ -51,6 +51,7 @@ log = logging.getLogger("astrid-feeder")
 
 DEFAULT_DB = Path("/Users/v/other/astrid/capsules/consciousness-bridge/workspace/bridge.db")
 POLL_INTERVAL = 5.0  # seconds between DB polls
+SHADOW_SUFFIX = "__lsm"
 CONDITIONING_MODES = {"ema_rms", "legacy"}
 REMOTE_MEMORY_POLICIES = {"off", "remote_role_blend"}
 REMOTE_MEMORY_ROLE_BLEND = {
@@ -89,6 +90,10 @@ PROJECTIONS = {
     "amplified": project_amplified,
     "compressed": project_compressed,
 }
+
+
+def shadow_name(name: str) -> str:
+    return f"{name}{SHADOW_SUFFIX}"
 
 
 def _safe_array(values: list[float]) -> np.ndarray:
@@ -388,18 +393,42 @@ async def run(db_path: Path, ws_url: str):
         try:
             ws = await websockets.connect(ws_url)
             log.info("connected to reservoir service")
-            for name, entity in [("astrid", "astrid"), ("claude_main", "claude")]:
-                await ws.send(json.dumps({"type": "create_handle", "name": name, "entity": entity}))
-                r = json.loads(await ws.recv())
-                if r.get("type") == "error" and "already exists" in r.get("message", ""):
-                    pass
-                elif r.get("ok"):
-                    log.info("created handle '%s'", name)
-                    if name == "astrid":
-                        await ws.send(json.dumps({"type": "set_mode", "name": name, "mode": "rehearse", "decay_profile": "slow"}))
-                        await ws.recv()
-                    elif name == "claude_main":
-                        await ws.send(json.dumps({"type": "set_mode", "name": name, "mode": "rehearse", "decay_profile": "slow"}))
+            specs = [
+                ("astrid", "astrid", "rehearse", "slow"),
+                ("claude_main", "claude", "rehearse", "slow"),
+            ]
+            for name, entity, mode, decay_profile in specs:
+                for handle_name, handle_backend in (
+                    (name, None),
+                    (shadow_name(name), "lsm_shadow"),
+                ):
+                    payload = {
+                        "type": "create_handle",
+                        "name": handle_name,
+                        "entity": entity,
+                    }
+                    if handle_backend is not None:
+                        payload["backend"] = handle_backend
+                    await ws.send(json.dumps(payload))
+                    r = json.loads(await ws.recv())
+                    if r.get("type") == "error" and "already exists" in r.get("message", ""):
+                        continue
+                    if r.get("ok"):
+                        log.info(
+                            "created handle '%s' (%s)",
+                            handle_name,
+                            r.get("backend", handle_backend or "default"),
+                        )
+                        await ws.send(
+                            json.dumps(
+                                {
+                                    "type": "set_mode",
+                                    "name": handle_name,
+                                    "mode": mode,
+                                    "decay_profile": decay_profile,
+                                }
+                            )
+                        )
                         await ws.recv()
             return ws
         except Exception as e:
@@ -423,6 +452,17 @@ async def run(db_path: Path, ws_url: str):
             log.warning("tick failed for '%s': %s", name, e)
             ws = None
             return False
+
+    async def tick_with_shadow(name: str, vec: list[float], meta: dict | None = None) -> bool:
+        ok = await tick_handle(name, vec, meta)
+        if not ok:
+            return False
+        shadow_meta = dict(meta or {})
+        shadow_meta["shadow_of"] = name
+        shadow_ok = await tick_handle(shadow_name(name), vec, shadow_meta)
+        if not shadow_ok:
+            log.warning("shadow tick failed for '%s' while live handle succeeded", name)
+        return True
 
     log.info("polling %s every %.0fs", db_path, POLL_INTERVAL)
 
@@ -506,7 +546,7 @@ async def run(db_path: Path, ws_url: str):
                     "rehearsal_hint": build_rehearsal_hint(relation_meta),
                 }
 
-                ok = await tick_handle("astrid", projected, tick_meta)
+                ok = await tick_with_shadow("astrid", projected, tick_meta)
                 if ok:
                     # Cross-feed Claude's handle (attenuated)
                     w = cfg["cross_feed_weight"]
@@ -524,7 +564,7 @@ async def run(db_path: Path, ws_url: str):
                         "contact_gate": round(relation_meta["contact_gate"], 4),
                         "rehearsal_hint": build_rehearsal_hint(relation_meta),
                     }
-                    await tick_handle("claude_main", cross, cross_meta)
+                    await tick_with_shadow("claude_main", cross, cross_meta)
                     log.info(
                         "tick id=%d [%s/%s/%s blend=%.2f gate=%.2f] → astrid + claude_main raw_rms=%.2f raw_max=%.2f scale=%.2f cond_max=%.2f",
                         row_id,

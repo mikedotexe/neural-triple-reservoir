@@ -47,6 +47,8 @@ AUTO_SNAPSHOT_INTERVAL = 60  # seconds between auto-snapshots (was 300; reduced 
 THERMOSTAT_PERSIST_STATES = 48  # enough recent layer history to avoid post-restart warmup
 SNAPSHOT_SCHEMA_VERSION = 2
 RESERVOIR_RUNTIME_VERSION = 1  # bump when canonical reservoir dynamics/readout recipe changes incompatibly
+SHADOW_SUFFIX = "__lsm"
+SHADOW_METRICS_WINDOW = 16
 
 
 @dataclass
@@ -54,6 +56,7 @@ class HandleInfo:
     """Metadata for one named handle."""
     name: str
     entity: str
+    backend: str
     tick_count: int = 0
     event_seq: int = 0
     last_tick_time: float = 0.0
@@ -463,7 +466,7 @@ class ReservoirService:
     ):
         self.config = ReservoirConfig(input_dim=input_dim, n_nodes=n_nodes)
         self.bridge = ReservoirBridge(
-            config=self.config, use_mlx=(backend == "mlx"),
+            config=self.config, backend=backend,
         )
         self.handles: dict[str, HandleInfo] = {}
         self.rehearsal = RehearsalController()
@@ -471,22 +474,111 @@ class ReservoirService:
         self.text_proj = TextProjection(input_dim=input_dim)
         self._shutdown = asyncio.Event()
         self._snapshot_fingerprint = reservoir_config_fingerprint(self.config)
+        self.shadow_metrics_path = self.persistence.state_dir / "shadow_metrics.jsonl"
+
+    def _infer_backend(self, name: str, backend: Optional[str] = None) -> str:
+        if backend is not None:
+            if name.endswith(SHADOW_SUFFIX) and backend != "lsm_shadow":
+                raise ValueError(
+                    f"shadow handle '{name}' must use backend 'lsm_shadow', got '{backend}'"
+                )
+            return backend
+        if name.endswith(SHADOW_SUFFIX):
+            return "lsm_shadow"
+        return self.bridge.default_backend
+
+    def _shadow_base_name(self, name: str) -> str | None:
+        if not name.endswith(SHADOW_SUFFIX):
+            return None
+        return name[: -len(SHADOW_SUFFIX)]
+
+    def _trajectory_rmsd(self, live: HandleInfo, shadow: HandleInfo) -> float | None:
+        shared = min(
+            len(live.output_ring),
+            len(shadow.output_ring),
+            SHADOW_METRICS_WINDOW,
+        )
+        if shared <= 0:
+            return None
+        live_vals = np.asarray(list(live.output_ring)[-shared:], dtype=np.float32)
+        shadow_vals = np.asarray(list(shadow.output_ring)[-shared:], dtype=np.float32)
+        return float(np.sqrt(np.mean(np.square(shadow_vals - live_vals))))
+
+    def _log_shadow_metrics(self, shadow_name: str, source: str) -> None:
+        base_name = self._shadow_base_name(shadow_name)
+        if base_name is None or base_name not in self.handles or shadow_name not in self.handles:
+            return
+
+        live_info = self.handles[base_name]
+        shadow_info = self.handles[shadow_name]
+        if not live_info.output_ring or not shadow_info.output_ring:
+            return
+
+        live_output = float(live_info.output_ring[-1])
+        shadow_output = float(shadow_info.output_ring[-1])
+        live_norms = list(live_info.h_norm_ring[-1]) if live_info.h_norm_ring else [0.0, 0.0, 0.0]
+        shadow_norms = list(shadow_info.h_norm_ring[-1]) if shadow_info.h_norm_ring else [0.0, 0.0, 0.0]
+        rs_live = self.rehearsal.get_state(base_name)
+        rs_shadow = self.rehearsal.get_state(shadow_name)
+        trajectory_rmsd = self._trajectory_rmsd(live_info, shadow_info)
+        source_label = source if source == "rehearsal" else shadow_info.last_live_meta.get("source", source)
+        payload = {
+            "timestamp": round(time.time(), 3),
+            "source": source_label,
+            "comparison_source": source,
+            "live_handle": base_name,
+            "shadow_handle": shadow_name,
+            "live_backend": live_info.backend,
+            "shadow_backend": shadow_info.backend,
+            "live_tick_count": live_info.tick_count,
+            "shadow_tick_count": shadow_info.tick_count,
+            "live_event_id": live_info.last_live_meta.get("event_id"),
+            "shadow_event_id": shadow_info.last_live_meta.get("event_id"),
+            "source_event_id": (
+                None if source == "rehearsal" else shadow_info.last_live_meta.get("source_event_id")
+            ),
+            "output_delta": round(shadow_output - live_output, 6),
+            "output_abs_delta": round(abs(shadow_output - live_output), 6),
+            "h_norm_deltas": [
+                round(float(s) - float(l), 6)
+                for l, s in zip(live_norms, shadow_norms)
+            ],
+            "trajectory_rmsd": round(trajectory_rmsd, 6) if trajectory_rmsd is not None else None,
+            "live_mode": rs_live.mode if rs_live else "unknown",
+            "shadow_mode": rs_shadow.mode if rs_shadow else "unknown",
+            "rehearsal_mode": rs_shadow.mode if rs_shadow else "unknown",
+        }
+        with self.shadow_metrics_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(payload, sort_keys=True) + "\n")
 
     # ------------------------------------------------------------------
     # Handle lifecycle
     # ------------------------------------------------------------------
 
-    def create_handle(self, name: str, entity: str = "unknown") -> HandleInfo:
+    def create_handle(
+        self,
+        name: str,
+        entity: str = "unknown",
+        backend: Optional[str] = None,
+    ) -> HandleInfo:
         if self.bridge.has_handle(name):
             raise ValueError(f"handle '{name}' already exists")
-        self.bridge.make_state(name)
+        handle_backend = self._infer_backend(name, backend)
+        self.bridge.make_state(name, backend=handle_backend)
         info = HandleInfo(
-            name=name, entity=entity,
+            name=name,
+            entity=entity,
+            backend=handle_backend,
             thermostats=make_thermostats(self.config.n_nodes),
         )
         self.handles[name] = info
         self.rehearsal.register(name, mode="quiet", decay_profile="medium")
-        log.info("created handle '%s' (entity=%s, 3 thermostats)", name, entity)
+        log.info(
+            "created handle '%s' (entity=%s, backend=%s, 3 thermostats)",
+            name,
+            entity,
+            handle_backend,
+        )
         return info
 
     def destroy_handle(self, name: str):
@@ -543,9 +635,12 @@ class ReservoirService:
         if hint is not None:
             hint_applied = self.rehearsal.maybe_apply_hint(name, hint)
             rs = self.rehearsal.get_state(name)
+        if name.endswith(SHADOW_SUFFIX):
+            self._log_shadow_metrics(name, source="live_tick")
         return {
             "type": "tick_response",
             "name": name,
+            "backend": info.backend,
             "output": output,
             "h_norms": list(norms),
             "tick": info.tick_count,
@@ -580,6 +675,7 @@ class ReservoirService:
             "type": "read_state_response",
             "name": name,
             "entity": info.entity,
+            "backend": info.backend,
             "h_norms": list(norms),
             "last_output": last_output,
             "tick_count": info.tick_count,
@@ -694,6 +790,7 @@ class ReservoirService:
             name=name,
             h1=h1, h2=h2, h3=h3,
             last_input=last_input,
+            backend=info.backend,
             mode=rs.mode if rs else "quiet",
             decay_profile=rs.decay_profile if rs else "medium",
             decay_weight=rs.decay_weight if rs else 0.0,
@@ -736,11 +833,24 @@ class ReservoirService:
                 f"quarantined: {moved_text}"
             )
 
+        snapshot_backend = self._infer_backend(name, snap.backend or None)
+
         # Create handle if it doesn't exist
         if not self.bridge.has_handle(name):
-            self.bridge.make_state(name)
-            self.handles[name] = HandleInfo(name=name, entity=snap.entity)
+            self.bridge.make_state(name, backend=snapshot_backend)
+            self.handles[name] = HandleInfo(
+                name=name,
+                entity=snap.entity,
+                backend=snapshot_backend,
+                thermostats=make_thermostats(self.config.n_nodes),
+            )
             self.rehearsal.register(name, mode=snap.mode, decay_profile=snap.decay_profile)
+        elif self.bridge.backend_for_handle(name) != snapshot_backend:
+            raise ValueError(
+                f"snapshot backend mismatch for '{name}': "
+                f"service has {self.bridge.backend_for_handle(name)}, "
+                f"snapshot wants {snapshot_backend}"
+            )
 
         # Restore hidden state
         self.bridge.set_state(name, snap.h1, snap.h2, snap.h3)
@@ -748,6 +858,7 @@ class ReservoirService:
         # Restore metadata
         info = self.handles[name]
         info.entity = snap.entity
+        info.backend = snapshot_backend
         info.tick_count = snap.tick_count
         info.event_seq = max(
             int(getattr(snap, "event_seq", 0) or 0),
@@ -800,8 +911,21 @@ class ReservoirService:
             except Exception as e:
                 log.warning("thermostat restore failed for '%s': %s", name, e)
 
-        log.info("restored '%s' (entity=%s, ticks=%d, mode=%s)", name, snap.entity, snap.tick_count, snap.mode)
-        return {"type": "restore_response", "name": name, "entity": snap.entity, "tick_count": snap.tick_count}
+        log.info(
+            "restored '%s' (entity=%s, backend=%s, ticks=%d, mode=%s)",
+            name,
+            snap.entity,
+            snapshot_backend,
+            snap.tick_count,
+            snap.mode,
+        )
+        return {
+            "type": "restore_response",
+            "name": name,
+            "entity": snap.entity,
+            "backend": snapshot_backend,
+            "tick_count": snap.tick_count,
+        }
 
     def snapshot_all(self):
         """Snapshot every active handle."""
@@ -834,11 +958,17 @@ class ReservoirService:
         """
         import base64
         info = self._require_handle(name)
+        if not self.bridge.supports_pull_push(name):
+            raise ValueError(
+                f"backend '{info.backend}' for handle '{name}' does not support "
+                "pull_state in phase 1; LSM shadow handles only expose public trace state"
+            )
         h1, h2, h3 = self.bridge.read_state(name)
         rs = self.rehearsal.get_state(name)
         return {
             "type": "pull_state_response",
             "name": name,
+            "backend": info.backend,
             "h1": base64.b64encode(h1.astype(np.float32).tobytes()).decode(),
             "h2": base64.b64encode(h2.astype(np.float32).tobytes()).decode(),
             "h3": base64.b64encode(h3.astype(np.float32).tobytes()).decode(),
@@ -868,6 +998,11 @@ class ReservoirService:
         """
         import base64
         info = self._require_handle(name)
+        if not self.bridge.supports_pull_push(name):
+            raise ValueError(
+                f"backend '{info.backend}' for handle '{name}' does not support "
+                "push_state in phase 1; LSM shadow handles only expose public trace state"
+            )
         n = self.config.n_nodes
         h1 = np.frombuffer(base64.b64decode(h1_b64), dtype=np.float32).reshape(1, n)
         h2 = np.frombuffer(base64.b64decode(h2_b64), dtype=np.float32).reshape(1, n)
@@ -922,6 +1057,7 @@ class ReservoirService:
         return {
             "type": "push_state_response",
             "name": name,
+            "backend": info.backend,
             "ok": True,
             "h_norms": list(norms),
             "tick": info.tick_count,
@@ -950,6 +1086,7 @@ class ReservoirService:
             handles.append({
                 "name": name,
                 "entity": info.entity,
+                "backend": info.backend,
                 "mode": rs.mode if rs else "unknown",
                 "mode_authority": rs.mode_authority if rs else "system",
                 "hint_policy": rs.hint_policy if rs else "off",
@@ -983,8 +1120,17 @@ class ReservoirService:
         msg_type = msg.get("type", "")
         try:
             if msg_type == "create_handle":
-                self.create_handle(msg["name"], msg.get("entity", "unknown"))
-                return {"type": "create_handle_response", "name": msg["name"], "ok": True}
+                info = self.create_handle(
+                    msg["name"],
+                    msg.get("entity", "unknown"),
+                    backend=msg.get("backend"),
+                )
+                return {
+                    "type": "create_handle_response",
+                    "name": msg["name"],
+                    "backend": info.backend,
+                    "ok": True,
+                }
 
             elif msg_type == "tick":
                 vec = np.array(msg["input"], dtype=np.float32)
@@ -1071,7 +1217,10 @@ class ReservoirService:
         while not self._shutdown.is_set():
             try:
                 inputs = self.rehearsal.get_rehearsal_inputs()
-                for name, vec in inputs.items():
+                for name, vec in sorted(
+                    inputs.items(),
+                    key=lambda item: item[0].endswith(SHADOW_SUFFIX),
+                ):
                     if name in self.handles:
                         output = self.bridge.tick(name, vec.reshape(1, -1))
                         norms = self.bridge.h_norms(name)
@@ -1094,6 +1243,8 @@ class ReservoirService:
                                 self.bridge.set_state(name, *[l.reshape(1, -1) for l in layers])
                             except Exception:
                                 pass
+                        if name.endswith(SHADOW_SUFFIX):
+                            self._log_shadow_metrics(name, source="rehearsal")
             except Exception as e:
                 log.error("rehearsal tick error: %s", e)
 
@@ -1132,9 +1283,7 @@ class ReservoirService:
         rehearsal_task = asyncio.create_task(self.rehearsal_loop())
         snapshot_task = asyncio.create_task(self.auto_snapshot_loop())
 
-        backend_name = "MLX (Metal)" if self.bridge.use_mlx else (
-            "Core ML (ANE)" if self.bridge.use_coreml else "NumPy"
-        )
+        backend_name = self.bridge.backend_label()
         log.info("listening on %s:%d (input_dim=%d, n_nodes=%d, backend=%s)",
                  host, port, self.config.input_dim, self.config.n_nodes, backend_name)
 
@@ -1163,7 +1312,7 @@ def main():
     ap.add_argument(
         "--backend",
         default="numpy",
-        choices=["numpy", "mlx", "coreml"],
+        choices=["numpy", "mlx", "coreml", "lsm_shadow"],
         help="Reservoir backend (default: numpy)",
     )
     args = ap.parse_args()

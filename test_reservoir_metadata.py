@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import importlib
+import json
 import sys
 import tempfile
 import types
@@ -34,25 +35,38 @@ def load_reservoir_service_with_stubs():
             return np.zeros((1, self.input_dim), dtype=np.float32)
 
     class FakeBridge:
-        def __init__(self, config, use_mlx=False):
+        def __init__(
+            self,
+            config,
+            mlpackage=None,
+            compute_units="cpu_and_ne",
+            use_mlx=False,
+            backend=None,
+        ):
             self.config = config
             self.states = {}
             self.outputs = {}
+            self.handle_backends = {}
+            self.default_backend = backend or ("mlx" if use_mlx else "numpy")
 
         def has_handle(self, name):
             return name in self.states
 
-        def make_state(self, name):
+        def make_state(self, name, backend=None):
             zeros = np.zeros((1, self.config.n_nodes), dtype=np.float32)
             self.states[name] = (zeros.copy(), zeros.copy(), zeros.copy())
             self.outputs[name] = 0.0
+            self.handle_backends[name] = backend or self.default_backend
 
         def destroy_handle(self, name):
             self.states.pop(name, None)
             self.outputs.pop(name, None)
+            self.handle_backends.pop(name, None)
 
         def tick(self, name, input_vec):
             value = float(np.asarray(input_vec, dtype=np.float32).sum())
+            if self.handle_backends.get(name) == "lsm_shadow":
+                value *= 0.8
             h1 = np.full((1, self.config.n_nodes), value, dtype=np.float32)
             h2 = np.full((1, self.config.n_nodes), value * 0.5, dtype=np.float32)
             h3 = np.full((1, self.config.n_nodes), value * 0.25, dtype=np.float32)
@@ -75,6 +89,25 @@ def load_reservoir_service_with_stubs():
 
         def read_state(self, name):
             return self.states[name]
+
+        def backend_for_handle(self, name):
+            return self.handle_backends[name]
+
+        def supports_pull_push(self, name):
+            return self.handle_backends.get(name) != "lsm_shadow"
+
+        def backend_label(self, name=None):
+            backend_name = self.default_backend if name is None else self.handle_backends[name]
+            labels = {
+                "numpy": "NumPy",
+                "mlx": "MLX (Metal)",
+                "coreml": "Core ML (ANE)",
+                "lsm_shadow": "LSM Shadow",
+            }
+            return labels.get(backend_name, backend_name)
+
+        def available_backends(self):
+            return ["lsm_shadow", "numpy"]
 
     fake_dual.ReservoirBridge = FakeBridge
     fake_dual.TextProjection = FakeTextProjection
@@ -126,6 +159,107 @@ class ReservoirMetadataTests(unittest.TestCase):
             self.assertEqual(read["provenance"][-1]["source"], "astrid_feeder")
             self.assertEqual(read["provenance"][-1]["event_id"], "astrid:000001")
             self.assertEqual(listed["recent_sources"], ["astrid_feeder"])
+
+    def test_backend_is_visible_in_read_and_list_for_shadow_handles(self):
+        reservoir_service = load_reservoir_service_with_stubs()
+        with tempfile.TemporaryDirectory() as tmp:
+            service = reservoir_service.ReservoirService(state_dir=Path(tmp))
+            service.create_handle("astrid", "astrid")
+            service.create_handle("astrid__lsm", "astrid")
+
+            live = service.read_state("astrid")
+            shadow = service.read_state("astrid__lsm")
+            listed = {entry["name"]: entry for entry in service.list_handles()["handles"]}
+
+            self.assertEqual(live["backend"], "numpy")
+            self.assertEqual(shadow["backend"], "lsm_shadow")
+            self.assertEqual(listed["astrid"]["backend"], "numpy")
+            self.assertEqual(listed["astrid__lsm"]["backend"], "lsm_shadow")
+
+    def test_dispatch_create_handle_accepts_explicit_backend(self):
+        reservoir_service = load_reservoir_service_with_stubs()
+        with tempfile.TemporaryDirectory() as tmp:
+            service = reservoir_service.ReservoirService(state_dir=Path(tmp))
+
+            result = asyncio.run(
+                service.dispatch(
+                    {
+                        "type": "create_handle",
+                        "name": "minime__lsm",
+                        "entity": "minime",
+                        "backend": "lsm_shadow",
+                    }
+                )
+            )
+
+            self.assertEqual(result["type"], "create_handle_response")
+            self.assertEqual(result["backend"], "lsm_shadow")
+            self.assertEqual(service.read_state("minime__lsm")["backend"], "lsm_shadow")
+
+    def test_pull_state_rejects_lsm_shadow_handles(self):
+        reservoir_service = load_reservoir_service_with_stubs()
+        with tempfile.TemporaryDirectory() as tmp:
+            service = reservoir_service.ReservoirService(state_dir=Path(tmp))
+            service.create_handle("astrid__lsm", "astrid")
+
+            result = asyncio.run(service.dispatch({"type": "pull_state", "name": "astrid__lsm"}))
+
+            self.assertEqual(result["type"], "error")
+            self.assertIn("phase 1", result["message"])
+            self.assertIn("lsm_shadow", result["message"])
+
+    def test_shadow_metrics_log_is_written_for_mirrored_ticks(self):
+        reservoir_service = load_reservoir_service_with_stubs()
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp)
+            service = reservoir_service.ReservoirService(state_dir=state_dir)
+            service.create_handle("astrid", "astrid")
+            service.create_handle("astrid__lsm", "astrid")
+
+            service.tick(
+                "astrid",
+                np.ones((1, 32), dtype=np.float32),
+                meta={"source": "astrid_feeder", "source_event_id": "codec_impact:42"},
+            )
+            service.tick(
+                "astrid__lsm",
+                np.ones((1, 32), dtype=np.float32),
+                meta={
+                    "source": "astrid_feeder",
+                    "source_event_id": "codec_impact:42",
+                    "shadow_of": "astrid",
+                },
+            )
+
+            metrics_path = state_dir / "shadow_metrics.jsonl"
+            self.assertTrue(metrics_path.exists())
+            lines = metrics_path.read_text().strip().splitlines()
+            self.assertEqual(len(lines), 1)
+            payload = json.loads(lines[0])
+            self.assertEqual(payload["live_handle"], "astrid")
+            self.assertEqual(payload["shadow_handle"], "astrid__lsm")
+            self.assertEqual(payload["live_backend"], "numpy")
+            self.assertEqual(payload["shadow_backend"], "lsm_shadow")
+            self.assertEqual(payload["source_event_id"], "codec_impact:42")
+            self.assertIn("trajectory_rmsd", payload)
+
+    def test_snapshot_restore_preserves_shadow_backend(self):
+        reservoir_service = load_reservoir_service_with_stubs()
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp)
+            service = reservoir_service.ReservoirService(state_dir=state_dir)
+            service.create_handle("astrid__lsm", "astrid")
+            service.tick(
+                "astrid__lsm",
+                np.ones((1, 32), dtype=np.float32),
+                meta={"source": "astrid_feeder", "source_event_id": "codec_impact:99"},
+            )
+            service.snapshot_handle("astrid__lsm")
+
+            restored = reservoir_service.ReservoirService(state_dir=state_dir)
+            restored.restore_handle("astrid__lsm")
+
+            self.assertEqual(restored.read_state("astrid__lsm")["backend"], "lsm_shadow")
 
     def test_guarded_hint_policy_applies_only_when_enabled(self):
         reservoir_service = load_reservoir_service_with_stubs()

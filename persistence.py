@@ -24,6 +24,7 @@ class HandleSnapshot:
     h2: np.ndarray
     h3: np.ndarray
     last_input: np.ndarray
+    backend: str
     mode: str
     decay_profile: str
     decay_weight: float
@@ -61,6 +62,7 @@ class PersistenceManager:
         h2: np.ndarray,
         h3: np.ndarray,
         last_input: np.ndarray,
+        backend: str,
         mode: str,
         decay_profile: str,
         decay_weight: float,
@@ -86,6 +88,7 @@ class PersistenceManager:
             h2=h2,
             h3=h3,
             last_input=last_input,
+            backend=np.array(backend),
             mode=np.array(mode),
             decay_profile=np.array(decay_profile),
             decay_weight=np.array(decay_weight, dtype=np.float64),
@@ -126,6 +129,7 @@ class PersistenceManager:
                 h2=data["h2"],
                 h3=data["h3"],
                 last_input=data["last_input"],
+                backend=str(data["backend"]) if "backend" in data else "",
                 mode=str(data["mode"]),
                 decay_profile=str(data["decay_profile"]),
                 decay_weight=float(data["decay_weight"]),
