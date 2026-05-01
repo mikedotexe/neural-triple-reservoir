@@ -12,6 +12,9 @@
 		<string>8090</string>
 		<string>--coupling-strength</string>
 		<string>0.1</string>
+		<string>--model-memory-map</string>
+		<string>--model</string>
+		<string>mlx-community/gemma-3-4b-it-4bit</string>
 	</array>
 	<key>WorkingDirectory</key>
 	<string>/Users/v/other/neural-triple-reservoir</string>
