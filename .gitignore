@@ -6,3 +6,4 @@ state/
 logs/
 tui/target/
 .DS_Store
+.claude/settings.local.json

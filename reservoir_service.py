@@ -49,6 +49,9 @@ SNAPSHOT_SCHEMA_VERSION = 2
 RESERVOIR_RUNTIME_VERSION = 1  # bump when canonical reservoir dynamics/readout recipe changes incompatibly
 SHADOW_SUFFIX = "__lsm"
 SHADOW_METRICS_WINDOW = 16
+SHADOW_METRICS_MAX_BYTES = 256 * 1024 * 1024
+SHADOW_METRICS_ROTATIONS = 4
+SHADOW_REHEARSAL_SAMPLE_SECS = 5.0
 
 
 @dataclass
@@ -475,6 +478,8 @@ class ReservoirService:
         self._shutdown = asyncio.Event()
         self._snapshot_fingerprint = reservoir_config_fingerprint(self.config)
         self.shadow_metrics_path = self.persistence.state_dir / "shadow_metrics.jsonl"
+        self.shadow_metrics_rollup_path = self.persistence.state_dir / "shadow_metrics_rollup.json"
+        self._shadow_metrics_last_rehearsal_log: dict[str, float] = {}
 
     def _infer_backend(self, name: str, backend: Optional[str] = None) -> str:
         if backend is not None:
@@ -508,6 +513,12 @@ class ReservoirService:
         base_name = self._shadow_base_name(shadow_name)
         if base_name is None or base_name not in self.handles or shadow_name not in self.handles:
             return
+        now = time.time()
+        if source == "rehearsal":
+            last = self._shadow_metrics_last_rehearsal_log.get(shadow_name, 0.0)
+            if now - last < SHADOW_REHEARSAL_SAMPLE_SECS:
+                return
+            self._shadow_metrics_last_rehearsal_log[shadow_name] = now
 
         live_info = self.handles[base_name]
         shadow_info = self.handles[shadow_name]
@@ -523,7 +534,7 @@ class ReservoirService:
         trajectory_rmsd = self._trajectory_rmsd(live_info, shadow_info)
         source_label = source if source == "rehearsal" else shadow_info.last_live_meta.get("source", source)
         payload = {
-            "timestamp": round(time.time(), 3),
+            "timestamp": round(now, 3),
             "source": source_label,
             "comparison_source": source,
             "live_handle": base_name,
@@ -548,8 +559,74 @@ class ReservoirService:
             "shadow_mode": rs_shadow.mode if rs_shadow else "unknown",
             "rehearsal_mode": rs_shadow.mode if rs_shadow else "unknown",
         }
+        self._rotate_shadow_metrics_if_needed()
         with self.shadow_metrics_path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(payload, sort_keys=True) + "\n")
+        self._update_shadow_metrics_rollup(payload)
+
+    def _rotate_shadow_metrics_if_needed(self) -> None:
+        try:
+            if not self.shadow_metrics_path.exists():
+                return
+            if self.shadow_metrics_path.stat().st_size < SHADOW_METRICS_MAX_BYTES:
+                return
+            for idx in range(SHADOW_METRICS_ROTATIONS, 0, -1):
+                src = self.shadow_metrics_path.with_name(f"shadow_metrics.jsonl.{idx}")
+                if idx == SHADOW_METRICS_ROTATIONS:
+                    if src.exists():
+                        src.unlink()
+                    continue
+                dst = self.shadow_metrics_path.with_name(f"shadow_metrics.jsonl.{idx + 1}")
+                if src.exists():
+                    src.rename(dst)
+            self.shadow_metrics_path.rename(self.shadow_metrics_path.with_name("shadow_metrics.jsonl.1"))
+            self.shadow_metrics_path.write_text("", encoding="utf-8")
+        except OSError as exc:
+            log.warning("shadow metrics rotation failed: %s", exc)
+
+    def _update_shadow_metrics_rollup(self, payload: dict) -> None:
+        try:
+            if self.shadow_metrics_rollup_path.exists():
+                rollup = json.loads(self.shadow_metrics_rollup_path.read_text())
+                if not isinstance(rollup, dict):
+                    rollup = {}
+            else:
+                rollup = {}
+        except (OSError, json.JSONDecodeError):
+            rollup = {}
+        count = int(rollup.get("total_logged", rollup.get("total_rows", 0)) or 0) + 1
+        by_source = rollup.get("counts_by_comparison_source")
+        if not isinstance(by_source, dict):
+            by_source = {}
+        comparison_source = str(payload.get("comparison_source") or "unknown")
+        by_source[comparison_source] = int(by_source.get(comparison_source, 0) or 0) + 1
+        handles = rollup.get("latest_by_shadow_handle")
+        if not isinstance(handles, dict):
+            handles = {}
+        shadow_handle = str(payload.get("shadow_handle") or "unknown")
+        handles[shadow_handle] = payload
+        updated = {
+            "schema_version": 1,
+            "updated_at": round(time.time(), 3),
+            "policy": "sampled_shadow_metrics_rollup_v1",
+            "sampling": {
+                "live_ticks": "all",
+                "rehearsal_min_interval_s": SHADOW_REHEARSAL_SAMPLE_SECS,
+                "rotation_max_mb": SHADOW_METRICS_MAX_BYTES // (1024 * 1024),
+                "rotations": SHADOW_METRICS_ROTATIONS,
+            },
+            "total_logged": count,
+            "counts_by_comparison_source": by_source,
+            "latest": payload,
+            "latest_by_shadow_handle": handles,
+        }
+        try:
+            self.shadow_metrics_rollup_path.write_text(
+                json.dumps(updated, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            log.warning("shadow metrics rollup update failed: %s", exc)
 
     # ------------------------------------------------------------------
     # Handle lifecycle
@@ -594,6 +671,77 @@ class ReservoirService:
         if name not in self.handles:
             raise ValueError(f"handle '{name}' not found")
         return self.handles[name]
+
+    def clone_handle(
+        self,
+        source: str,
+        name: str,
+        entity: Optional[str] = None,
+        mode: str = "quiet",
+        decay_profile: Optional[str] = None,
+        meta: Optional[dict] = None,
+    ) -> dict:
+        """Clone a handle's hidden state into a new named garden handle."""
+        source_info = self._require_handle(source)
+        if self.bridge.has_handle(name):
+            raise ValueError(f"handle '{name}' already exists")
+        if not self.bridge.supports_pull_push(source):
+            raise ValueError(
+                f"backend '{source_info.backend}' for handle '{source}' does not support clone_handle"
+            )
+        if mode not in ("hold", "rehearse", "quiet"):
+            raise ValueError(f"unknown mode: {mode}")
+
+        h1, h2, h3 = self.bridge.read_state(source)
+        cloned = self.create_handle(name, entity or source_info.entity, backend=source_info.backend)
+        self.bridge.set_state(name, h1.copy(), h2.copy(), h3.copy())
+        cloned.tick_count = source_info.tick_count
+        cloned.last_tick_time = time.monotonic()
+        cloned.output_ring = deque(source_info.output_ring, maxlen=RING_SIZE)
+        cloned.h_norm_ring = deque(source_info.h_norm_ring, maxlen=RING_SIZE)
+        cloned.last_lane_meta = dict(source_info.last_lane_meta)
+        clone_meta = {
+            "source": "clone_handle",
+            "operation": "attractor_garden_clone",
+            "from_handle": source,
+        }
+        if isinstance(meta, dict):
+            clone_meta.update(meta)
+        cloned.last_live_meta = stamp_event_meta(cloned, clone_meta)
+        update_lane_meta(cloned, cloned.last_live_meta)
+        cloned.provenance_ring = deque(source_info.provenance_ring, maxlen=PROVENANCE_SIZE)
+        cloned.provenance_ring.append(build_provenance_entry(cloned, cloned.last_live_meta))
+
+        source_rs = self.rehearsal.get_state(source)
+        clone_rs = self.rehearsal.get_state(name)
+        if source_rs and clone_rs:
+            clone_rs.last_live_input = (
+                None if source_rs.last_live_input is None else source_rs.last_live_input.copy()
+            )
+            clone_rs.decay_weight = source_rs.decay_weight
+            clone_rs.ticks_since_live = source_rs.ticks_since_live
+        self.rehearsal.set_mode(name, mode, decay_profile)
+        rs = self.rehearsal.get_state(name)
+        norms = self.bridge.h_norms(name)
+        if cloned.thermostats:
+            try:
+                for thermostat, h_i in zip(cloned.thermostats, (h1, h2, h3)):
+                    thermostat.step(h_i)
+            except Exception:
+                pass
+        log.info("cloned handle '%s' → '%s' (mode=%s)", source, name, mode)
+        return {
+            "type": "clone_handle_response",
+            "source": source,
+            "name": name,
+            "entity": cloned.entity,
+            "backend": cloned.backend,
+            "mode": rs.mode if rs else mode,
+            "decay_profile": rs.decay_profile if rs else decay_profile,
+            "h_norms": list(norms),
+            "tick": cloned.tick_count,
+            "ok": True,
+        }
 
     # ------------------------------------------------------------------
     # Tick
@@ -1131,6 +1279,16 @@ class ReservoirService:
                     "backend": info.backend,
                     "ok": True,
                 }
+
+            elif msg_type == "clone_handle":
+                return self.clone_handle(
+                    msg["source"],
+                    msg["name"],
+                    entity=msg.get("entity"),
+                    mode=msg.get("mode", "quiet"),
+                    decay_profile=msg.get("decay_profile"),
+                    meta=msg.get("meta"),
+                )
 
             elif msg_type == "tick":
                 vec = np.array(msg["input"], dtype=np.float32)

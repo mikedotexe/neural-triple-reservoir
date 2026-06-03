@@ -52,6 +52,13 @@ log = logging.getLogger("astrid-feeder")
 DEFAULT_DB = Path("/Users/v/other/astrid/capsules/consciousness-bridge/workspace/bridge.db")
 POLL_INTERVAL = 5.0  # seconds between DB polls
 SHADOW_SUFFIX = "__lsm"
+
+# v3.5: minime can publish a reciprocal influence here. Each codec frame
+# entering the reservoir is biased toward the published target_dims/
+# target_values for `duration_ticks` then ramps down over `decay_ticks`.
+MINIME_WORKSPACE = Path("/Users/v/other/minime/workspace")
+MINIME_INFLUENCE_PATH = MINIME_WORKSPACE / "astrid_influence_v3.json"
+MINIME_INFLUENCE_CONSUMED_PATH = MINIME_WORKSPACE / "astrid_influence_v3.consumed.json"
 CONDITIONING_MODES = {"ema_rms", "legacy"}
 REMOTE_MEMORY_POLICIES = {"off", "remote_role_blend"}
 REMOTE_MEMORY_ROLE_BLEND = {
@@ -347,6 +354,112 @@ def load_config(workspace_dir: Path) -> dict:
     return defaults
 
 
+class MinimeInfluenceState:
+    """v3.5: tracks an active reciprocal influence from minime.
+
+    Loaded from `astrid_influence_v3.json` (atomic file written by minime).
+    Each tick consumed during the influence window biases that frame's
+    codec features toward (target_dims → target_values) with weight
+    `amplitude * decay_factor`. After ramp + decay completes, the file is
+    renamed to `.consumed.json` and the in-memory state clears.
+    """
+
+    def __init__(self, payload: dict):
+        self.intent_id = str(payload.get("intent_id", "?"))
+        self.label = str(payload.get("label", "untitled"))
+        self.amplitude = max(0.0, min(1.0, float(payload.get("amplitude", 0.0))))
+        self.duration_ticks = max(1, int(payload.get("duration_ticks", 1)))
+        self.decay_ticks = max(0, int(payload.get("decay_ticks", 0)))
+        self.target_dims = [int(d) for d in payload.get("target_dims", []) if 0 <= int(d) < 32]
+        raw_values = payload.get("target_values", [])
+        self.target_values = [float(v) for v in raw_values][: len(self.target_dims)]
+        if len(self.target_values) < len(self.target_dims):
+            # Pad with amplitude if the publisher under-specified.
+            self.target_values.extend(
+                [self.amplitude] * (len(self.target_dims) - len(self.target_values))
+            )
+        self.ramp_remaining = self.duration_ticks
+        self.decay_remaining = self.decay_ticks
+        self.applied_ticks = 0
+
+    def is_active(self) -> bool:
+        return self.ramp_remaining > 0 or self.decay_remaining > 0
+
+    def current_weight(self) -> float:
+        """Weight at the current tick. Linear ramp during duration, then
+        linear decay over decay_ticks. Returns 0.0 when fully consumed."""
+        if self.ramp_remaining > 0:
+            return self.amplitude
+        if self.decay_remaining > 0 and self.decay_ticks > 0:
+            return self.amplitude * (self.decay_remaining / self.decay_ticks)
+        return 0.0
+
+    def apply(self, features: list[float]) -> list[float]:
+        """Blend features toward target_values for target_dims."""
+        if not self.is_active() or not self.target_dims:
+            return features
+        weight = self.current_weight()
+        if weight <= 0.0:
+            return features
+        biased = list(features)
+        for d, target in zip(self.target_dims, self.target_values):
+            if 0 <= d < len(biased):
+                biased[d] = (1.0 - weight) * biased[d] + weight * target
+        return biased
+
+    def advance(self) -> None:
+        """Consume one tick — call after applying bias."""
+        if self.ramp_remaining > 0:
+            self.ramp_remaining -= 1
+        elif self.decay_remaining > 0:
+            self.decay_remaining -= 1
+        self.applied_ticks += 1
+
+
+def load_minime_influence(current: "MinimeInfluenceState | None") -> "MinimeInfluenceState | None":
+    """Poll the influence file and return either the existing in-flight
+    influence (if its window has not expired) or a freshly-parsed new one.
+
+    When the active influence finishes, renames the file to .consumed.json
+    so a duplicate cannot fire.
+    """
+    if current is not None and current.is_active():
+        return current
+    # Either no current or it just finished — finalize and look for a new one.
+    if current is not None and not current.is_active():
+        try:
+            if MINIME_INFLUENCE_PATH.exists():
+                MINIME_INFLUENCE_PATH.replace(MINIME_INFLUENCE_CONSUMED_PATH)
+                log.info(
+                    "minime influence consumed: intent_id=%s applied_ticks=%d",
+                    current.intent_id,
+                    current.applied_ticks,
+                )
+        except Exception as e:
+            log.warning("could not finalize consumed influence: %s", e)
+        current = None
+    if not MINIME_INFLUENCE_PATH.exists():
+        return None
+    try:
+        payload = json.loads(MINIME_INFLUENCE_PATH.read_text())
+    except Exception as e:
+        log.warning("could not parse minime_influence: %s", e)
+        return None
+    state = MinimeInfluenceState(payload)
+    if not state.target_dims:
+        log.info("minime influence has no valid target_dims, skipping")
+        return None
+    log.info(
+        "applying minime influence intent_id=%s label=%s ramp=%d decay=%d dims=%s",
+        state.intent_id,
+        state.label,
+        state.ramp_remaining,
+        state.decay_remaining,
+        state.target_dims,
+    )
+    return state
+
+
 async def run(db_path: Path, ws_url: str):
     import websockets
 
@@ -357,6 +470,9 @@ async def run(db_path: Path, ws_url: str):
 
     last_id = 0
     workspace_dir = db_path.parent  # bridge.db sits in workspace/
+
+    # v3.5: track minime's reciprocal-influence state across loop iterations.
+    minime_influence: "MinimeInfluenceState | None" = None
 
     # Find the latest ID already in the DB so we don't replay history
     try:
@@ -513,6 +629,16 @@ async def run(db_path: Path, ws_url: str):
                     log.warning("unexpected feature dim %d at id=%d", len(features), row_id)
                     last_id = row_id
                     continue
+
+                # v3.5: apply minime's reciprocal influence (if active) to
+                # the codec frame BEFORE conditioning so the bias enters
+                # the same downstream pipeline as natural codec features.
+                # Only the first 32 dims correspond to Astrid's codec; the
+                # higher 33-48 reserved channels are not influenceable.
+                minime_influence = load_minime_influence(minime_influence)
+                if minime_influence is not None and minime_influence.is_active():
+                    features = minime_influence.apply(features)
+                    minime_influence.advance()
 
                 conditioned, stats = conditioner.transform(features)
 

@@ -242,6 +242,37 @@ class ReservoirMetadataTests(unittest.TestCase):
             self.assertEqual(payload["shadow_backend"], "lsm_shadow")
             self.assertEqual(payload["source_event_id"], "codec_impact:42")
             self.assertIn("trajectory_rmsd", payload)
+            rollup = json.loads((state_dir / "shadow_metrics_rollup.json").read_text())
+            self.assertEqual(rollup["latest"]["shadow_handle"], "astrid__lsm")
+            self.assertEqual(rollup["counts_by_comparison_source"]["live_tick"], 1)
+
+    def test_shadow_metrics_rehearsal_is_sampled_and_rotated(self):
+        reservoir_service = load_reservoir_service_with_stubs()
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp)
+            service = reservoir_service.ReservoirService(state_dir=state_dir)
+            service.create_handle("astrid", "astrid")
+            service.create_handle("astrid__lsm", "astrid")
+
+            service.tick("astrid", np.ones((1, 32), dtype=np.float32), meta={"source": "seed"})
+            service.tick(
+                "astrid__lsm",
+                np.ones((1, 32), dtype=np.float32),
+                meta={"source": "seed", "shadow_of": "astrid"},
+            )
+            service._log_shadow_metrics("astrid__lsm", source="rehearsal")
+            service._log_shadow_metrics("astrid__lsm", source="rehearsal")
+            lines = (state_dir / "shadow_metrics.jsonl").read_text().strip().splitlines()
+            self.assertEqual(len(lines), 2)
+
+            old_max = reservoir_service.SHADOW_METRICS_MAX_BYTES
+            try:
+                reservoir_service.SHADOW_METRICS_MAX_BYTES = 8
+                service._rotate_shadow_metrics_if_needed()
+            finally:
+                reservoir_service.SHADOW_METRICS_MAX_BYTES = old_max
+            self.assertTrue((state_dir / "shadow_metrics.jsonl.1").exists())
+            self.assertEqual((state_dir / "shadow_metrics.jsonl").read_text(), "")
 
     def test_snapshot_restore_preserves_shadow_backend(self):
         reservoir_service = load_reservoir_service_with_stubs()
@@ -324,6 +355,74 @@ class ReservoirMetadataTests(unittest.TestCase):
             self.assertEqual(result["layers"][0]["name"], "h1_fast")
             self.assertIn("rho", result["layers"][0])
             self.assertIn("h_norm", result["layers"][0])
+
+    def test_clone_handle_copies_state_and_diverges_without_mutating_source(self):
+        reservoir_service = load_reservoir_service_with_stubs()
+        with tempfile.TemporaryDirectory() as tmp:
+            service = reservoir_service.ReservoirService(state_dir=Path(tmp))
+            service.create_handle("minime", "minime")
+            service.tick("minime", np.ones((1, 32), dtype=np.float32), meta={"source": "unit_seed"})
+
+            result = asyncio.run(
+                service.dispatch(
+                    {
+                        "type": "clone_handle",
+                        "source": "minime",
+                        "name": "attr_minime_lambda_edge_seed",
+                        "entity": "minime",
+                        "mode": "hold",
+                        "decay_profile": "slow",
+                        "meta": {
+                            "intent_id": "intent-1",
+                            "attractor_label": "lambda edge",
+                        },
+                    }
+                )
+            )
+
+            self.assertEqual(result["type"], "clone_handle_response")
+            self.assertEqual(result["source"], "minime")
+            self.assertEqual(result["name"], "attr_minime_lambda_edge_seed")
+            self.assertEqual(result["mode"], "hold")
+            self.assertEqual(result["decay_profile"], "slow")
+            base = service.read_state("minime")
+            clone = service.read_state("attr_minime_lambda_edge_seed")
+            self.assertEqual(base["backend"], clone["backend"])
+            self.assertTrue(np.allclose(base["h_norms"], clone["h_norms"]))
+            self.assertEqual(clone["last_live_meta"]["source"], "clone_handle")
+            self.assertEqual(clone["last_live_meta"]["from_handle"], "minime")
+            self.assertEqual(clone["last_live_meta"]["intent_id"], "intent-1")
+
+            service.tick(
+                "attr_minime_lambda_edge_seed",
+                np.full((1, 32), 0.5, dtype=np.float32),
+                meta={"source": "garden_shape"},
+            )
+            diverged = service.resonance("minime", "attr_minime_lambda_edge_seed")
+            self.assertIn("divergence", diverged)
+            self.assertEqual(service.read_state("minime")["tick_count"], 1)
+
+            service.destroy_handle("attr_minime_lambda_edge_seed")
+            self.assertEqual(service.read_state("minime")["name"], "minime")
+
+    def test_clone_handle_rejects_shadow_backend(self):
+        reservoir_service = load_reservoir_service_with_stubs()
+        with tempfile.TemporaryDirectory() as tmp:
+            service = reservoir_service.ReservoirService(state_dir=Path(tmp))
+            service.create_handle("minime__lsm", "minime", backend="lsm_shadow")
+
+            result = asyncio.run(
+                service.dispatch(
+                    {
+                        "type": "clone_handle",
+                        "source": "minime__lsm",
+                        "name": "attr_shadow_blocked",
+                    }
+                )
+            )
+
+            self.assertEqual(result["type"], "error")
+            self.assertIn("does not support clone_handle", result["message"])
 
     def test_push_state_meta_is_visible_without_synthetic_output(self):
         reservoir_service = load_reservoir_service_with_stubs()

@@ -49,6 +49,22 @@ TOOLS = [
         },
     },
     {
+        "name": "reservoir_clone",
+        "description": "Clone one handle's hidden state into a new attractor-garden handle for hold/rehearse/quiet tests without mutating the source.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "source": {"type": "string", "description": "Existing source handle to clone"},
+                "name": {"type": "string", "description": "New deterministic garden handle name"},
+                "entity": {"type": "string", "description": "Optional owner for the clone"},
+                "mode": {"type": "string", "enum": ["hold", "rehearse", "quiet"], "description": "Initial rehearsal mode for the clone"},
+                "decay_profile": {"type": "string", "enum": ["fast", "medium", "slow"], "description": "Optional decay profile for rehearse mode"},
+                "meta": {"type": "object", "description": "Optional provenance metadata, such as attractor intent id and label"},
+            },
+            "required": ["source", "name"],
+        },
+    },
+    {
         "name": "reservoir_tick_text",
         "description": "Send text to a reservoir handle. The text is projected to a 32D vector via frozen random projection, then fed into the reservoir. Auto-creates 'claude_main' handle if name is omitted. Returns the readout output and hidden layer norms.",
         "inputSchema": {
@@ -480,6 +496,27 @@ class MCPReservoirServer:
                 if result.get("type") == "error":
                     return f"Error: {result['message']}"
                 return f"Created handle '{arguments['name']}' for entity '{arguments['entity']}'."
+
+            elif tool_name == "reservoir_clone":
+                msg: dict[str, Any] = {
+                    "type": "clone_handle",
+                    "source": arguments["source"],
+                    "name": arguments["name"],
+                    "mode": arguments.get("mode", "quiet"),
+                }
+                for key in ("entity", "decay_profile", "meta"):
+                    if key in arguments:
+                        msg[key] = arguments[key]
+                result = await self._send(msg)
+                if result.get("type") == "error":
+                    return f"Error: {result['message']}"
+                norms = result.get("h_norms", [0, 0, 0])
+                return (
+                    f"Cloned '{arguments['source']}' to '{arguments['name']}' "
+                    f"(entity={result.get('entity')}, backend={result.get('backend')}, "
+                    f"mode={result.get('mode')}, tick={result.get('tick')}): "
+                    f"h_norms=[{norms[0]:.3f}, {norms[1]:.3f}, {norms[2]:.3f}]"
+                )
 
             elif tool_name == "reservoir_tick_text":
                 name = arguments.get("name", "claude_main")
