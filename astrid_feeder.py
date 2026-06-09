@@ -49,7 +49,8 @@ logging.basicConfig(
 )
 log = logging.getLogger("astrid-feeder")
 
-DEFAULT_DB = Path("/Users/v/other/astrid/capsules/consciousness-bridge/workspace/bridge.db")
+# Bridge DB lives in the spectral-bridge capsule (renamed from consciousness-bridge).
+DEFAULT_DB = Path("/Users/v/other/astrid/capsules/spectral-bridge/workspace/bridge.db")
 POLL_INTERVAL = 5.0  # seconds between DB polls
 SHADOW_SUFFIX = "__lsm"
 

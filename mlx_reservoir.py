@@ -208,12 +208,18 @@ class ReservoirLogitProcessor:
         self,
         coupling_strength: float = 0.1,
         sync_observer: Optional[Callable[[str, float], None]] = None,
+        rep_window: int = 64,
+        rep_penalty: float = 2.0,
     ):
         self.coupling_strength = coupling_strength
         self._sync_observer = sync_observer
         self._y1 = 0.0  # fast: token confidence
         self._y2 = 0.0  # medium: repetition
         self._y3 = 0.0  # slow: tonal drift
+        # y2 (medium) repetition-penalty params: how many recent tokens to consider
+        # and the per-occurrence logit penalty at full y2 (scaled by coupling strength).
+        self.rep_window = rep_window
+        self.rep_penalty = rep_penalty
 
     def update(self, y1: float, y2: float, y3: float):
         """Update with per-layer reservoir outputs."""
@@ -247,14 +253,25 @@ class ReservoirLogitProcessor:
         t_mod = max(0.5, min(2.0, t_mod))  # defensive clamp
         logits = logits * (1.0 / t_mod)
 
-        # Layer 2 (medium): repetition penalty modulation
-        # Positive y2 → boost token diversity, negative → allow repetition
-        # Applied as a gentle entropy bonus/penalty on the logit distribution
+        # Layer 2 (medium): phrase-level repetition penalty (h2 = medium timescale).
+        # NOTE: this was previously an inert constant-add (`logits + scalar`), which
+        # is softmax-invariant — it had ZERO effect on sampling, so this whole
+        # coupling channel was dead. Now it's a real, gentle scatter penalty on
+        # recently-generated tokens, scaled by y2 and by how often each recurred
+        # (duplicate indices accumulate). Positive y2 → discourage repetition (more
+        # diversity); negative → allow it. Wrapped defensively so the coupling path
+        # can never break generation.
         sig2 = self._sigmoid(self._y2)
-        entropy_nudge = s * (2.0 * sig2 - 1.0) * 0.5  # ±5% entropy shift
-        if abs(entropy_nudge) > 0.001:
-            # Add uniform noise proportional to nudge — softens or sharpens
-            logits = logits + entropy_nudge
+        rep = s * (2.0 * sig2 - 1.0)  # in [-s, +s]
+        if abs(rep) > 0.001 and tokens is not None:
+            try:
+                if int(tokens.size) > 0:
+                    recent = tokens.reshape(-1)[-self.rep_window:]
+                    flat = logits.reshape(-1)
+                    flat = flat.at[recent].add(-rep * self.rep_penalty)
+                    logits = flat.reshape(logits.shape)
+            except Exception:
+                pass  # never break generation on the coupling path
 
         # Layer 3 (slow): top-p / nucleus narrowing
         # Positive y3 → precise/narrow (suppress low-prob tokens more)

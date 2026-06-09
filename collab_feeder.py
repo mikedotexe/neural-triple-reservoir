@@ -45,7 +45,8 @@ log = logging.getLogger("collab-feeder")
 
 DEFAULT_SHARED_DIR = Path("/Users/v/other/shared/collaborations")
 DEFAULT_ASTRID_DB = Path(
-    "/Users/v/other/astrid/capsules/consciousness-bridge/workspace/bridge.db"
+    # Renamed from consciousness-bridge → spectral-bridge.
+    "/Users/v/other/astrid/capsules/spectral-bridge/workspace/bridge.db"
 )
 DEFAULT_MINIME_WORKSPACE = Path("/Users/v/other/minime/workspace")
 DEFAULT_WS_URL = "ws://127.0.0.1:7881"

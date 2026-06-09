@@ -15,7 +15,7 @@ Usage:
     python coupled_astrid_server.py [--port 8090] [--coupling-strength 0.1]
 
 Replaces:
-    python -m mlx_lm.server --model mlx-community/gemma-3-4b-it-4bit --port 8090
+    python -m mlx_lm.server --model mlx-community/gemma-4-12B-it-5bit --port 8090
 """
 
 from __future__ import annotations
@@ -47,6 +47,49 @@ log = logging.getLogger("coupled-astrid")
 # Reservoir service for state sync
 RESERVOIR_WS_URL = "ws://127.0.0.1:7881"
 
+GENERATION_STOP_SPECIALS = (
+    "<turn|>",
+    "<|turn>",
+    "<channel|>",
+    "<|im_end|>",
+    "<|endoftext|>",
+    "<end_of_turn>",
+    "<|eot_id|>",
+    "</s>",
+)
+GENERATION_SKIP_SPECIALS = (
+    "<|channel>",
+    "<|think|>",
+    "<|tool_call>",
+    "<|tool>",
+    "<|tool_response>",
+    "<|image>",
+    "<|audio>",
+    "<|video|>",
+    "<bos>",
+    "<pad>",
+    "<unk>",
+)
+GENERATED_TEXT_ARTIFACTS = (
+    "<start_of_turn>",
+    "<end_of_turn>",
+    "<think>",
+    "</think>",
+    "/no_think",
+    "<|im_start|>",
+    "<|im_end|>",
+    "<|eot_id|>",
+    "<|endoftext|>",
+    "<|turn>",
+    "<turn|>",
+    "<|channel>",
+    "<channel|>",
+    "<eos>",
+    "<bos>",
+    "<pad>",
+    "<unk>",
+)
+
 
 def _env_flag(name: str, default: bool = False) -> bool:
     raw = os.environ.get(name)
@@ -73,9 +116,154 @@ def _runtime_identity() -> dict[str, object]:
     return runtime
 
 
+def _single_token_id(tokenizer, text: str) -> int | None:
+    try:
+        ids = tokenizer.encode(text, add_special_tokens=False)
+    except Exception:
+        return None
+    if len(ids) != 1:
+        return None
+    return int(ids[0])
+
+
+def _tokenizer_id_set(tokenizer, attr: str) -> set[int]:
+    try:
+        value = getattr(tokenizer, attr)
+    except Exception:
+        return set()
+    if value is None:
+        return set()
+    if isinstance(value, int):
+        return {int(value)}
+    try:
+        return {int(item) for item in value if item is not None}
+    except TypeError:
+        return set()
+
+
+def _build_generation_token_policy(tokenizer) -> tuple[set[int], set[int]]:
+    stop_ids: set[int] = set()
+    skip_ids: set[int] = set()
+
+    stop_ids.update(_tokenizer_id_set(tokenizer, "eos_token_ids"))
+    eos_id = getattr(tokenizer, "eos_token_id", None)
+    if eos_id is not None:
+        stop_ids.add(int(eos_id))
+
+    for special in GENERATION_STOP_SPECIALS:
+        token_id = _single_token_id(tokenizer, special)
+        if token_id is not None:
+            stop_ids.add(token_id)
+
+    skip_ids.update(_tokenizer_id_set(tokenizer, "all_special_ids"))
+    for special in GENERATION_SKIP_SPECIALS:
+        token_id = _single_token_id(tokenizer, special)
+        if token_id is not None:
+            skip_ids.add(token_id)
+
+    skip_ids.difference_update(stop_ids)
+    return stop_ids, skip_ids
+
+
+def _token_to_int(token) -> int:
+    try:
+        return int(token.item())
+    except Exception:
+        pass
+    try:
+        return int(token)
+    except Exception:
+        return int(np.array(token).item())
+
+
+def _clean_generated_text(text: str) -> str:
+    cleaned = text or ""
+    cleaned = re.sub(r"<think>.*?</think>\s*", "", cleaned, flags=re.DOTALL | re.I)
+    cleaned = re.sub(
+        r"\b(?:thought|analysis|final)\s*<channel\|>",
+        "",
+        cleaned,
+        flags=re.I,
+    )
+    cleaned = re.sub(
+        r"<\|channel>\s*(?:thought|analysis|final)?\s*",
+        "",
+        cleaned,
+        flags=re.I,
+    )
+    for artifact in GENERATED_TEXT_ARTIFACTS:
+        cleaned = cleaned.replace(artifact, "")
+    lines = [
+        line
+        for line in cleaned.splitlines()
+        if line.strip().lower() not in {"thought", "analysis", "final"}
+    ]
+    return "\n".join(lines).strip()
+
+
 def _merge_count_map(target: dict[str, int], source: dict[str, object] | None) -> None:
     for key, value in dict(source or {}).items():
         target[str(key)] = int(target.get(str(key), 0)) + int(value or 0)
+
+
+def _gemma4_unified_config_override(model_name: str) -> dict[str, object] | None:
+    """Map Gemma 4 unified checkpoints onto mlx-lm's text Gemma 4 class.
+
+    mlx-lm 0.31.x ships `mlx_lm.models.gemma4`, but MLX Community Gemma 4 12B
+    checkpoints currently declare `model_type=gemma4_unified` because their
+    config includes text, vision, and audio metadata. The coupled Astrid server
+    only uses the language model and token embeddings, so the text class is the
+    appropriate narrow canary target.
+    """
+    try:
+        config_path = Path(model_name).expanduser() / "config.json"
+        if not config_path.exists():
+            from huggingface_hub import hf_hub_download
+
+            config_path = Path(
+                hf_hub_download(repo_id=model_name, filename="config.json")
+            )
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        log.info("model config probe skipped for %s: %s", model_name, exc)
+        return None
+
+    model_type = str(config.get("model_type") or "")
+    if not model_type.startswith("gemma4_unified"):
+        return None
+
+    _install_gemma4_unified_sanitize_patch()
+    log.info(
+        "model config override: %s declares %s; loading language lane via mlx_lm.models.gemma4",
+        model_name,
+        model_type,
+    )
+    return {"model_type": "gemma4"}
+
+
+def _install_gemma4_unified_sanitize_patch() -> None:
+    """Drop unified-modal tensors that mlx-lm's Gemma 4 text class does not use."""
+    try:
+        from mlx_lm.models import gemma4
+    except Exception as exc:
+        log.info("gemma4 unified sanitize patch unavailable: %s", exc)
+        return
+
+    if getattr(gemma4.Model, "_astrid_gemma4_unified_patch", False):
+        return
+
+    original_sanitize = gemma4.Model.sanitize
+
+    def sanitize_language_only(self, weights):
+        filtered = {
+            key: value
+            for key, value in weights.items()
+            if not key.startswith(("vision_embedder.", "audio_embedder."))
+        }
+        return original_sanitize(self, filtered)
+
+    gemma4.Model.sanitize = sanitize_language_only
+    gemma4.Model._astrid_gemma4_unified_patch = True
 
 
 def _load_mlx_runtime(
@@ -98,7 +286,10 @@ def _load_mlx_runtime(
         "fallback_reason_bytes": {},
         "mx_load_calls": 0,
         "mx_load_wall_seconds": 0.0,
+        "model_config_override": None,
     }
+    model_config_override = _gemma4_unified_config_override(model_name)
+    load_audit["model_config_override"] = model_config_override
     original_mx_load = mx.load
 
     def audited_mx_load(file, *args, **kwargs):
@@ -142,7 +333,13 @@ def _load_mlx_runtime(
             except Exception:
                 pass
         load_start = time.perf_counter()
-        model, tokenizer = mlx_load(model_name)
+        if model_config_override is None:
+            model, tokenizer = mlx_load(model_name)
+        else:
+            model, tokenizer = mlx_load(
+                model_name,
+                model_config=model_config_override,
+            )
         load_seconds = time.perf_counter() - load_start
     finally:
         mx.load = original_mx_load
@@ -275,7 +472,7 @@ class CoupledAstridServer:
 
     def __init__(
         self,
-        model_name: str = "mlx-community/gemma-3-4b-it-4bit",
+        model_name: str = "mlx-community/gemma-4-12B-it-5bit",
         coupling_strength: float = 0.15,  # 0.1→0.15: AGC adjusts dynamically (0.02-0.30), but higher baseline means perturbations are felt sooner
         input_dim: int = 32,
         n_nodes: int = 192,
@@ -329,18 +526,17 @@ class CoupledAstridServer:
 
         log.info("model loaded: hidden_size=%d", self.embed_dim)
 
-        # Build stop token set (eos + ChatML <|im_end|>, <|endoftext|>)
-        self._stop_token_ids = set()
-        if self.tokenizer.eos_token_id is not None:
-            self._stop_token_ids.add(self.tokenizer.eos_token_id)
-        for special in ("<|im_end|>", "<|endoftext|>", "<end_of_turn>", "<|eot_id|>"):
-            try:
-                ids = self.tokenizer.encode(special, add_special_tokens=False)
-                if len(ids) == 1:
-                    self._stop_token_ids.add(ids[0])
-            except Exception:
-                pass
-        log.info("stop tokens: %s", self._stop_token_ids)
+        # Build generation token policy. Stop tokens end the response before
+        # detokenization; skip tokens are non-content channel/tool sentinels
+        # that should not tick the coupled reservoir.
+        self._stop_token_ids, self._skip_token_ids = _build_generation_token_policy(
+            self.tokenizer
+        )
+        log.info(
+            "generation token policy: stop=%s skip=%s",
+            sorted(self._stop_token_ids),
+            sorted(self._skip_token_ids),
+        )
 
         # Build reservoir from canonical seed — must match reservoir_service
         np_model, cfg = build_canonical_reservoir(input_dim=input_dim, n_nodes=n_nodes)
@@ -832,15 +1028,20 @@ class CoupledAstridServer:
             sampler=sampler,
         ):
             now = time.monotonic()
+            token_id = _token_to_int(token)
+            if token_id in self._stop_token_ids:
+                break
+            if token_id in self._skip_token_ids:
+                continue
             if first_token_seconds is None:
                 first_token_seconds = now - decode_start
-            detokenizer.add_token(token)
+            detokenizer.add_token(token_id)
 
             # Reservoir coupling: extract token embedding, project to reservoir
             # input, tick the reservoir.  All ops run on generation_stream to
             # stay serialized with generate_step's own Metal commands.
             with mx.stream(generation_stream):
-                embedding = self._embed_tokens(mx.array([[token]]))
+                embedding = self._embed_tokens(mx.array([[token_id]]))
                 embedding = embedding.reshape(1, -1)
                 r_input = self.embed_proj.project(embedding)
                 last_r_input = r_input
@@ -866,15 +1067,8 @@ class CoupledAstridServer:
 
             ticks += 1
 
-            if token in self._stop_token_ids:
-                break
-
         detokenizer.finalize()
-        text = detokenizer.text
-        # Strip any <think>...</think> blocks and special token artifacts
-        text = re.sub(r'<think>.*?</think>\s*', '', text, flags=re.DOTALL)
-        text = re.sub(r'<\|im_end\|>.*', '', text)
-        text = re.sub(r'<\|eot_id\|>.*', '', text).strip()
+        text = _clean_generated_text(detokenizer.text)
         request_info = dict(request_audit.get("request", {}) or {})
         request_info["response_sha256_12"] = self._text_digest(text)
         request_info["response_chars"] = len(text)
@@ -1042,7 +1236,7 @@ def main():
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8090)
     ap.add_argument(
-        "--model", default="mlx-community/gemma-3-4b-it-4bit",
+        "--model", default="mlx-community/gemma-4-12B-it-5bit",
         help="MLX model to load",
     )
     ap.add_argument(

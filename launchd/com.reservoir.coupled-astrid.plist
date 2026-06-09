@@ -14,7 +14,7 @@
 		<string>0.1</string>
 		<string>--model-memory-map</string>
 		<string>--model</string>
-		<string>mlx-community/gemma-3-4b-it-4bit</string>
+		<string>mlx-community/gemma-4-12B-it-5bit</string>
 	</array>
 	<key>WorkingDirectory</key>
 	<string>/Users/v/other/neural-triple-reservoir</string>
