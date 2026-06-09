@@ -94,7 +94,7 @@ python minime_feeder.py &
 # Drop-in replacement for mlx_lm.server (requires reservoir service running)
 python coupled_astrid_server.py --port 8090 --coupling-strength 0.1
 
-# With custom model
+# Roll back to the former compact model if needed
 python coupled_astrid_server.py --port 8090 --model mlx-community/gemma-3-4b-it-4bit
 ```
 
