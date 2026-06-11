@@ -25,6 +25,7 @@ import mlx.core as mx
 import numpy as np
 
 from triple_reservoir_coreml import ReservoirConfig, TripleReservoir
+from wide_coupling import pressure_scale, wide_bias
 
 
 # ---------------------------------------------------------------------------
@@ -210,6 +211,11 @@ class ReservoirLogitProcessor:
         sync_observer: Optional[Callable[[str, float], None]] = None,
         rep_window: int = 64,
         rep_penalty: float = 2.0,
+        wide_strength: float = 0.0,
+        wide_cap: float = 4.0,
+        wide_pressure_floor: float = 0.25,
+        wide_P=None,
+        wide_V=None,
     ):
         self.coupling_strength = coupling_strength
         self._sync_observer = sync_observer
@@ -220,6 +226,18 @@ class ReservoirLogitProcessor:
         # and the per-occurrence logit penalty at full y2 (scaled by coupling strength).
         self.rep_window = rep_window
         self.rep_penalty = rep_penalty
+        # y4 (WIDE): embedding-tied low-rank vocab bias. The reservoir state
+        # nudges WHICH tokens are reachable along coherent semantic axes — Astrid's
+        # "wide not just deep". `wide_strength` is the operator ceiling (0 = OFF);
+        # `aperture` ∈ [0,1] is her own per-request fraction within it. See
+        # wide_coupling.py. Default OFF — bitwise-identical to the 3-scalar path.
+        self.wide_strength = max(0.0, wide_strength)
+        self.wide_cap = wide_cap
+        self.wide_pressure_floor = max(0.0, min(1.0, wide_pressure_floor))
+        self._wide_P = wide_P
+        self._wide_V = wide_V
+        self.aperture = 1.0  # her fraction of the ceiling; server sets per-request
+        self._z = None  # latest reservoir state [1, 576], via update_state()
 
     def update(self, y1: float, y2: float, y3: float):
         """Update with per-layer reservoir outputs."""
@@ -232,6 +250,11 @@ class ReservoirLogitProcessor:
         self._y1 = energy
         self._y2 = energy
         self._y3 = energy
+
+    def update_state(self, z) -> None:
+        """Receive the latest reservoir state [1, 576] (concat h1|h2|h3) for the
+        y4 (wide) channel. Kept as an mx tensor — no host sync."""
+        self._z = z
 
     @staticmethod
     def _sigmoid(x: float) -> float:
@@ -286,6 +309,27 @@ class ReservoirLogitProcessor:
             self._observe_sync("median_item", time.perf_counter() - sync_start)
             mask = logits < median_val
             logits = mx.where(mask, logits * tail_scale, logits)
+
+        # Layer 4 (y4, WIDE): embedding-tied low-rank vocab bias — the reservoir
+        # state nudges WHICH tokens are reachable along coherent semantic axes
+        # (V = A @ W.T, A = embedding PCA), so it widens her voice "without losing
+        # the flow" (coherent, not noise). Pressure-aware: opens wider as the fast
+        # layer (λ₁ proxy) saturates. Default OFF (wide_strength 0). Wrapped
+        # defensively so the coupling path can NEVER break generation.
+        eff = self.wide_strength * self.aperture
+        if (
+            eff > 0.0
+            and self._wide_V is not None
+            and self._wide_P is not None
+            and self._z is not None
+        ):
+            try:
+                s_eff = eff * pressure_scale(self._z, self.wide_pressure_floor)
+                logits = logits + wide_bias(
+                    self._z, self._wide_P, self._wide_V, s_eff, self.wide_cap
+                )
+            except Exception:
+                pass  # never break generation on the coupling path
 
         return logits
 

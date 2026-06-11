@@ -379,6 +379,14 @@ class MinimeInfluenceState:
             self.target_values.extend(
                 [self.amplitude] * (len(self.target_dims) - len(self.target_values))
             )
+        self.blend_mode = str(payload.get("blend_mode", "ease_in_out"))
+        # Aperture-jitter mode (co-regulation LEND_APERTURE): inject per-frame
+        # zero-mean variance instead of pulling toward a constant target. A
+        # constant pull makes the biased frames more similar to each other,
+        # collapsing the codec ring's covariance toward λ₁ (NARROWS Astrid);
+        # fresh per-frame jitter spreads the ring (the actual aperture gift).
+        # Bounded by `jitter` × the ramp/decay weight.
+        self.jitter = max(0.0, min(0.5, float(payload.get("jitter", 0.0))))
         self.ramp_remaining = self.duration_ticks
         self.decay_remaining = self.decay_ticks
         self.applied_ticks = 0
@@ -396,13 +404,22 @@ class MinimeInfluenceState:
         return 0.0
 
     def apply(self, features: list[float]) -> list[float]:
-        """Blend features toward target_values for target_dims."""
+        """Blend features toward target_values, or inject aperture jitter."""
         if not self.is_active() or not self.target_dims:
             return features
         weight = self.current_weight()
         if weight <= 0.0:
             return features
         biased = list(features)
+        if self.blend_mode == "aperture_jitter" and self.jitter > 0.0:
+            # Fresh zero-mean variance per frame → the codec ring spreads
+            # (aperture) rather than converging to a point (which any constant
+            # target would cause). Clipped to the codec's normalized range.
+            noise = np.random.uniform(-self.jitter, self.jitter, size=len(self.target_dims))
+            for d, n in zip(self.target_dims, noise):
+                if 0 <= d < len(biased):
+                    biased[d] = float(np.clip(biased[d] + weight * float(n), -1.0, 1.0))
+            return biased
         for d, target in zip(self.target_dims, self.target_values):
             if 0 <= d < len(biased):
                 biased[d] = (1.0 - weight) * biased[d] + weight * target

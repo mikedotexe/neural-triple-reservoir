@@ -134,5 +134,58 @@ class MinimeMemoryPolicyTests(unittest.TestCase):
         self.assertEqual(meta["blend"], 0.0)
 
 
+class MinimeApertureJitterTests(unittest.TestCase):
+    """Co-regulation LEND_APERTURE: the feeder's aperture-jitter mode must
+    SPREAD Astrid's codec ring (inject cross-frame variance), unlike the
+    constant-target pull which collapses it toward λ₁ (narrows her)."""
+
+    @staticmethod
+    def _run(payload, frames):
+        from astrid_feeder import MinimeInfluenceState
+
+        st = MinimeInfluenceState(payload)
+        out = []
+        for f in frames:
+            if not st.is_active():
+                break
+            out.append(st.apply(list(f)))
+            st.advance()
+        return np.array(out)
+
+    def test_constant_recipe_narrows_jitter_spreads(self):
+        np.random.seed(0)
+        dims = list(range(32))
+        varying = [list(np.random.uniform(-0.5, 0.5, 32)) for _ in range(14)]
+        base_var = float(np.mean(np.var(np.array(varying), axis=0)))
+        const = self._run(
+            {"amplitude": 0.3, "duration_ticks": 14, "decay_ticks": 10,
+             "target_dims": dims, "target_values": [0.3] * 32, "blend_mode": "ease_in_out"},
+            varying,
+        )
+        jit = self._run(
+            {"amplitude": 0.3, "duration_ticks": 14, "decay_ticks": 10,
+             "target_dims": dims, "target_values": [0.0] * 32,
+             "blend_mode": "aperture_jitter", "jitter": 0.12},
+            varying,
+        )
+        const_var = float(np.mean(np.var(const, axis=0)))
+        jit_var = float(np.mean(np.var(jit, axis=0)))
+        # Constant pull collapses cross-frame variance (NARROWS); jitter must not.
+        self.assertLess(const_var, base_var)
+        self.assertGreater(jit_var, const_var)
+
+    def test_jitter_respects_bounds(self):
+        np.random.seed(1)
+        out = self._run(
+            {"amplitude": 0.3, "duration_ticks": 5, "decay_ticks": 3,
+             "target_dims": list(range(32)), "target_values": [0.0] * 32,
+             "blend_mode": "aperture_jitter", "jitter": 0.12},
+            [[0.0] * 32 for _ in range(8)],
+        )
+        max_disp = float(np.max(np.abs(out)))
+        # Bounded by weight (≤0.3) × jitter (0.12) = 0.036.
+        self.assertLessEqual(max_disp, 0.3 * 0.12 + 1e-9)
+
+
 if __name__ == "__main__":
     unittest.main()

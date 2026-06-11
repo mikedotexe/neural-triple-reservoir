@@ -478,6 +478,10 @@ class CoupledAstridServer:
         n_nodes: int = 192,
         model_memory_map: bool = False,
         audit_dir: str | None = None,
+        wide_coupling_strength: float = 0.0,
+        wide_coupling_rank: int = 16,
+        wide_bias_cap: float = 4.0,
+        wide_pressure_floor: float = 0.25,
     ):
         from mlx_reservoir import EmbeddingProjection, MLXTripleReservoir
         from triple_reservoir_coreml import build_canonical_reservoir
@@ -554,6 +558,38 @@ class CoupledAstridServer:
         self.coupling_strength = coupling_strength
         self.input_dim = input_dim
         self._multi_head = True  # use per-layer readouts
+
+        # Wide coupling (y4): embedding-tied low-rank vocab-bias matrices, built
+        # once at load. Default-off (ceiling 0) → not built, server unchanged.
+        self.wide_coupling_strength = max(0.0, wide_coupling_strength)
+        self.wide_bias_cap = wide_bias_cap
+        self.wide_pressure_floor = wide_pressure_floor
+        self._wide_P = None
+        self._wide_V = None
+        if self.wide_coupling_strength > 0.0:
+            try:
+                import wide_coupling as _wc
+
+                m_args = getattr(self.model, "args", None)
+                vocab = None
+                if m_args is not None:
+                    if getattr(m_args, "vocab_size", None):
+                        vocab = int(m_args.vocab_size)
+                    elif isinstance(getattr(m_args, "text_config", None), dict):
+                        vocab = int(m_args.text_config.get("vocab_size") or 0) or None
+                if vocab is None:
+                    vocab = int(getattr(self.tokenizer, "vocab_size", 262144))
+                self._wide_P, self._wide_V, _info = _wc.build_wide_coupling_matrices(
+                    self._embed_tokens, vocab, k=int(wide_coupling_rank)
+                )
+                log.info(
+                    "wide coupling built: k=%d ceiling=%.3f cap=%.2f floor=%.2f vocab=%d",
+                    int(wide_coupling_rank), self.wide_coupling_strength,
+                    self.wide_bias_cap, self.wide_pressure_floor, vocab,
+                )
+            except Exception as exc:
+                log.warning("wide coupling build failed: %s; wide channel disabled", exc)
+                self._wide_P = self._wide_V = None
         configured_audit_dir = audit_dir or os.environ.get("COUPLED_ASTRID_AUDIT_DIR")
         self._audit_dir = Path(configured_audit_dir).expanduser() if configured_audit_dir else None
         self._audit_metrics_path = (
@@ -959,6 +995,7 @@ class CoupledAstridServer:
         temperature: float = 0.8,
         max_tokens: int = 512,
         handle_name: str = "astrid",
+        aperture: float = 1.0,
     ) -> str:
         """Run coupled generation with unified reservoir state.
 
@@ -1010,7 +1047,14 @@ class CoupledAstridServer:
             sync_observer=lambda kind, elapsed: _record_host_sync(
                 request_audit, kind, elapsed
             ),
+            wide_strength=self.wide_coupling_strength,
+            wide_cap=self.wide_bias_cap,
+            wide_pressure_floor=self.wide_pressure_floor,
+            wide_P=self._wide_P,
+            wide_V=self._wide_V,
         )
+        # Astrid's per-request aperture fraction within the operator ceiling.
+        processor.aperture = max(0.0, min(1.0, float(aperture)))
 
         detokenizer = self.tokenizer.detokenizer
         detokenizer.reset()
@@ -1056,6 +1100,11 @@ class CoupledAstridServer:
                         _timed_float_item(y2, request_audit, "scalar_item"),
                         _timed_float_item(y3, request_audit, "scalar_item"),
                     )
+                    if processor._wide_V is not None:
+                        # y4 (wide): pass the reservoir state (h1|h2|h3) for the
+                        # embedding-tied vocab bias. Lazy concat — only evaluated
+                        # inside the processor when the wide channel is active.
+                        processor.update_state(mx.concatenate(self.state, axis=1))
                 else:
                     # Legacy single-headed
                     y, _z, self.state = self.reservoir.step(r_input, self.state)
@@ -1168,6 +1217,9 @@ async def handle_chat_completions(request, server: CoupledAstridServer):
     temperature = body.get("temperature", 0.8)
     max_tokens = body.get("max_tokens", 512)
     handle_name = body.get("reservoir_handle", body.get("handle_name", "astrid"))
+    # Astrid's aperture fraction [0,1] (her SET_APERTURE), within the operator
+    # ceiling. Accept `aperture` (bridge) or `wide_coupling_strength` (alias).
+    aperture = body.get("aperture", body.get("wide_coupling_strength", 1.0))
 
     try:
         # Run synchronously on the main thread.  Do NOT use run_in_executor —
@@ -1175,7 +1227,7 @@ async def handle_chat_completions(request, server: CoupledAstridServer):
         # async_eval on generation_stream, causing Metal command buffer
         # contention (AGXG16X assertion).  The bridge sends one request at a
         # time with 120s timeout, so blocking the event loop is fine.
-        text = server.generate_coupled(messages, temperature, max_tokens, handle_name=handle_name)
+        text = server.generate_coupled(messages, temperature, max_tokens, handle_name=handle_name, aperture=aperture)
     except Exception as e:
         log.error("generation failed: %s", e)
         import traceback
@@ -1256,6 +1308,18 @@ def main():
         default=os.environ.get("COUPLED_ASTRID_AUDIT_DIR"),
         help="Directory for per-request JSONL audit metrics. Disabled unless set.",
     )
+    ap.add_argument(
+        "--wide-coupling-strength", type=float,
+        default=float(os.environ.get("COUPLED_ASTRID_WIDE_STRENGTH", "0.0") or 0.0),
+        help="Operator CEILING for the y4 wide (logit-space aperture) channel. "
+             "0.0 = OFF (default). Astrid's SET_APERTURE scales within this.",
+    )
+    ap.add_argument("--wide-coupling-rank", type=int, default=16,
+                    help="Low-rank k for the wide channel (8/16/32).")
+    ap.add_argument("--wide-bias-cap", type=float, default=4.0,
+                    help="Hard clamp on the per-token wide bias (logits).")
+    ap.add_argument("--wide-pressure-floor", type=float, default=0.25,
+                    help="Min aperture fraction at rest; opens to 1.0 under λ₁ pressure.")
     args = ap.parse_args()
 
     server = CoupledAstridServer(
@@ -1265,6 +1329,10 @@ def main():
         n_nodes=args.n_nodes,
         model_memory_map=bool(args.model_memory_map),
         audit_dir=args.audit_dir,
+        wide_coupling_strength=args.wide_coupling_strength,
+        wide_coupling_rank=args.wide_coupling_rank,
+        wide_bias_cap=args.wide_bias_cap,
+        wide_pressure_floor=args.wide_pressure_floor,
     )
     asyncio.run(run_server(server, args.host, args.port))
 
