@@ -187,5 +187,226 @@ class MinimeApertureJitterTests(unittest.TestCase):
         self.assertLessEqual(max_disp, 0.3 * 0.12 + 1e-9)
 
 
+class MinimeGiftWindowTests(unittest.TestCase):
+    """The LEND_APERTURE un-muffle: a gift's window is wall-clock-bounded (so it
+    finalizes promptly on the sparse codec_impact channel instead of dragging for
+    days); newer gifts supersede in-flight ones; a newer gift is never mis-consumed
+    under an old intent; and a stale gift finalizes (firing the closed-loop)."""
+
+    @staticmethod
+    def _payload(intent_id="g1", issued_t_ms=None, ticks=14, decay_ticks=10):
+        import time
+
+        if issued_t_ms is None:
+            issued_t_ms = time.time() * 1000.0
+        return {
+            "intent_id": intent_id, "issued_t_ms": issued_t_ms,
+            "amplitude": 0.3, "duration_ticks": ticks, "decay_ticks": decay_ticks,
+            "target_dims": list(range(32)), "target_values": [0.0] * 32,
+            "blend_mode": "aperture_jitter", "jitter": 0.12,
+        }
+
+    def test_walltime_expiry_overrides_remaining_ticks(self):
+        import time
+        import astrid_feeder as af
+
+        fresh = af.MinimeInfluenceState(self._payload(issued_t_ms=time.time() * 1000.0))
+        self.assertTrue(fresh.is_active())
+        old = af.MinimeInfluenceState(
+            self._payload(issued_t_ms=time.time() * 1000.0 - (af.MINIME_GIFT_MAX_AGE_MS + 60_000))
+        )
+        self.assertGreater(old.ramp_remaining, 0)  # ticks remain
+        self.assertTrue(old.walltime_expired())
+        self.assertFalse(old.is_active())  # but wall-clock says done
+        no_anchor = af.MinimeInfluenceState(self._payload(issued_t_ms=0.0))
+        self.assertFalse(no_anchor.walltime_expired())  # no anchor → tick window governs
+        self.assertTrue(no_anchor.is_active())
+
+    def test_zero_tick_expiry_is_shorter_than_absolute_window(self):
+        import time
+        import astrid_feeder as af
+
+        old_enough_for_zero_tick_close = af.MinimeInfluenceState(
+            self._payload(
+                issued_t_ms=time.time() * 1000.0
+                - (af.MINIME_GIFT_NO_TICK_MAX_AGE_MS + 1_000)
+            )
+        )
+        self.assertTrue(old_enough_for_zero_tick_close.no_tick_expired())
+        self.assertFalse(old_enough_for_zero_tick_close.walltime_expired())
+        self.assertFalse(old_enough_for_zero_tick_close.is_active())
+
+        old_enough_for_zero_tick_close.advance()
+        self.assertFalse(old_enough_for_zero_tick_close.no_tick_expired())
+
+    def _patched(self, tmp):
+        """Point module influence paths at a temp dir; returns paths + restore."""
+        import json
+        from pathlib import Path
+        import astrid_feeder as af
+
+        inf = Path(tmp) / "astrid_influence_v3.json"
+        consumed = Path(tmp) / "astrid_influence_v3.consumed.json"
+        terminal = Path(tmp) / "diagnostics" / "astrid_influence_terminal_events.jsonl"
+        quarantine = Path(tmp) / "diagnostics" / "astrid_influence_quarantine"
+        orig = (
+            af.MINIME_INFLUENCE_PATH,
+            af.MINIME_INFLUENCE_CONSUMED_PATH,
+            af.MINIME_INFLUENCE_TERMINAL_EVENTS_PATH,
+            af.MINIME_INFLUENCE_QUARANTINE_DIR,
+        )
+        af.MINIME_INFLUENCE_PATH, af.MINIME_INFLUENCE_CONSUMED_PATH = inf, consumed
+        af.MINIME_INFLUENCE_TERMINAL_EVENTS_PATH = terminal
+        af.MINIME_INFLUENCE_QUARANTINE_DIR = quarantine
+
+        def restore():
+            (
+                af.MINIME_INFLUENCE_PATH,
+                af.MINIME_INFLUENCE_CONSUMED_PATH,
+                af.MINIME_INFLUENCE_TERMINAL_EVENTS_PATH,
+                af.MINIME_INFLUENCE_QUARANTINE_DIR,
+            ) = orig
+
+        return inf, consumed, terminal, json, restore
+
+    @staticmethod
+    def _terminal_events(path):
+        import json
+
+        return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+    def test_newer_gift_supersedes_and_is_not_misconsumed(self):
+        import astrid_feeder as af
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as tmp:
+            inf, consumed, terminal, json, restore = self._patched(tmp)
+            try:
+                inf.write_text(json.dumps(self._payload(intent_id="g1")))
+                st = af.load_minime_influence(None)
+                self.assertIsNotNone(st)
+                self.assertEqual(st.intent_id, "g1")
+                # minime issues a newer gift g2 while g1 is still in-flight.
+                inf.write_text(json.dumps(self._payload(intent_id="g2")))
+                st2 = af.load_minime_influence(st)
+                self.assertIsNotNone(st2)
+                self.assertEqual(st2.intent_id, "g2")  # superseded → we load g2, not stuck on g1
+                self.assertTrue(inf.exists())  # g2 still live
+                self.assertFalse(consumed.exists())  # g2 was NOT mis-consumed under g1's intent
+                events = self._terminal_events(terminal)
+                self.assertEqual(events[-1]["status"], "superseded")
+                self.assertEqual(events[-1]["intent_id"], "g1")
+                self.assertEqual(events[-1]["superseded_by_intent_id"], "g2")
+            finally:
+                restore()
+
+    def test_stale_gift_finalizes_to_fire_closed_loop(self):
+        import time
+        import astrid_feeder as af
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as tmp:
+            inf, consumed, terminal, json, restore = self._patched(tmp)
+            try:
+                old_ms = time.time() * 1000.0 - (af.MINIME_GIFT_MAX_AGE_MS + 60_000)
+                inf.write_text(json.dumps(self._payload(intent_id="stale", issued_t_ms=old_ms)))
+                st = af.load_minime_influence(None)
+                self.assertIsNone(st)  # expired → not applied
+                self.assertFalse(inf.exists())  # but finalized →
+                self.assertTrue(consumed.exists())  # consumed (the closed-loop trigger)
+                consumed_payload = json.loads(consumed.read_text())
+                self.assertEqual(
+                    consumed_payload["feeder_terminal_v1"]["status"], "expired_unapplied"
+                )
+                self.assertEqual(consumed_payload["feeder_terminal_v1"]["applied_ticks"], 0)
+                events = self._terminal_events(terminal)
+                self.assertEqual(events[-1]["status"], "expired_unapplied")
+                self.assertEqual(events[-1]["intent_id"], "stale")
+                self.assertEqual(events[-1]["applied_ticks"], 0)
+            finally:
+                restore()
+
+    def test_zero_tick_gift_finalizes_after_short_deadline(self):
+        import time
+        import astrid_feeder as af
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as tmp:
+            inf, consumed, terminal, json, restore = self._patched(tmp)
+            try:
+                old_ms = time.time() * 1000.0 - (
+                    af.MINIME_GIFT_NO_TICK_MAX_AGE_MS + 1_000
+                )
+                inf.write_text(json.dumps(self._payload(intent_id="no-ticks", issued_t_ms=old_ms)))
+                st = af.load_minime_influence(None)
+                self.assertIsNone(st)
+                self.assertFalse(inf.exists())
+                self.assertTrue(consumed.exists())
+                consumed_payload = json.loads(consumed.read_text())
+                terminal_event = consumed_payload["feeder_terminal_v1"]
+                self.assertEqual(terminal_event["status"], "expired_unapplied")
+                self.assertEqual(terminal_event["applied_ticks"], 0)
+                self.assertEqual(
+                    terminal_event["reason"],
+                    "arrived_without_codec_ticks_before_short_deadline",
+                )
+                events = self._terminal_events(terminal)
+                self.assertEqual(events[-1]["intent_id"], "no-ticks")
+                self.assertEqual(events[-1]["status"], "expired_unapplied")
+            finally:
+                restore()
+
+    def test_finished_gift_appends_consumed_terminal_event(self):
+        import astrid_feeder as af
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as tmp:
+            inf, consumed, terminal, json, restore = self._patched(tmp)
+            try:
+                inf.write_text(json.dumps(self._payload(intent_id="done", ticks=1, decay_ticks=0)))
+                st = af.load_minime_influence(None)
+                self.assertIsNotNone(st)
+                st.advance()
+                st2 = af.load_minime_influence(st)
+                self.assertIsNone(st2)
+                self.assertFalse(inf.exists())
+                self.assertTrue(consumed.exists())
+                consumed_payload = json.loads(consumed.read_text())
+                self.assertEqual(consumed_payload["feeder_terminal_v1"]["status"], "consumed")
+                self.assertEqual(consumed_payload["feeder_terminal_v1"]["applied_ticks"], 1)
+                events = self._terminal_events(terminal)
+                self.assertEqual(events[-1]["status"], "consumed")
+                self.assertEqual(events[-1]["intent_id"], "done")
+                self.assertEqual(events[-1]["applied_ticks"], 1)
+            finally:
+                restore()
+
+    def test_malformed_gift_quarantines_once_without_consumed_trigger(self):
+        import astrid_feeder as af
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as tmp:
+            inf, consumed, terminal, json, restore = self._patched(tmp)
+            try:
+                inf.write_text("{not json")
+                st = af.load_minime_influence(None)
+                self.assertIsNone(st)
+                self.assertFalse(inf.exists())
+                self.assertFalse(consumed.exists())
+                quarantined = sorted(af.MINIME_INFLUENCE_QUARANTINE_DIR.glob("*.json"))
+                self.assertEqual(len(quarantined), 1)
+                self.assertEqual(quarantined[0].read_text(), "{not json")
+
+                # A later poll sees no live malformed file and appends no duplicate.
+                st2 = af.load_minime_influence(None)
+                self.assertIsNone(st2)
+                events = self._terminal_events(terminal)
+                self.assertEqual(len(events), 1)
+                self.assertEqual(events[0]["status"], "parse_failed")
+                self.assertIn("quarantined", events[0]["reason"])
+            finally:
+                restore()
+
+
 if __name__ == "__main__":
     unittest.main()

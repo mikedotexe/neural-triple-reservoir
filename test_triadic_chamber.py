@@ -1,0 +1,1210 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import asyncio
+import json
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+import collab_feeder
+import triadic_chamber as chamber
+
+
+def write_collab(shared: Path) -> dict:
+    meta = {
+        "schema_version": 1,
+        "id": "coll_123_triadic",
+        "topic": "triadic chamber",
+        "inviter": "astrid",
+        "invitee": "minime",
+        "status": "joined",
+        "created_t_ms": 1_000,
+        "updated_t_ms": 2_000,
+        "members": ["astrid", "minime"],
+    }
+    coll_dir = shared / meta["id"]
+    coll_dir.mkdir(parents=True)
+    (coll_dir / "meta.json").write_text(json.dumps(meta))
+    return meta
+
+
+class FakeReservoirWs:
+    def __init__(self):
+        self.messages: list[dict] = []
+        self._responses: list[dict] = []
+
+    async def send(self, text: str) -> None:
+        msg = json.loads(text)
+        self.messages.append(msg)
+        msg_type = msg.get("type")
+        if msg_type == "create_handle":
+            self._responses.append({"type": "create_handle_response", "ok": True})
+        elif msg_type == "set_mode":
+            self._responses.append({"type": "set_mode_response", "ok": True})
+        elif msg_type == "tick_text":
+            self._responses.append({"type": "tick_response", "name": msg["name"]})
+        elif msg_type == "read_state":
+            self._responses.append({
+                "type": "read_state_response",
+                "name": msg["name"],
+                "h_norms": [1.0, 2.0, 3.0],
+                "tick_count": 12,
+                "mode": "rehearse",
+                "seconds_since_live": 1.5,
+            })
+        elif msg_type == "resonance":
+            self._responses.append({
+                "type": "resonance_response",
+                "name_a": msg["name_a"],
+                "name_b": msg["name_b"],
+                "shared_ticks": 12,
+                "correlation": 0.25,
+                "divergence": 0.1,
+                "rmsd": 0.2,
+            })
+        else:
+            self._responses.append({"type": "error", "message": "unexpected"})
+
+    async def recv(self) -> str:
+        return json.dumps(self._responses.pop(0))
+
+
+class TriadicChamberFileTests(unittest.TestCase):
+    def synthetic_metrics(
+        self,
+        *,
+        weather: str = "aligned",
+        trend: str = "steady",
+        streak: int = 4,
+        weather_confidence: str = "high",
+        gravity_participant: str = "shared",
+        gravity_role: str = "shared",
+        residue: str = "countercurrent",
+        residue_strength: str = "medium",
+        volatility: float = 0.05,
+    ) -> dict:
+        return {
+            "relational_schema_version": chamber.RELATIONAL_SCHEMA_VERSION,
+            "room_weather": {
+                "label": weather,
+                "trend": trend,
+                "streak": streak,
+                "confidence": weather_confidence,
+                "history_samples": 12,
+            },
+            "gravitational_center": {
+                "participant": gravity_participant,
+                "role": gravity_role,
+                "confidence": weather_confidence,
+                "signature": f"{gravity_participant}:{gravity_role}:{weather}",
+            },
+            "relational_inertia": {
+                "label": residue,
+                "strength_label": residue_strength,
+                "carry_forward": {
+                    "weather": "mixed",
+                    "gravity_participant": gravity_participant,
+                    "gravity_role": gravity_role,
+                },
+                "signature": f"{residue}:{residue_strength}:{weather}",
+            },
+            "pair_matrix": [
+                {
+                    "pair_key": "astrid-minime",
+                    "pair": ["astrid", "minime"],
+                    "available": True,
+                    "current_correlation": 0.45,
+                    "volatility": volatility,
+                },
+                {
+                    "pair_key": "astrid-steward",
+                    "pair": ["astrid", "steward"],
+                    "available": True,
+                    "current_correlation": 0.4,
+                    "volatility": volatility,
+                },
+                {
+                    "pair_key": "minime-steward",
+                    "pair": ["minime", "steward"],
+                    "available": True,
+                    "current_correlation": 0.38,
+                    "volatility": volatility,
+                },
+            ],
+        }
+
+    def test_latest_prefers_joined_collaboration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shared = Path(tmp)
+            joined = write_collab(shared)
+            invited = dict(joined)
+            invited["id"] = "coll_999_invited"
+            invited["status"] = "invited"
+            invited["updated_t_ms"] = 9_999
+            invited["members"] = ["astrid"]
+            invited_dir = shared / invited["id"]
+            invited_dir.mkdir()
+            (invited_dir / "meta.json").write_text(json.dumps(invited))
+
+            selected = chamber.select_collab(shared, "latest")
+
+            self.assertEqual(selected["id"], joined["id"])
+
+    def test_activate_initializes_chamber_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shared = Path(tmp)
+            meta = write_collab(shared)
+
+            doc = chamber.activate(shared, meta["id"])
+            coll_dir = shared / meta["id"]
+            paths = chamber.chamber_paths(coll_dir)
+
+            self.assertEqual(doc["mode"], "witness")
+            self.assertTrue(doc["witness_only"])
+            self.assertEqual(doc["handles"]["steward"], "steward")
+            self.assertTrue(paths["meta"].is_file())
+            self.assertTrue(paths["notes"].is_file())
+            self.assertTrue(paths["intentions"].is_file())
+            self.assertTrue(paths["memory_edits"].is_file())
+            self.assertTrue(paths["presence"].is_file())
+            self.assertTrue(paths["annotations"].is_file())
+            self.assertTrue(paths["events"].is_file())
+            self.assertIn("activated", paths["events"].read_text())
+
+    def test_steward_note_cursor_deduplicates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shared = Path(tmp)
+            meta = write_collab(shared)
+            note = chamber.append_steward_note(
+                shared,
+                "Please hold this as witness context, not a command.",
+                target=meta["id"],
+            )
+            coll_dir = shared / meta["id"]
+
+            self.assertEqual(len(chamber.unprocessed_steward_notes(coll_dir)), 1)
+            chamber.mark_notes_processed(coll_dir, [note["id"]])
+            self.assertEqual(chamber.unprocessed_steward_notes(coll_dir), [])
+
+    def test_prompt_summary_marks_notes_as_non_commands(self):
+        meta = {
+            "id": "coll_123_triadic",
+            "topic": "triadic chamber",
+        }
+        doc = chamber.chamber_doc_for(meta)
+        state = chamber.build_chamber_state(
+            meta,
+            doc,
+            {"steward": {"type": "read_state_response", "h_norms": [1, 2, 3]}},
+            {("astrid", "steward"): {"type": "resonance_response", "correlation": 0.5}},
+            [{"id": "n1", "t_ms": 1, "source": "test", "text": "Witness note only."}],
+            active_intention={
+                "id": "i1",
+                "t_ms": 1,
+                "text": "Observe integration without steering.",
+                "witness_only": True,
+            },
+            phase="integration",
+            phase_source="manual",
+            compressed_memory={
+                "compression_schema_version": 1,
+                "current_thread": "Carry the chamber forward.",
+                "open_questions": ["What remains alive?"],
+                "do_not_forget": ["Memory edits are context, not commands."],
+                "recent_shifts": ["manual memory refinement"],
+                "stable_truths": ["Astrid, Minime, and steward are present."],
+                "room_weather": {
+                    "label": "aligned",
+                    "summary": "astrid-steward corr=+0.500",
+                    "signature": "aligned|astrid-steward:strong_pos",
+                },
+                "source": "derived",
+                "updated_t_ms": 1,
+            },
+        )
+
+        self.assertIn("not commands", state["prompt_summary"])
+        self.assertIn("Phase integration (manual)", state["prompt_summary"])
+        self.assertIn("Active steward intention", state["prompt_summary"])
+        self.assertIn("Current thread", state["prompt_summary"])
+        self.assertIn("Open question", state["prompt_summary"])
+        self.assertIn("Room weather", state["prompt_summary"])
+        self.assertTrue(state["witness_only"])
+        self.assertEqual(state["schema_version"], 2)
+        self.assertEqual(state["phase"], "integration")
+        self.assertEqual(state["phase_source"], "manual")
+        self.assertEqual(state["compressed_memory"]["current_thread"], "Carry the chamber forward.")
+        self.assertEqual(state["recent_steward_notes"][0]["witness_only"], True)
+
+    def test_steward_intention_set_clear_and_clamp(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shared = Path(tmp)
+            meta = write_collab(shared)
+            long_text = "x" * (chamber.INTENTION_TEXT_LIMIT + 20)
+
+            with self.assertRaises(ValueError):
+                chamber.append_steward_intention(shared, "   ", target=meta["id"])
+            intention = chamber.append_steward_intention(shared, long_text, target=meta["id"])
+            coll_dir = shared / meta["id"]
+
+            active = chamber.active_steward_intention(coll_dir)
+            stored = chamber.read_steward_intentions(coll_dir)[-1]
+            self.assertEqual(active["id"], intention["id"])
+            self.assertLessEqual(len(stored["text"]), chamber.INTENTION_TEXT_LIMIT + 20)
+            self.assertIn("[truncated]", stored["text"])
+            cleared = chamber.clear_steward_intention(shared, target=meta["id"])
+
+            self.assertFalse(cleared["active"])
+            self.assertIsNone(chamber.active_steward_intention(coll_dir))
+            self.assertIn("steward_intention_cleared", (coll_dir / "chamber_events.jsonl").read_text())
+
+    def test_phase_override_and_clear_restores_inferred_phase(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shared = Path(tmp)
+            meta = write_collab(shared)
+            coll_dir = shared / meta["id"]
+            chamber.activate(shared, meta["id"])
+
+            result = chamber.set_chamber_phase(shared, "play", target=meta["id"])
+            self.assertEqual(result["phase"], "play")
+            self.assertEqual(chamber.resolve_chamber_phase(coll_dir), ("play", "manual"))
+            with self.assertRaises(ValueError):
+                chamber.set_chamber_phase(shared, "command_mode", target=meta["id"])
+
+            cleared = chamber.clear_chamber_phase(shared, target=meta["id"])
+            self.assertEqual(cleared["phase_source"], "inferred")
+            self.assertEqual(chamber.resolve_chamber_phase(coll_dir), ("initialized", "inferred"))
+
+    def test_presence_and_annotation_lanes_render_into_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shared = Path(tmp)
+            meta = write_collab(shared)
+            coll_dir = shared / meta["id"]
+            chamber.activate(shared, meta["id"])
+
+            receipt = chamber.append_presence_receipt(
+                shared,
+                "astrid",
+                attention="high",
+                notice="repair_watch feels accurate",
+                carrying="continuity and boundary",
+                target=meta["id"],
+            )
+            annotation = chamber.append_chamber_annotation(
+                shared,
+                "minime",
+                "phase_cartography",
+                "question",
+                "oscillation may be repair in disguise",
+                target=meta["id"],
+            )
+            state = chamber.refresh_chamber_files_from_disk(coll_dir, meta)
+            memory = json.loads((coll_dir / "chamber_memory.json").read_text())
+            reentry = (coll_dir / "chamber_reentry.md").read_text()
+
+            self.assertEqual(receipt["actor"], "astrid")
+            self.assertEqual(annotation["target"], "phase_cartography")
+            self.assertIn("presence_protocol", state)
+            self.assertIn("annotation_lane", state)
+            self.assertIn("Presence protocol", state["prompt_summary"])
+            self.assertIn("Annotation lane", state["prompt_summary"])
+            self.assertIn("context, not commands", state["prompt_summary"])
+            self.assertEqual(state["presence_protocol"]["seen_actors"], ["astrid"])
+            self.assertEqual(state["annotation_lane"]["annotations_total"], 1)
+            self.assertIn("presence_protocol", memory)
+            self.assertIn("annotation_lane", memory)
+            self.assertIn("Presence Protocol", reentry)
+            self.assertIn("Annotation Lane", reentry)
+            self.assertIn("repair_watch", chamber.render_presence(shared, meta["id"]))
+            self.assertIn("phase_cartography", chamber.render_annotations(shared, meta["id"]))
+            history = chamber.render_history(shared, meta["id"], limit=20)
+            self.assertIn("presence:", history)
+            self.assertIn("annotation:", history)
+
+    def test_presence_and_annotation_reject_invalid_inputs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shared = Path(tmp)
+            meta = write_collab(shared)
+
+            with self.assertRaises(ValueError):
+                chamber.append_presence_receipt(shared, "ghost", target=meta["id"])
+            with self.assertRaises(ValueError):
+                chamber.append_presence_receipt(
+                    shared,
+                    "astrid",
+                    attention="absolute",
+                    target=meta["id"],
+                )
+            with self.assertRaises(ValueError):
+                chamber.append_chamber_annotation(
+                    shared,
+                    "minime",
+                    "unknown_target",
+                    "notice",
+                    "text",
+                    target=meta["id"],
+                )
+            with self.assertRaises(ValueError):
+                chamber.append_chamber_annotation(
+                    shared,
+                    "minime",
+                    "other",
+                    "command",
+                    "text",
+                    target=meta["id"],
+                )
+            with self.assertRaises(ValueError):
+                chamber.append_chamber_annotation(
+                    shared,
+                    "minime",
+                    "other",
+                    "notice",
+                    "   ",
+                    target=meta["id"],
+                )
+
+    def test_only_latest_active_intention_is_unprocessed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shared = Path(tmp)
+            meta = write_collab(shared)
+            first = chamber.append_steward_intention(
+                shared,
+                "First intention, superseded before processing.",
+                target=meta["id"],
+            )
+            second = chamber.append_steward_intention(
+                shared,
+                "Second intention, the active beacon.",
+                target=meta["id"],
+            )
+            coll_dir = shared / meta["id"]
+
+            unprocessed = chamber.unprocessed_steward_intentions(coll_dir)
+
+            self.assertEqual([item["id"] for item in unprocessed], [second["id"]])
+            self.assertNotIn(first["id"], [item["id"] for item in unprocessed])
+
+    def test_compressed_memory_derives_without_manual_edit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shared = Path(tmp)
+            meta = write_collab(shared)
+            coll_dir = shared / meta["id"]
+            chamber.activate(shared, meta["id"])
+            intention = chamber.append_steward_intention(
+                shared,
+                "Hold continuity without steering.",
+                target=meta["id"],
+            )
+            note = chamber.append_steward_note(
+                shared,
+                "What is the next open thread?",
+                target=meta["id"],
+            )
+
+            compressed = chamber.build_compressed_memory(
+                coll_dir,
+                meta,
+                phase="witness_active",
+                phase_source="inferred",
+                active_intention={
+                    "id": intention["id"],
+                    "text": intention["text"],
+                    "witness_only": True,
+                },
+                recent_notes=[note],
+                resonance_rows=[
+                    {"pair": ["astrid", "minime"], "available": True, "correlation": 0.6},
+                    {"pair": ["astrid", "steward"], "available": True, "correlation": 0.55},
+                    {"pair": ["minime", "steward"], "available": True, "correlation": 0.5},
+                ],
+            )
+
+            self.assertEqual(compressed["source"], "derived")
+            self.assertEqual(compressed["compression_schema_version"], 1)
+            self.assertIn("Hold continuity", compressed["current_thread"])
+            self.assertEqual(compressed["open_questions"][0], "What is the next open thread?")
+            self.assertEqual(compressed["room_weather"]["label"], "aligned")
+            self.assertIn("context, not commands", compressed["do_not_forget"][0])
+
+    def test_relational_metrics_build_from_current_resonance_without_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shared = Path(tmp)
+            meta = write_collab(shared)
+            coll_dir = shared / meta["id"]
+            chamber.activate(shared, meta["id"])
+            rows = [
+                {"pair": ["astrid", "minime"], "available": True, "correlation": 0.6},
+                {"pair": ["astrid", "steward"], "available": True, "correlation": 0.55},
+                {"pair": ["minime", "steward"], "available": True, "correlation": 0.5},
+            ]
+
+            metrics = chamber.build_relational_metrics(coll_dir, rows, history_rows=[])
+
+            self.assertEqual(metrics["relational_schema_version"], 2)
+            self.assertEqual(len(metrics["pair_matrix"]), 3)
+            self.assertEqual(metrics["room_weather"]["label"], "aligned")
+            self.assertEqual(metrics["room_weather"]["trend"], "insufficient_history")
+            self.assertEqual(metrics["gravitational_center"]["participant"], "shared")
+            self.assertEqual(metrics["relational_inertia"]["label"], "unavailable")
+            self.assertIn("Relational gravity", metrics["prompt_mirror"])
+            self.assertIn("not commands or authority", metrics["prompt_mirror"])
+
+    def test_relational_matrix_uses_balanced_history_for_trend_and_confidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shared = Path(tmp)
+            meta = write_collab(shared)
+            coll_dir = shared / meta["id"]
+            chamber.activate(shared, meta["id"])
+            history = []
+            for idx in range(30):
+                corr = 0.15 + (idx * 0.005)
+                history.append({
+                    "t_ms": idx,
+                    "label": "mixed",
+                    "pairs": [
+                        {"pair": ["astrid", "minime"], "correlation": corr},
+                        {"pair": ["astrid", "steward"], "correlation": corr + 0.02},
+                        {"pair": ["minime", "steward"], "correlation": corr + 0.01},
+                    ],
+                })
+            current = [
+                {"pair": ["astrid", "minime"], "available": True, "correlation": 0.62},
+                {"pair": ["astrid", "steward"], "available": True, "correlation": 0.58},
+                {"pair": ["minime", "steward"], "available": True, "correlation": 0.55},
+            ]
+
+            metrics = chamber.build_relational_metrics(coll_dir, current, history_rows=history)
+
+            self.assertEqual(metrics["room_weather"]["trend"], "stabilizing")
+            self.assertEqual(metrics["room_weather"]["confidence"], "high")
+            self.assertGreaterEqual(metrics["pair_matrix"][0]["sample_count"], 31)
+            self.assertEqual(metrics["pair_matrix"][0]["trend"], "rising")
+
+    def test_relational_weather_detects_labels_and_oscillation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shared = Path(tmp)
+            meta = write_collab(shared)
+            coll_dir = shared / meta["id"]
+            chamber.activate(shared, meta["id"])
+            aligned = [
+                {"pair": ["astrid", "minime"], "available": True, "correlation": 0.5},
+                {"pair": ["astrid", "steward"], "available": True, "correlation": 0.5},
+                {"pair": ["minime", "steward"], "available": True, "correlation": 0.5},
+            ]
+            mixed = [
+                {"pair": ["astrid", "minime"], "available": True, "correlation": 0.25},
+                {"pair": ["astrid", "steward"], "available": True, "correlation": 0.05},
+                {"pair": ["minime", "steward"], "available": True, "correlation": -0.1},
+            ]
+            divergent = [
+                {"pair": ["astrid", "minime"], "available": True, "correlation": -0.5},
+                {"pair": ["astrid", "steward"], "available": True, "correlation": 0.1},
+                {"pair": ["minime", "steward"], "available": True, "correlation": 0.1},
+            ]
+            oscillating_history = [
+                {"label": label, "pairs": [{"pair": ["astrid", "minime"], "correlation": 0.2}]}
+                for label in ["aligned", "mixed", "aligned", "mixed", "divergent", "mixed"]
+            ]
+
+            self.assertEqual(chamber.build_relational_metrics(coll_dir, aligned, history_rows=[])["room_weather"]["label"], "aligned")
+            self.assertEqual(chamber.build_relational_metrics(coll_dir, mixed, history_rows=[])["room_weather"]["label"], "mixed")
+            self.assertEqual(chamber.build_relational_metrics(coll_dir, divergent, history_rows=[])["room_weather"]["label"], "divergent")
+            self.assertEqual(chamber.build_relational_metrics(coll_dir, [], history_rows=[])["room_weather"]["label"], "unavailable")
+            self.assertEqual(
+                chamber.build_relational_metrics(coll_dir, mixed, history_rows=oscillating_history)["room_weather"]["trend"],
+                "oscillating",
+            )
+
+    def test_relational_gravity_derives_roles(self):
+        def row(pair, corr, delta=0.0):
+            return {
+                "pair": list(pair),
+                "pair_key": "-".join(pair),
+                "available": True,
+                "current_correlation": corr,
+                "delta_correlation": delta,
+                "volatility": 0.05,
+            }
+
+        weather = {"label": "mixed", "trend": "steady", "confidence": "medium"}
+        cases = [
+            (
+                "shared",
+                [
+                    row(("astrid", "minime"), 0.6),
+                    row(("astrid", "steward"), 0.55),
+                    row(("minime", "steward"), 0.5),
+                ],
+                {"label": "aligned", "trend": "steady", "confidence": "high"},
+                ("shared", "shared"),
+            ),
+            (
+                "unsettled",
+                [
+                    row(("astrid", "minime"), -0.6),
+                    row(("astrid", "steward"), -0.5),
+                    row(("minime", "steward"), 0.2),
+                ],
+                weather,
+                ("astrid", "unsettled"),
+            ),
+            (
+                "mover",
+                [
+                    row(("astrid", "minime"), 0.3, 0.2),
+                    row(("astrid", "steward"), 0.3, 0.18),
+                    row(("minime", "steward"), 0.1, 0.0),
+                ],
+                weather,
+                ("astrid", "mover"),
+            ),
+            (
+                "anchor",
+                [
+                    row(("astrid", "minime"), 0.7),
+                    row(("astrid", "steward"), 0.5),
+                    row(("minime", "steward"), 0.1),
+                ],
+                weather,
+                ("astrid", "anchor"),
+            ),
+            (
+                "bridge",
+                [
+                    row(("astrid", "minime"), 0.25),
+                    row(("astrid", "steward"), 0.3),
+                    row(("minime", "steward"), -0.05),
+                ],
+                weather,
+                ("astrid", "bridge"),
+            ),
+            ("unavailable", [], weather, ("unavailable", "unavailable")),
+        ]
+
+        for name, matrix, case_weather, expected in cases:
+            with self.subTest(name=name):
+                gravity = chamber.derive_gravitational_center(matrix, case_weather)
+                self.assertEqual((gravity["participant"], gravity["role"]), expected)
+                self.assertIn("authority", gravity)
+
+    def test_relational_inertia_derives_residue_labels(self):
+        current_aligned = {"label": "aligned", "trend": "steady", "confidence": "high"}
+        current_divergent = {"label": "divergent", "trend": "destabilizing", "confidence": "high"}
+        shared_gravity = {
+            "participant": "shared",
+            "role": "shared",
+            "signature": "shared:shared:high:aligned:steady",
+        }
+        unsettled_gravity = {
+            "participant": "astrid",
+            "role": "unsettled",
+            "signature": "astrid:unsettled:high:divergent:destabilizing",
+        }
+
+        def row(label, participant="shared", role="shared"):
+            return {
+                "label": label,
+                "gravity": {
+                    "participant": participant,
+                    "role": role,
+                    "signature": f"{participant}:{role}:medium:{label}:steady",
+                },
+            }
+
+        reinforcing = chamber.derive_relational_inertia(
+            [row("aligned") for _ in range(8)],
+            current_aligned,
+            shared_gravity,
+        )
+        countercurrent = chamber.derive_relational_inertia(
+            [row("aligned") for _ in range(8)],
+            current_divergent,
+            unsettled_gravity,
+        )
+        turbulent = chamber.derive_relational_inertia(
+            [row(label) for label in ["aligned", "mixed", "divergent", "mixed", "aligned", "divergent"]],
+            current_aligned,
+            shared_gravity,
+        )
+        faint = chamber.derive_relational_inertia(
+            [row("aligned")],
+            current_aligned,
+            shared_gravity,
+        )
+        unavailable = chamber.derive_relational_inertia([], current_aligned, shared_gravity)
+
+        self.assertEqual(reinforcing["label"], "reinforcing")
+        self.assertEqual(countercurrent["label"], "countercurrent")
+        self.assertEqual(turbulent["label"], "turbulent")
+        self.assertEqual(faint["label"], "faint")
+        self.assertEqual(unavailable["label"], "unavailable")
+        self.assertEqual(reinforcing["source"], "weather_timeline_decay")
+        self.assertIn("interpretive_context_not_authority", reinforcing["authority"])
+        self.assertLessEqual(len(reinforcing["evidence"]), 3)
+
+    def test_phase_cartography_derives_core_labels(self):
+        integration = chamber.derive_phase_cartography(
+            self.synthetic_metrics(residue="countercurrent"),
+            history_rows=[{"label": "mixed"} for _ in range(8)],
+        )
+        repair = chamber.derive_phase_cartography(
+            self.synthetic_metrics(
+                weather="divergent",
+                trend="destabilizing",
+                gravity_participant="astrid",
+                gravity_role="unsettled",
+                residue="reinforcing",
+            ),
+            history_rows=[{"label": "divergent"} for _ in range(8)],
+        )
+        oscillation = chamber.derive_phase_cartography(
+            self.synthetic_metrics(weather="mixed", trend="steady", residue="reinforcing"),
+            history_rows=[
+                {"label": label}
+                for label in ["aligned", "mixed", "divergent", "mixed", "aligned", "mixed"]
+            ],
+        )
+        handoff = chamber.derive_phase_cartography(
+            self.synthetic_metrics(
+                weather="mixed",
+                trend="steady",
+                streak=5,
+                gravity_participant="astrid",
+                gravity_role="anchor",
+                residue="faint",
+                residue_strength="low",
+            ),
+            history_rows=[{"label": "mixed"} for _ in range(10)],
+        )
+        unavailable = chamber.derive_phase_cartography(None, history_rows=[])
+
+        self.assertEqual(integration["phase"], "integration_opportunity")
+        self.assertEqual(repair["phase"], "repair_watch")
+        self.assertEqual(oscillation["phase"], "oscillation")
+        self.assertEqual(handoff["phase"], "handoff_ready")
+        self.assertEqual(unavailable["phase"], "unavailable")
+        self.assertEqual(integration["cartography_schema_version"], 1)
+        self.assertIn("phase_authority", integration["authority"])
+
+    def test_phase_cartography_artifacts_write_json_markdown_and_optional_png(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shared = Path(tmp)
+            meta = write_collab(shared)
+            coll_dir = shared / meta["id"]
+            chamber.activate(shared, meta["id"])
+            metrics = self.synthetic_metrics(residue="faint", residue_strength="low")
+            cartography = chamber.derive_phase_cartography(
+                metrics,
+                history_rows=[{"t_ms": idx, "label": "aligned"} for idx in range(5)],
+            )
+
+            payload = chamber.write_phase_cartography_artifacts(
+                coll_dir,
+                cartography,
+                metrics,
+                history_rows=[{"t_ms": idx, "label": "aligned"} for idx in range(5)],
+            )
+            paths = chamber.chamber_paths(coll_dir)
+
+            self.assertTrue(paths["phase_cartography"].is_file())
+            self.assertTrue(paths["phase_cartography_md"].is_file())
+            self.assertIn("phase_cartography", payload)
+            self.assertIn("Boundary", paths["phase_cartography_md"].read_text())
+            artifacts = payload["artifacts"]
+            self.assertTrue("png" in artifacts or "plot_error" in artifacts)
+            if "png" in artifacts:
+                self.assertTrue(Path(artifacts["png"]).is_file())
+
+    def test_old_v21_weather_rows_load_into_relational_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shared = Path(tmp)
+            meta = write_collab(shared)
+            coll_dir = shared / meta["id"]
+            chamber.activate(shared, meta["id"])
+            old_row = {
+                "schema_version": 2,
+                "compression_schema_version": 1,
+                "t_ms": 1,
+                "signature": "mixed",
+                "label": "mixed",
+                "summary": "legacy",
+                "pairs": [
+                    {"pair": ["astrid", "minime"], "correlation": 0.2},
+                    {"pair": ["astrid", "steward"], "correlation": 0.25},
+                ],
+            }
+            current = [
+                {"pair": ["astrid", "minime"], "available": True, "correlation": 0.35},
+                {"pair": ["astrid", "steward"], "available": True, "correlation": 0.3},
+                {"pair": ["minime", "steward"], "available": True, "correlation": 0.1},
+            ]
+
+            metrics = chamber.build_relational_metrics(coll_dir, current, history_rows=[old_row])
+
+            self.assertEqual(metrics["pair_matrix"][0]["sample_count"], 2)
+            self.assertEqual(metrics["pair_matrix"][0]["delta_correlation"], 0.15)
+            self.assertIn("relational_inertia", metrics)
+
+    def test_resonance_timeline_appends_signature_changes_without_spam(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shared = Path(tmp)
+            meta = write_collab(shared)
+            coll_dir = shared / meta["id"]
+            chamber.activate(shared, meta["id"])
+            rows = [
+                {"pair": ["astrid", "minime"], "available": True, "correlation": 0.2},
+                {"pair": ["astrid", "steward"], "available": True, "correlation": 0.2},
+                {"pair": ["minime", "steward"], "available": True, "correlation": 0.2},
+            ]
+            metrics = chamber.build_relational_metrics(coll_dir, rows, history_rows=[])
+            compressed = {"room_weather": metrics["room_weather"]}
+
+            chamber.maybe_append_resonance_journal(coll_dir, compressed, metrics)
+            chamber.maybe_append_resonance_journal(coll_dir, compressed, metrics)
+            timeline = chamber.read_jsonl_dicts(chamber.chamber_paths(coll_dir)["resonance_journal"])
+            self.assertEqual(len(timeline), 1)
+            self.assertEqual(timeline[0]["relational_schema_version"], 2)
+            self.assertIn("relational_inertia", timeline[0])
+            self.assertIn("inertia_signature", timeline[0])
+
+            changed = dict(metrics)
+            changed["gravitational_center"] = dict(metrics["gravitational_center"])
+            changed["gravitational_center"]["signature"] = "astrid:mover:medium:mixed:stabilizing"
+            chamber.maybe_append_resonance_journal(coll_dir, compressed, changed)
+            timeline = chamber.read_jsonl_dicts(chamber.chamber_paths(coll_dir)["resonance_journal"])
+            self.assertEqual(len(timeline), 2)
+
+            changed_inertia = dict(changed)
+            changed_inertia["relational_inertia"] = dict(changed["relational_inertia"])
+            changed_inertia["relational_inertia"]["signature"] = "countercurrent:medium:aligned:shared:shared:mixed:astrid:mover"
+            chamber.maybe_append_resonance_journal(coll_dir, compressed, changed_inertia)
+            timeline = chamber.read_jsonl_dicts(chamber.chamber_paths(coll_dir)["resonance_journal"])
+            self.assertEqual(len(timeline), 3)
+
+            cartography = chamber.derive_phase_cartography(changed_inertia, history_rows=timeline)
+            chamber.maybe_append_resonance_journal(coll_dir, compressed, changed_inertia, cartography)
+            timeline = chamber.read_jsonl_dicts(chamber.chamber_paths(coll_dir)["resonance_journal"])
+            self.assertEqual(len(timeline), 4)
+            self.assertIn("phase_cartography", timeline[-1])
+            self.assertIn("cartography_signature", timeline[-1])
+
+    def test_memory_edit_json_override_and_clear(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shared = Path(tmp)
+            meta = write_collab(shared)
+            coll_dir = shared / meta["id"]
+            chamber.activate(shared, meta["id"])
+            base_state = {
+                "schema_version": 2,
+                "collab_id": meta["id"],
+                "topic": meta["topic"],
+                "resonance": [],
+            }
+            chamber.write_chamber_state(coll_dir, base_state)
+
+            edit = chamber.append_memory_edit(
+                shared,
+                {
+                    "current_thread": "Manual thread",
+                    "open_questions": ["Manual question?"],
+                    "do_not_forget": ["Manual memory is not a command."],
+                    "recent_shifts": ["Manual refinement landed"],
+                    "stable_truths": ["Manual stable truth"],
+                    "room_weather": {"label": "mixed", "summary": "manual weather"},
+                },
+                target=meta["id"],
+            )
+            state = chamber.refresh_chamber_files_from_disk(coll_dir, meta)
+
+            compressed = state["compressed_memory"]
+            self.assertEqual(compressed["source"], "hybrid_manual")
+            self.assertEqual(compressed["manual_edit_id"], edit["id"])
+            self.assertEqual(compressed["current_thread"], "Manual thread")
+            self.assertIn("Manual question?", compressed["open_questions"])
+            self.assertIn("Manual thread", state["prompt_summary"])
+            self.assertIn("relational_metrics", state)
+
+            chamber.clear_memory_edit(shared, target=meta["id"])
+            cleared_state = chamber.refresh_chamber_files_from_disk(coll_dir, meta)
+            self.assertEqual(cleared_state["compressed_memory"]["source"], "derived")
+
+    def test_memory_edit_rejects_invalid_payloads(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shared = Path(tmp)
+            meta = write_collab(shared)
+            with self.assertRaises(ValueError):
+                chamber.parse_memory_edit_payload("{not json")
+            with self.assertRaises(ValueError):
+                chamber.append_memory_edit(shared, {}, target=meta["id"])
+            with self.assertRaises(ValueError):
+                chamber.append_memory_edit(shared, {"unknown": "field"}, target=meta["id"])
+            with self.assertRaises(ValueError):
+                chamber.append_memory_edit(shared, {"open_questions": "not-a-list"}, target=meta["id"])
+
+    def test_memory_edit_file_cli_matches_inline_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shared = Path(tmp)
+            meta = write_collab(shared)
+            payload_file = shared / "memory_edit.json"
+            payload_file.write_text(json.dumps({"current_thread": "File thread"}))
+
+            with patch(
+                "sys.argv",
+                [
+                    "triadic_chamber.py",
+                    "--shared-dir",
+                    str(shared),
+                    "--target",
+                    meta["id"],
+                    "memory",
+                    "edit",
+                    "--file",
+                    str(payload_file),
+                ],
+            ):
+                self.assertEqual(chamber.main(), 0)
+
+            coll_dir = shared / meta["id"]
+            self.assertEqual(
+                chamber.active_memory_edit(coll_dir)["payload"]["current_thread"],
+                "File thread",
+            )
+
+    def test_intention_list_and_history_render_bounded_timeline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shared = Path(tmp)
+            meta = write_collab(shared)
+            chamber.activate(shared, meta["id"])
+            chamber.append_steward_note(shared, "Witness this.", target=meta["id"])
+            chamber.append_steward_intention(shared, "Hold this room.", target=meta["id"])
+            chamber.append_memory_edit(
+                shared,
+                {"current_thread": "Timeline thread"},
+                target=meta["id"],
+            )
+
+            intentions = chamber.render_intentions(shared, meta["id"], limit=5)
+            history = chamber.render_history(shared, meta["id"], limit=8)
+
+            self.assertIn("Hold this room", intentions)
+            self.assertIn("note:", history)
+            self.assertIn("intention:", history)
+            self.assertIn("memory:", history)
+
+    def test_chamber_memory_and_reentry_capture_phase(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shared = Path(tmp)
+            meta = write_collab(shared)
+            coll_dir = shared / meta["id"]
+            chamber.activate(shared, meta["id"])
+            chamber.append_steward_intention(
+                shared,
+                "Observe integration without steering.",
+                target=meta["id"],
+            )
+            note = chamber.append_steward_note(
+                shared,
+                "Witness note for re-entry, still not a command.",
+                target=meta["id"],
+            )
+            chamber.append_chamber_event(
+                coll_dir,
+                "steward_note_processed",
+                "collab_feeder",
+                {"note_id": note["id"]},
+            )
+            state = {
+                "collab_id": meta["id"],
+                "topic": meta["topic"],
+                "prompt_summary": "Triadic chamber witness: steward notes are context, not commands.",
+                "resonance": [
+                    {
+                        "pair": ["astrid", "steward"],
+                        "available": True,
+                        "correlation": 0.25,
+                        "divergence": 0.1,
+                    }
+                ],
+            }
+
+            memory = chamber.write_chamber_memory(coll_dir, state)
+
+            self.assertEqual(memory["schema_version"], 2)
+            self.assertEqual(memory["phase"], "witness_active")
+            self.assertEqual(memory["phase_source"], "inferred")
+            self.assertIn("active_steward_intention", memory)
+            self.assertIn("compressed_memory", memory)
+            self.assertEqual(memory["compressed_memory"]["compression_schema_version"], 1)
+            self.assertIn("relational_metrics", memory)
+            self.assertIn("phase_cartography", memory)
+            self.assertIn("stable_truths", memory)
+            self.assertIn("boundaries", memory)
+            self.assertEqual(memory["latest_steward_note"]["id"], note["id"])
+            self.assertIn("not commands", memory["state_summary"])
+            reentry = (coll_dir / "chamber_reentry.md").read_text()
+            self.assertIn("Triadic Chamber Re-entry", reentry)
+            self.assertIn("Compressed Memory", reentry)
+            self.assertIn("Relational Metrics", reentry)
+            self.assertIn("Phase Cartography", reentry)
+            self.assertIn("carry-forward residue", reentry)
+            self.assertIn("Active steward intention", reentry)
+            self.assertIn("Boundaries", reentry)
+            self.assertIn("Steward notes and intentions are witness context only", reentry)
+            self.assertTrue((coll_dir / "chamber_phase_cartography.json").is_file())
+            self.assertTrue((coll_dir / "chamber_phase_cartography.md").is_file())
+
+    def test_prompt_summary_includes_v3_mirror_and_stays_bounded(self):
+        meta = {"id": "coll_123_triadic", "topic": "triadic chamber"}
+        doc = chamber.chamber_doc_for(meta)
+        with tempfile.TemporaryDirectory() as tmp:
+            coll_dir = Path(tmp) / meta["id"]
+            coll_dir.mkdir()
+            resonance_rows = [
+                {"pair": ["astrid", "minime"], "available": True, "correlation": 0.4},
+                {"pair": ["astrid", "steward"], "available": True, "correlation": 0.3},
+                {"pair": ["minime", "steward"], "available": True, "correlation": 0.2},
+            ]
+            metrics = chamber.build_relational_metrics(
+                coll_dir,
+                resonance_rows,
+                history_rows=[
+                    {
+                        "label": "aligned",
+                        "gravity": {"participant": "shared", "role": "shared"},
+                        "pairs": [
+                            {"pair": ["astrid", "minime"], "correlation": 0.5},
+                            {"pair": ["astrid", "steward"], "correlation": 0.5},
+                            {"pair": ["minime", "steward"], "correlation": 0.5},
+                        ],
+                    }
+                    for _ in range(8)
+                ],
+            )
+            cartography = chamber.derive_phase_cartography(
+                metrics,
+                history_rows=[
+                    {"label": "aligned", "gravity": {"participant": "shared", "role": "shared"}}
+                    for _ in range(8)
+                ],
+            )
+            state = chamber.build_chamber_state(
+                meta,
+                doc,
+                {},
+                {},
+                [],
+                resonance_rows=resonance_rows,
+                compressed_memory={
+                    "current_thread": "V3 relation work",
+                    "open_questions": ["How does the room move?"],
+                    "do_not_forget": ["Metrics are not commands."],
+                    "recent_shifts": ["V3 mirror"],
+                    "room_weather": metrics["room_weather"],
+                },
+                relational_metrics=metrics,
+                phase_cartography=cartography,
+            )
+
+        self.assertIn("V3 relational mirror", state["prompt_summary"])
+        self.assertIn("Relational gravity", state["prompt_summary"])
+        self.assertIn("Carry-forward residue", state["prompt_summary"])
+        self.assertIn("Phase cartography", state["prompt_summary"])
+        self.assertIn("not command or phase authority", state["prompt_summary"])
+        self.assertIn("interpretive context, not authority", state["prompt_summary"])
+        self.assertLessEqual(len(state["prompt_summary"]), chamber.PROMPT_SUMMARY_LIMIT)
+
+    def test_metrics_weather_and_status_render_bounded_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shared = Path(tmp)
+            meta = write_collab(shared)
+            coll_dir = shared / meta["id"]
+            chamber.activate(shared, meta["id"])
+            resonance_rows = [
+                {"pair": ["astrid", "minime"], "available": True, "correlation": 0.4},
+                {"pair": ["astrid", "steward"], "available": True, "correlation": 0.3},
+                {"pair": ["minime", "steward"], "available": True, "correlation": 0.2},
+            ]
+            metrics = chamber.build_relational_metrics(coll_dir, resonance_rows, history_rows=[])
+            cartography = chamber.derive_phase_cartography(metrics, history_rows=[])
+            chamber.write_chamber_state(
+                coll_dir,
+                {
+                    "schema_version": 2,
+                    "collab_id": meta["id"],
+                    "topic": meta["topic"],
+                    "resonance": resonance_rows,
+                    "relational_metrics": metrics,
+                    "phase_cartography": cartography,
+                    "compressed_memory": {"room_weather": metrics["room_weather"]},
+                    "prompt_summary": metrics["prompt_mirror"],
+                },
+            )
+            chamber.maybe_append_resonance_journal(
+                coll_dir,
+                {"room_weather": metrics["room_weather"]},
+                metrics,
+                cartography,
+            )
+
+            rendered_metrics = chamber.render_metrics(shared, meta["id"])
+            rendered_inertia = chamber.render_inertia(shared, meta["id"])
+            rendered_cartography = chamber.render_cartography(shared, meta["id"], limit=3)
+            rendered_weather = chamber.render_weather(shared, meta["id"], limit=3)
+            rendered_status = chamber.render_status(shared, meta["id"])
+
+            self.assertIn("relational gravity", rendered_metrics)
+            self.assertIn("carry-forward residue", rendered_metrics)
+            self.assertIn("phase cartography", rendered_metrics)
+            self.assertIn("Triadic relational inertia", rendered_inertia)
+            self.assertIn("Triadic phase cartography", rendered_cartography)
+            self.assertIn("transition hint", rendered_cartography)
+            self.assertIn("matrix:", rendered_metrics)
+            self.assertIn("Triadic weather timeline", rendered_weather)
+            self.assertIn("residue=", rendered_weather)
+            self.assertIn("phase=", rendered_weather)
+            self.assertIn("weather trend", rendered_status)
+            self.assertIn("relational gravity", rendered_status)
+            self.assertIn("carry-forward residue", rendered_status)
+            self.assertIn("phase cartography", rendered_status)
+
+
+class TriadicChamberFeederTests(unittest.TestCase):
+    def test_process_chamber_notes_ticks_once_and_writes_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shared = Path(tmp)
+            meta = write_collab(shared)
+            chamber.append_steward_note(
+                shared,
+                "This note should tick the steward and chamber handles once.",
+                target=meta["id"],
+            )
+            ws = FakeReservoirWs()
+            known: set[str] = set()
+
+            emitted = asyncio.run(
+                collab_feeder.process_chamber_notes(ws, shared, meta, known)
+            )
+            emitted_again = asyncio.run(
+                collab_feeder.process_chamber_notes(ws, shared, meta, known)
+            )
+
+            self.assertEqual(emitted, 2)
+            self.assertEqual(emitted_again, 0)
+            tick_texts = [m for m in ws.messages if m.get("type") == "tick_text"]
+            self.assertEqual(len(tick_texts), 2)
+            self.assertEqual({m["name"] for m in tick_texts}, {"steward", "collab_coll_123_triadic"})
+            coll_dir = shared / meta["id"]
+            self.assertEqual(chamber.unprocessed_steward_notes(coll_dir), [])
+            state = json.loads((coll_dir / "chamber_state.json").read_text())
+            memory = json.loads((coll_dir / "chamber_memory.json").read_text())
+            self.assertIn("not commands", state["prompt_summary"])
+            self.assertIn("compressed_memory", state)
+            self.assertIn("relational_metrics", state)
+            self.assertIn("phase_cartography", state)
+            self.assertIn("compressed_memory", memory)
+            self.assertIn("relational_metrics", memory)
+            self.assertIn("phase_cartography", memory)
+            self.assertEqual(memory["phase"], "witness_active")
+            self.assertTrue((coll_dir / "chamber_reentry.md").is_file())
+            self.assertTrue((coll_dir / "chamber_phase_cartography.json").is_file())
+            self.assertTrue((coll_dir / "chamber_phase_cartography.md").is_file())
+
+    def test_process_chamber_intention_ticks_once_and_writes_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shared = Path(tmp)
+            meta = write_collab(shared)
+            intention = chamber.append_steward_intention(
+                shared,
+                "Observe resonance without steering.",
+                target=meta["id"],
+            )
+            ws = FakeReservoirWs()
+            known: set[str] = set()
+
+            emitted = asyncio.run(
+                collab_feeder.process_chamber_notes(ws, shared, meta, known)
+            )
+            emitted_again = asyncio.run(
+                collab_feeder.process_chamber_notes(ws, shared, meta, known)
+            )
+
+            self.assertEqual(emitted, 2)
+            self.assertEqual(emitted_again, 0)
+            tick_texts = [m for m in ws.messages if m.get("type") == "tick_text"]
+            self.assertEqual(len(tick_texts), 2)
+            self.assertTrue(all("not a command" in m["text"] for m in tick_texts))
+            coll_dir = shared / meta["id"]
+            self.assertEqual(chamber.unprocessed_steward_intentions(coll_dir), [])
+            self.assertIn(intention["id"], chamber.processed_intention_ids(coll_dir))
+            state = json.loads((coll_dir / "chamber_state.json").read_text())
+            memory = json.loads((coll_dir / "chamber_memory.json").read_text())
+            self.assertIn("Active steward intention", state["prompt_summary"])
+            self.assertIn("compressed_memory", state)
+            self.assertIn("relational_metrics", state)
+            self.assertIn("phase_cartography", state)
+            self.assertEqual(memory["active_steward_intention"]["id"], intention["id"])
+            self.assertIn("phase_cartography", memory)
+
+    def test_memory_edit_does_not_tick_reservoir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shared = Path(tmp)
+            meta = write_collab(shared)
+            chamber.append_memory_edit(
+                shared,
+                {"current_thread": "Manual memory only."},
+                target=meta["id"],
+            )
+            ws = FakeReservoirWs()
+            known: set[str] = set()
+
+            emitted = asyncio.run(
+                collab_feeder.process_chamber_notes(ws, shared, meta, known)
+            )
+
+            self.assertEqual(emitted, 0)
+            tick_texts = [m for m in ws.messages if m.get("type") == "tick_text"]
+            self.assertEqual(tick_texts, [])
+            state = json.loads((shared / meta["id"] / "chamber_state.json").read_text())
+            self.assertEqual(state["compressed_memory"]["current_thread"], "Manual memory only.")
+            self.assertIn("relational_metrics", state)
+            self.assertIn("phase_cartography", state)
+
+    def test_presence_and_annotations_do_not_tick_reservoir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shared = Path(tmp)
+            meta = write_collab(shared)
+            chamber.append_presence_receipt(
+                shared,
+                "astrid",
+                attention="medium",
+                notice="I saw the chamber mirror.",
+                target=meta["id"],
+            )
+            chamber.append_chamber_annotation(
+                shared,
+                "minime",
+                "relational_metrics",
+                "affirm",
+                "The matrix is useful public context.",
+                target=meta["id"],
+            )
+            ws = FakeReservoirWs()
+            known: set[str] = set()
+
+            emitted = asyncio.run(
+                collab_feeder.process_chamber_notes(ws, shared, meta, known)
+            )
+
+            self.assertEqual(emitted, 0)
+            tick_texts = [m for m in ws.messages if m.get("type") == "tick_text"]
+            self.assertEqual(tick_texts, [])
+            state = json.loads((shared / meta["id"] / "chamber_state.json").read_text())
+            self.assertIn("Presence protocol", state["prompt_summary"])
+            self.assertIn("Annotation lane", state["prompt_summary"])
+            self.assertEqual(state["presence_protocol"]["seen_actors"], ["astrid"])
+
+
+if __name__ == "__main__":
+    unittest.main()

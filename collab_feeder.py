@@ -36,6 +36,8 @@ from pathlib import Path
 import numpy as np
 import websockets
 
+import triadic_chamber as chamber
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [collab-feeder] %(message)s",
@@ -74,7 +76,7 @@ def collab_handle_name(coll_id: str) -> str:
     """Deterministic mapping from collab id → reservoir handle name.
     Must match the convention used by Astrid (collaboration.rs) and
     minime (autonomous_agent.py) when reading the handle state."""
-    return f"collab_{coll_id}"
+    return chamber.collab_handle_name(coll_id)
 
 
 def scan_joined_collabs(shared_dir: Path) -> list[dict]:
@@ -226,13 +228,13 @@ def blend_features(
     }
 
 
-async def ensure_handle(ws, name: str) -> bool:
+async def ensure_handle(ws, name: str, entity: str = "collab") -> bool:
     """Idempotent create_handle. Returns True if handle exists or was
-    created, False on protocol error. Uses entity='collab' so the handle
+    created, False on protocol error. Uses entity metadata so the handle
     is identifiable in reservoir_list."""
     try:
         await ws.send(
-            json.dumps({"type": "create_handle", "name": name, "entity": "collab"})
+            json.dumps({"type": "create_handle", "name": name, "entity": entity})
         )
         r = json.loads(await ws.recv())
         if r.get("type") == "error":
@@ -242,7 +244,7 @@ async def ensure_handle(ws, name: str) -> bool:
             log.warning("create_handle %s rejected: %s", name, msg)
             return False
         if r.get("ok"):
-            log.info("created collab handle '%s'", name)
+            log.info("created %s handle '%s'", entity, name)
             # Set rehearse mode with medium decay so quiet periods preserve
             # state without immediately collapsing — same default Astrid
             # uses for her own handle.
@@ -259,6 +261,8 @@ async def ensure_handle(ws, name: str) -> bool:
             await ws.recv()
             return True
         return False
+    except websockets.exceptions.ConnectionClosed:
+        raise
     except Exception as e:
         log.warning("ensure_handle %s failed: %s", name, e)
         return False
@@ -270,9 +274,209 @@ async def tick_handle(ws, name: str, vec: np.ndarray, meta: dict) -> bool:
         await ws.send(json.dumps(msg))
         r = json.loads(await ws.recv())
         return r.get("type") != "error"
+    except websockets.exceptions.ConnectionClosed:
+        raise
     except Exception as e:
         log.warning("tick %s failed: %s", name, e)
         return False
+
+
+async def reservoir_request(ws, msg: dict) -> dict | None:
+    try:
+        await ws.send(json.dumps(msg))
+        return json.loads(await ws.recv())
+    except websockets.exceptions.ConnectionClosed:
+        raise
+    except Exception as e:
+        log.debug("reservoir request %s failed: %s", msg.get("type"), e)
+        return None
+
+
+async def tick_text_handle(ws, name: str, text: str) -> bool:
+    r = await reservoir_request(ws, {"type": "tick_text", "name": name, "text": text})
+    return bool(r and r.get("type") != "error")
+
+
+async def read_handle_state(ws, name: str) -> dict | None:
+    return await reservoir_request(ws, {"type": "read_state", "name": name})
+
+
+async def read_pair_resonance(ws, name_a: str, name_b: str) -> dict | None:
+    return await reservoir_request(
+        ws,
+        {"type": "resonance", "name_a": name_a, "name_b": name_b},
+    )
+
+
+def steward_note_tick_text(meta: dict, note: dict) -> str:
+    coll_id = str(meta.get("id") or "")
+    topic = str(meta.get("topic") or "")
+    text = str(note.get("text") or "")
+    return (
+        "[Triadic chamber witness]\n"
+        f"collab_id: {coll_id}\n"
+        f"topic: {topic}\n"
+        "authority: steward witness note; context only; not a command\n"
+        f"note_id: {note.get('id')}\n"
+        f"text: {text}"
+    )
+
+
+def steward_intention_tick_text(meta: dict, intention: dict) -> str:
+    coll_id = str(meta.get("id") or "")
+    topic = str(meta.get("topic") or "")
+    text = str(intention.get("text") or "")
+    return (
+        "[Triadic chamber steward intention]\n"
+        f"collab_id: {coll_id}\n"
+        f"topic: {topic}\n"
+        "authority: steward soft intention; witness context only; not a command\n"
+        f"intention_id: {intention.get('id')}\n"
+        f"text: {text}"
+    )
+
+
+async def refresh_chamber_state(ws, shared_dir: Path, meta: dict) -> bool:
+    coll_id = str(meta.get("id") or "")
+    if not coll_id:
+        return False
+    coll_dir = shared_dir / coll_id
+    chamber_doc = chamber.ensure_chamber(coll_dir, meta)
+    room_handle = collab_handle_name(coll_id)
+    labels = {
+        "astrid": chamber.ASTRID_HANDLE,
+        "minime": chamber.MINIME_HANDLE,
+        "steward": chamber.STEWARD_HANDLE,
+        "chamber": room_handle,
+    }
+    handle_payloads = {
+        label: await read_handle_state(ws, handle)
+        for label, handle in labels.items()
+    }
+    pairs = [
+        (chamber.ASTRID_HANDLE, chamber.MINIME_HANDLE),
+        (chamber.ASTRID_HANDLE, chamber.STEWARD_HANDLE),
+        (chamber.MINIME_HANDLE, chamber.STEWARD_HANDLE),
+    ]
+    resonance_payloads = {
+        pair: await read_pair_resonance(ws, pair[0], pair[1])
+        for pair in pairs
+    }
+    phase, phase_source = chamber.resolve_chamber_phase(coll_dir)
+    active_intention = chamber.active_steward_intention(coll_dir)
+    recent_notes = chamber.recent_steward_notes(coll_dir)
+    resonance_rows = chamber.build_resonance_rows(resonance_payloads)
+    compressed_memory = chamber.build_compressed_memory(
+        coll_dir,
+        meta,
+        phase=phase,
+        phase_source=phase_source,
+        active_intention=active_intention,
+        recent_notes=recent_notes,
+        resonance_rows=resonance_rows,
+    )
+    relational_metrics = chamber.build_relational_metrics(coll_dir, resonance_rows)
+    phase_cartography = chamber.build_phase_cartography(coll_dir, relational_metrics)
+    presence_protocol = chamber.build_presence_protocol(coll_dir)
+    annotation_lane = chamber.build_annotation_lane(coll_dir)
+    state = chamber.build_chamber_state(
+        meta,
+        chamber_doc,
+        handle_payloads,
+        resonance_payloads,
+        recent_notes,
+        active_intention=active_intention,
+        phase=phase,
+        phase_source=phase_source,
+        resonance_rows=resonance_rows,
+        compressed_memory=compressed_memory,
+        relational_metrics=relational_metrics,
+        phase_cartography=phase_cartography,
+        presence_protocol=presence_protocol,
+        annotation_lane=annotation_lane,
+    )
+    chamber.write_chamber_state(coll_dir, state)
+    chamber.write_chamber_memory(coll_dir, state)
+    return True
+
+
+async def process_chamber_notes(
+    ws,
+    shared_dir: Path,
+    meta: dict,
+    known_handles: set[str],
+) -> int:
+    """Initialize the witness chamber, tick new steward records, and refresh
+    the compact state file. Returns reservoir tick count emitted for records."""
+    coll_id = str(meta.get("id") or "")
+    if not coll_id:
+        return 0
+    coll_dir = shared_dir / coll_id
+    paths = chamber.chamber_paths(coll_dir)
+    first_init = not paths["meta"].exists()
+    chamber.ensure_chamber(coll_dir, meta)
+    if first_init:
+        chamber.append_chamber_event(
+            coll_dir,
+            "activated_by_collab_feeder",
+            "collab_feeder",
+            {"mode": chamber.CHAMBER_MODE},
+        )
+
+    room_handle = collab_handle_name(coll_id)
+    for handle, entity in ((room_handle, "collab"), (chamber.STEWARD_HANDLE, "steward")):
+        if handle in known_handles:
+            continue
+        ok = await ensure_handle(ws, handle, entity=entity)
+        if ok:
+            known_handles.add(handle)
+
+    emitted = 0
+    for note in chamber.unprocessed_steward_notes(coll_dir):
+        note_id = str(note.get("id") or "")
+        if not note_id:
+            continue
+        text = steward_note_tick_text(meta, note)
+        steward_ok = await tick_text_handle(ws, chamber.STEWARD_HANDLE, text)
+        room_ok = await tick_text_handle(ws, room_handle, text)
+        if steward_ok and room_ok:
+            emitted += 2
+            chamber.append_chamber_event(
+                coll_dir,
+                "steward_note_processed",
+                "collab_feeder",
+                {
+                    "note_id": note_id,
+                    "handles": [chamber.STEWARD_HANDLE, room_handle],
+                },
+            )
+            # Persist the cursor per-note: if a LATER note's tick raises (WS drop),
+            # the notes already ticked must not re-tick next poll (duplicate witness).
+            chamber.mark_notes_processed(coll_dir, [note_id])
+    processed_intentions: list[str] = []
+    for intention in chamber.unprocessed_steward_intentions(coll_dir):
+        intention_id = str(intention.get("id") or "")
+        if not intention_id:
+            continue
+        text = steward_intention_tick_text(meta, intention)
+        steward_ok = await tick_text_handle(ws, chamber.STEWARD_HANDLE, text)
+        room_ok = await tick_text_handle(ws, room_handle, text)
+        if steward_ok and room_ok:
+            emitted += 2
+            processed_intentions.append(intention_id)
+            chamber.append_chamber_event(
+                coll_dir,
+                "steward_intention_processed",
+                "collab_feeder",
+                {
+                    "intention_id": intention_id,
+                    "handles": [chamber.STEWARD_HANDLE, room_handle],
+                },
+            )
+    if processed_intentions:
+        chamber.mark_intentions_processed(coll_dir, processed_intentions)
+    await refresh_chamber_state(ws, shared_dir, meta)
+    return emitted
 
 
 async def quiet_handle(ws, name: str) -> bool:
@@ -284,6 +488,8 @@ async def quiet_handle(ws, name: str) -> bool:
         )
         r = json.loads(await ws.recv())
         return r.get("type") != "error"
+    except websockets.exceptions.ConnectionClosed:
+        raise
     except Exception as e:
         log.debug("quiet %s failed: %s", name, e)
         return False
@@ -312,24 +518,23 @@ async def one_pass(
         handle = collab_handle_name(coll_id)
         if handle not in known_handles:
             ok = await ensure_handle(ws, handle)
-            if not ok:
-                continue
-            known_handles.add(handle)
+            if ok:
+                known_handles.add(handle)
         blended, blend_meta = blend_features(
             astrid_vec, minime_vec, astrid_age, minime_age
         )
-        if blended is None:
-            continue
-        tick_meta = {
-            "source": "collab_feeder",
-            "collab_id": coll_id,
-            "topic": meta.get("topic", ""),
-            "source_timestamp": round(time.time(), 3),
-            **blend_meta,
-        }
-        ok = await tick_handle(ws, handle, blended, tick_meta)
-        if ok:
-            ticks += 1
+        if blended is not None and handle in known_handles:
+            tick_meta = {
+                "source": "collab_feeder",
+                "collab_id": coll_id,
+                "topic": meta.get("topic", ""),
+                "source_timestamp": round(time.time(), 3),
+                **blend_meta,
+            }
+            ok = await tick_handle(ws, handle, blended, tick_meta)
+            if ok:
+                ticks += 1
+        ticks += await process_chamber_notes(ws, shared_dir, meta, known_handles)
     return ticks
 
 

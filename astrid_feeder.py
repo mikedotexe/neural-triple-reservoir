@@ -52,6 +52,7 @@ log = logging.getLogger("astrid-feeder")
 # Bridge DB lives in the spectral-bridge capsule (renamed from consciousness-bridge).
 DEFAULT_DB = Path("/Users/v/other/astrid/capsules/spectral-bridge/workspace/bridge.db")
 POLL_INTERVAL = 5.0  # seconds between DB polls
+POLL_ERROR_STALL_THRESHOLD = 5  # consecutive poll errors before escalating a STALL warning
 SHADOW_SUFFIX = "__lsm"
 
 # v3.5: minime can publish a reciprocal influence here. Each codec frame
@@ -60,6 +61,19 @@ SHADOW_SUFFIX = "__lsm"
 MINIME_WORKSPACE = Path("/Users/v/other/minime/workspace")
 MINIME_INFLUENCE_PATH = MINIME_WORKSPACE / "astrid_influence_v3.json"
 MINIME_INFLUENCE_CONSUMED_PATH = MINIME_WORKSPACE / "astrid_influence_v3.consumed.json"
+MINIME_INFLUENCE_TERMINAL_EVENTS_PATH = (
+    MINIME_WORKSPACE / "diagnostics" / "astrid_influence_terminal_events.jsonl"
+)
+MINIME_INFLUENCE_QUARANTINE_DIR = (
+    MINIME_WORKSPACE / "diagnostics" / "astrid_influence_quarantine"
+)
+# Wall-clock bounds on a gift's window. The window is also tick-counted
+# (ramp+decay), but codec_impact rows are sparse, so a pure tick window can drag
+# for days — blocking newer gifts and never finalizing. If no codec tick lands at
+# all, close quickly as "expired_unapplied"; if some ticks land, keep the longer
+# absolute cap as a final guard.
+MINIME_GIFT_NO_TICK_MAX_AGE_MS = 5 * 60 * 1000  # 5 minutes
+MINIME_GIFT_MAX_AGE_MS = 30 * 60 * 1000  # 30 minutes
 CONDITIONING_MODES = {"ema_rms", "legacy"}
 REMOTE_MEMORY_POLICIES = {"off", "remote_role_blend"}
 REMOTE_MEMORY_ROLE_BLEND = {
@@ -387,11 +401,30 @@ class MinimeInfluenceState:
         # fresh per-frame jitter spreads the ring (the actual aperture gift).
         # Bounded by `jitter` × the ramp/decay weight.
         self.jitter = max(0.0, min(0.5, float(payload.get("jitter", 0.0))))
+        # Wall-clock anchor for the gift's max-age expiry. minime stamps `issued_t_ms`
+        # (unix ms); load_minime_influence falls back to the file mtime if it is absent.
+        self.issued_t_ms = float(payload.get("issued_t_ms", 0.0))
         self.ramp_remaining = self.duration_ticks
         self.decay_remaining = self.decay_ticks
         self.applied_ticks = 0
 
+    def walltime_expired(self) -> bool:
+        """True once the gift is older than MINIME_GIFT_MAX_AGE_MS — the wall-clock bound
+        that stops a tick-counted window dragging for days on the sparse codec_impact
+        channel. Without an age anchor (no issued_t_ms / mtime) the tick window governs."""
+        if self.issued_t_ms <= 0.0:
+            return False
+        return (time.time() * 1000.0 - self.issued_t_ms) > MINIME_GIFT_MAX_AGE_MS
+
+    def no_tick_expired(self) -> bool:
+        """True when the gift got no codec-impact tick inside the short closure window."""
+        if self.issued_t_ms <= 0.0 or self.applied_ticks > 0:
+            return False
+        return (time.time() * 1000.0 - self.issued_t_ms) > MINIME_GIFT_NO_TICK_MAX_AGE_MS
+
     def is_active(self) -> bool:
+        if self.no_tick_expired() or self.walltime_expired():
+            return False
         return self.ramp_remaining > 0 or self.decay_remaining > 0
 
     def current_weight(self) -> float:
@@ -434,6 +467,190 @@ class MinimeInfluenceState:
         self.applied_ticks += 1
 
 
+def minime_influence_terminal_event(
+    status: str,
+    *,
+    intent_id: str | None,
+    label: str | None = None,
+    issued_t_ms: float | None = None,
+    applied_ticks: int = 0,
+    reason: str,
+    superseded_by_intent_id: str | None = None,
+) -> dict:
+    """Build a durable terminal diagnostic for the minime→Astrid influence loop."""
+    event = {
+        "schema_version": 1,
+        "status": status,
+        "intent_id": intent_id,
+        "label": label,
+        "issued_t_ms": issued_t_ms,
+        "completed_at_unix_ms": int(time.time() * 1000),
+        "applied_ticks": applied_ticks,
+        "reason": reason,
+    }
+    if superseded_by_intent_id:
+        event["superseded_by_intent_id"] = superseded_by_intent_id
+    return event
+
+
+def append_minime_influence_terminal_event(
+    status: str,
+    *,
+    intent_id: str | None,
+    label: str | None = None,
+    issued_t_ms: float | None = None,
+    applied_ticks: int = 0,
+    reason: str,
+    superseded_by_intent_id: str | None = None,
+) -> dict:
+    """Append a durable terminal diagnostic for the minime→Astrid influence loop."""
+    event = minime_influence_terminal_event(
+        status,
+        intent_id=intent_id,
+        label=label,
+        issued_t_ms=issued_t_ms,
+        applied_ticks=applied_ticks,
+        reason=reason,
+        superseded_by_intent_id=superseded_by_intent_id,
+    )
+    append_minime_influence_terminal_event_object(event)
+    return event
+
+
+def append_minime_influence_terminal_event_object(event: dict) -> None:
+    """Append a pre-built terminal diagnostic event."""
+    try:
+        MINIME_INFLUENCE_TERMINAL_EVENTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(MINIME_INFLUENCE_TERMINAL_EVENTS_PATH, "a") as f:
+            f.write(json.dumps(event, sort_keys=True) + "\n")
+    except Exception as e:
+        log.warning("could not append minime influence terminal event: %s", e)
+
+
+def _compact_reason(text: str, limit: int = 260) -> str:
+    compact = " ".join(str(text or "").split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: max(0, limit - 3)].rstrip() + "..."
+
+
+def read_minime_influence_payload() -> tuple[dict | None, str | None, Exception | None]:
+    """Read the active influence file once for this feeder pass."""
+    if not MINIME_INFLUENCE_PATH.exists():
+        return None, None, None
+    try:
+        payload = json.loads(MINIME_INFLUENCE_PATH.read_text())
+        if not isinstance(payload, dict):
+            raise ValueError("influence payload must be a JSON object")
+        return payload, str(payload.get("intent_id", "?")), None
+    except Exception as e:
+        return None, None, e
+
+
+def quarantine_malformed_minime_influence(parse_error: Exception) -> Path | None:
+    """Move malformed active influence bytes out of the live path and log once."""
+    suffix = f"{int(time.time() * 1000)}_{time.time_ns() % 1_000_000}"
+    quarantine_path = (
+        MINIME_INFLUENCE_QUARANTINE_DIR
+        / f"{MINIME_INFLUENCE_PATH.stem}.malformed.{suffix}{MINIME_INFLUENCE_PATH.suffix}"
+    )
+    try:
+        MINIME_INFLUENCE_QUARANTINE_DIR.mkdir(parents=True, exist_ok=True)
+        MINIME_INFLUENCE_PATH.replace(quarantine_path)
+        append_minime_influence_terminal_event(
+            "parse_failed",
+            intent_id=None,
+            reason=_compact_reason(
+                f"malformed active influence quarantined: {parse_error}; "
+                f"quarantine_path={quarantine_path}"
+            ),
+        )
+        log.warning("quarantined malformed minime influence: %s", parse_error)
+        return quarantine_path
+    except Exception as e:
+        append_minime_influence_terminal_event(
+            "parse_failed",
+            intent_id=None,
+            reason=_compact_reason(
+                f"could not quarantine malformed active influence: {parse_error}; "
+                f"quarantine_failed={e}"
+            ),
+        )
+        log.warning("could not quarantine malformed minime influence: %s", e)
+        return None
+
+
+def finalize_minime_influence_file(
+    state: MinimeInfluenceState,
+    status: str,
+    *,
+    reason: str,
+) -> bool:
+    """Move the active influence to consumed with feeder terminal metadata.
+
+    The consumed file is Astrid's closed-loop trigger, so it carries the same
+    terminal event that the append-only diagnostic ledger receives. That keeps
+    future response history honest about planned ticks versus ticks actually
+    applied by the feeder.
+    """
+    try:
+        payload = json.loads(MINIME_INFLUENCE_PATH.read_text())
+    except Exception as e:
+        append_minime_influence_terminal_event(
+            "finalize_failed",
+            intent_id=state.intent_id,
+            label=state.label,
+            issued_t_ms=state.issued_t_ms,
+            applied_ticks=state.applied_ticks,
+            reason=f"could not read influence before finalize: {e}",
+        )
+        log.warning("could not read minime influence before finalize: %s", e)
+        return False
+    if str(payload.get("intent_id", "?")) != state.intent_id:
+        append_minime_influence_terminal_event(
+            "finalize_failed",
+            intent_id=state.intent_id,
+            label=state.label,
+            issued_t_ms=state.issued_t_ms,
+            applied_ticks=state.applied_ticks,
+            reason=(
+                "active influence changed during finalize: "
+                f"file_intent={payload.get('intent_id')}"
+            ),
+        )
+        return False
+    event = minime_influence_terminal_event(
+        status,
+        intent_id=state.intent_id,
+        label=state.label,
+        issued_t_ms=state.issued_t_ms,
+        applied_ticks=state.applied_ticks,
+        reason=reason,
+    )
+    payload["feeder_terminal_v1"] = event
+    tmp_path = MINIME_INFLUENCE_CONSUMED_PATH.with_name(
+        f".{MINIME_INFLUENCE_CONSUMED_PATH.name}.tmp"
+    )
+    try:
+        MINIME_INFLUENCE_CONSUMED_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path.write_text(json.dumps(payload, sort_keys=True))
+        tmp_path.replace(MINIME_INFLUENCE_CONSUMED_PATH)
+        MINIME_INFLUENCE_PATH.unlink(missing_ok=True)
+        append_minime_influence_terminal_event_object(event)
+        return True
+    except Exception as e:
+        append_minime_influence_terminal_event(
+            "finalize_failed",
+            intent_id=state.intent_id,
+            label=state.label,
+            issued_t_ms=state.issued_t_ms,
+            applied_ticks=state.applied_ticks,
+            reason=f"could not finalize consumed influence: {e}",
+        )
+        log.warning("could not finalize consumed influence: %s", e)
+        return False
+
+
 def load_minime_influence(current: "MinimeInfluenceState | None") -> "MinimeInfluenceState | None":
     """Poll the influence file and return either the existing in-flight
     influence (if its window has not expired) or a freshly-parsed new one.
@@ -441,31 +658,107 @@ def load_minime_influence(current: "MinimeInfluenceState | None") -> "MinimeInfl
     When the active influence finishes, renames the file to .consumed.json
     so a duplicate cannot fire.
     """
-    if current is not None and current.is_active():
+    # Read the file once, so malformed payloads produce one bounded diagnostic
+    # and cannot spam parse_failed on the peek + load paths.
+    payload, file_intent, parse_error = read_minime_influence_payload()
+    if parse_error is not None:
+        quarantine_malformed_minime_influence(parse_error)
+        if current is not None and current.is_active():
+            return current
+        return None
+
+    # Keep applying the in-flight gift ONLY while it is active (ticks remaining AND not
+    # wall-clock-expired) AND the file still holds that same gift. A different intent in
+    # the file means minime issued a newer gift → it supersedes this one.
+    if (
+        current is not None
+        and current.is_active()
+        and (file_intent is None or file_intent == current.intent_id)
+    ):
         return current
-    # Either no current or it just finished — finalize and look for a new one.
-    if current is not None and not current.is_active():
-        try:
-            if MINIME_INFLUENCE_PATH.exists():
-                MINIME_INFLUENCE_PATH.replace(MINIME_INFLUENCE_CONSUMED_PATH)
+
+    # The in-flight gift is finished, wall-clock-expired, or superseded — close it out.
+    if current is not None:
+        if file_intent is not None and file_intent == current.intent_id:
+            # The file still holds THIS gift → rename it to consumed. This rename is the
+            # trigger astrid_shadow.rs watches to fire the closed-loop acknowledgment.
+            no_tick_expired = current.no_tick_expired()
+            walltime_expired = current.walltime_expired()
+            terminal_status = "expired_unapplied" if (
+                current.applied_ticks == 0 and (no_tick_expired or walltime_expired)
+            ) else "consumed"
+            reason = "influence_window_consumed"
+            if terminal_status == "expired_unapplied":
+                reason = (
+                    "no_codec_ticks_before_short_deadline"
+                    if no_tick_expired
+                    else "walltime_expired_without_codec_ticks"
+                )
+            if finalize_minime_influence_file(
+                current,
+                terminal_status,
+                reason=reason,
+            ):
                 log.info(
                     "minime influence consumed: intent_id=%s applied_ticks=%d",
                     current.intent_id,
                     current.applied_ticks,
                 )
-        except Exception as e:
-            log.warning("could not finalize consumed influence: %s", e)
+            return None
+        else:
+            # The file is gone, or a NEWER gift superseded this one. Do NOT rename a newer
+            # gift under the old intent (the mis-consume bug): just drop the old in-memory
+            # state and let the new gift load below.
+            append_minime_influence_terminal_event(
+                "superseded",
+                intent_id=current.intent_id,
+                label=current.label,
+                issued_t_ms=current.issued_t_ms,
+                applied_ticks=current.applied_ticks,
+                reason="newer_active_influence_replaced_current",
+                superseded_by_intent_id=file_intent,
+            )
+            log.info(
+                "minime influence ended without re-consume: intent_id=%s applied_ticks=%d file_intent=%s",
+                current.intent_id,
+                current.applied_ticks,
+                file_intent,
+            )
         current = None
-    if not MINIME_INFLUENCE_PATH.exists():
+
+    if payload is None and not MINIME_INFLUENCE_PATH.exists():
         return None
-    try:
-        payload = json.loads(MINIME_INFLUENCE_PATH.read_text())
-    except Exception as e:
-        log.warning("could not parse minime_influence: %s", e)
+    if payload is None:
         return None
     state = MinimeInfluenceState(payload)
+    if state.issued_t_ms <= 0.0:
+        # Older gift with no issued_t_ms stamp — anchor the wall-clock age to the file
+        # mtime so it can still expire instead of dragging forever.
+        try:
+            state.issued_t_ms = MINIME_INFLUENCE_PATH.stat().st_mtime * 1000.0
+        except OSError:
+            pass
     if not state.target_dims:
         log.info("minime influence has no valid target_dims, skipping")
+        return None
+    if not state.is_active():
+        # Already expired on arrival (sat unconsumed, got no ticks inside the
+        # short window, or the feeder was down). Finalize it now so the
+        # closed-loop fires + the file does not linger blocking newer gifts.
+        reason = (
+            "arrived_without_codec_ticks_before_short_deadline"
+            if state.no_tick_expired()
+            else "arrived_already_walltime_expired"
+        )
+        if finalize_minime_influence_file(
+            state,
+            "expired_unapplied",
+            reason=reason,
+        ):
+            log.info(
+                "minime influence arrived already-expired, finalized: intent_id=%s",
+                state.intent_id,
+            )
         return None
     log.info(
         "applying minime influence intent_id=%s label=%s ramp=%d decay=%d dims=%s",
@@ -600,6 +893,7 @@ async def run(db_path: Path, ws_url: str):
 
     log.info("polling %s every %.0fs", db_path, POLL_INTERVAL)
 
+    consecutive_poll_errors = 0  # escalate a STALL warning if a poll error persists
     while not shutdown.is_set():
         try:
             # Reload config periodically (every ~30s at 5s poll = 6 checks)
@@ -725,8 +1019,23 @@ async def run(db_path: Path, ws_url: str):
 
                 last_id = row_id
 
+            # Per-poll wall-clock check: finalize/supersede the in-flight gift even when
+            # no new codec_impact row arrived this poll, so a gift cannot linger past its
+            # wall-clock window (the codec_impact channel is sparse). No frame to apply
+            # here — this advances only the gift lifecycle (expiry → consumed → the
+            # closed-loop fires within ~one poll of expiry).
+            minime_influence = load_minime_influence(minime_influence)
+            consecutive_poll_errors = 0  # full poll succeeded — clear the stall counter
+
         except Exception as e:
-            log.error("poll error: %s", e)
+            consecutive_poll_errors += 1
+            log.error("poll error (%d consecutive): %s", consecutive_poll_errors, e)
+            if consecutive_poll_errors % POLL_ERROR_STALL_THRESHOLD == 0:
+                log.error(
+                    "STALL: %d consecutive poll errors — the feeder is logging but not "
+                    "advancing; Astrid's reservoir lane is falling behind. Investigate.",
+                    consecutive_poll_errors,
+                )
 
         try:
             await asyncio.wait_for(shutdown.wait(), timeout=POLL_INTERVAL)
