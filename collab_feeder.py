@@ -379,6 +379,8 @@ async def refresh_chamber_state(ws, shared_dir: Path, meta: dict) -> bool:
     phase_cartography = chamber.build_phase_cartography(coll_dir, relational_metrics)
     presence_protocol = chamber.build_presence_protocol(coll_dir)
     annotation_lane = chamber.build_annotation_lane(coll_dir)
+    consent_protocol = chamber.build_consent_protocol(coll_dir)
+    active_relational_supports = chamber.build_active_relational_supports(consent_protocol)
     state = chamber.build_chamber_state(
         meta,
         chamber_doc,
@@ -394,6 +396,8 @@ async def refresh_chamber_state(ws, shared_dir: Path, meta: dict) -> bool:
         phase_cartography=phase_cartography,
         presence_protocol=presence_protocol,
         annotation_lane=annotation_lane,
+        consent_protocol=consent_protocol,
+        active_relational_supports=active_relational_supports,
     )
     chamber.write_chamber_state(coll_dir, state)
     chamber.write_chamber_memory(coll_dir, state)

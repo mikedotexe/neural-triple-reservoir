@@ -24,6 +24,7 @@ INERTIA_SCHEMA_VERSION = 1
 CARTOGRAPHY_SCHEMA_VERSION = 1
 PRESENCE_SCHEMA_VERSION = 1
 ANNOTATION_SCHEMA_VERSION = 1
+CONSENT_SCHEMA_VERSION = 1
 CHAMBER_MODE = "witness"
 STEWARD_HANDLE = "steward"
 ASTRID_HANDLE = "astrid"
@@ -38,6 +39,9 @@ NOTE_TEXT_LIMIT = 4_000
 INTENTION_TEXT_LIMIT = 1_000
 PRESENCE_TEXT_LIMIT = 360
 ANNOTATION_TEXT_LIMIT = 800
+PROPOSAL_TEXT_LIMIT = 700
+PROPOSAL_RATIONALE_LIMIT = 700
+CONSENT_NOTE_LIMIT = 500
 PROMPT_NOTE_LIMIT = 240
 PROMPT_SUMMARY_LIMIT = 2_300
 CURSOR_KEEP_LIMIT = 1_000
@@ -60,6 +64,18 @@ ANNOTATION_TARGETS = {
     "presence_protocol",
     "other",
 }
+CONSENT_SUPPORT_TYPES = {
+    "repair_invitation",
+    "reentry_ritual",
+    "softening_prompt",
+    "pause_escalation",
+    "name_disagreement",
+    "handoff_check",
+    "rest_window",
+    "integration_check",
+}
+CONSENT_STANCES = {"consent", "withhold", "revise"}
+CONSENT_THRESHOLD = "astrid_minime_steward"
 ALLOWED_PHASES = {
     "initialized",
     "witness_pending",
@@ -108,6 +124,8 @@ def chamber_paths(coll_dir: Path) -> dict[str, Path]:
         "memory_edits": coll_dir / "chamber_memory_edits.jsonl",
         "presence": coll_dir / "chamber_presence.jsonl",
         "annotations": coll_dir / "chamber_annotations.jsonl",
+        "proposals": coll_dir / "chamber_proposals.jsonl",
+        "consent": coll_dir / "chamber_consent.jsonl",
         "events": coll_dir / "chamber_events.jsonl",
         "resonance_journal": coll_dir / "chamber_resonance.jsonl",
         "state": coll_dir / "chamber_state.json",
@@ -220,7 +238,16 @@ def ensure_chamber(coll_dir: Path, meta: dict[str, Any]) -> dict[str, Any]:
     chamber = chamber_doc_for(meta, existing)
     if existing != chamber:
         atomic_write_json(paths["meta"], chamber)
-    for key in ("notes", "intentions", "memory_edits", "presence", "annotations", "events"):
+    for key in (
+        "notes",
+        "intentions",
+        "memory_edits",
+        "presence",
+        "annotations",
+        "proposals",
+        "consent",
+        "events",
+    ):
         paths[key].touch(exist_ok=True)
     return chamber
 
@@ -385,6 +412,381 @@ def append_chamber_annotation(
         },
     )
     return annotation | {"collab_id": meta["id"]}
+
+
+def clamp_proposal_text(text: str, limit: int = PROPOSAL_TEXT_LIMIT) -> str:
+    clean = " ".join(str(text or "").split())
+    if len(clean) <= limit:
+        return clean
+    return clean[:limit].rstrip() + " [truncated]"
+
+
+def normalize_support_type(support_type: str) -> str:
+    normalized = str(support_type or "").strip().lower()
+    if normalized not in CONSENT_SUPPORT_TYPES:
+        raise ValueError(
+            f"support type must be one of {', '.join(sorted(CONSENT_SUPPORT_TYPES))}"
+        )
+    return normalized
+
+
+def normalize_consent_stance(stance: str) -> str:
+    normalized = str(stance or "").strip().lower()
+    if normalized not in CONSENT_STANCES:
+        raise ValueError(f"consent stance must be one of {', '.join(sorted(CONSENT_STANCES))}")
+    return normalized
+
+
+def normalize_proposal_id(proposal_id: str) -> str:
+    normalized = str(proposal_id or "").strip()
+    allowed = all(ch.isalnum() or ch in {"_", "-"} for ch in normalized)
+    if not normalized or not normalized.startswith("chamber_proposal_") or not allowed:
+        raise ValueError("proposal id must be a chamber_proposal_* id")
+    return normalized
+
+
+def append_chamber_proposal(
+    shared_dir: Path,
+    support_type: str,
+    text: str,
+    *,
+    rationale: str = "",
+    target: str = "latest",
+    source: str = "steward_cli",
+) -> dict[str, Any]:
+    meta = select_collab(shared_dir, target, joined_only=False)
+    coll_dir = shared_dir / str(meta["id"])
+    ensure_chamber(coll_dir, meta)
+    proposal_type = normalize_support_type(support_type)
+    proposal_text = clamp_proposal_text(text)
+    if not proposal_text:
+        raise ValueError("proposal text is empty")
+    rationale_text = clamp_proposal_text(rationale, PROPOSAL_RATIONALE_LIMIT)
+    t_ms = now_ms()
+    proposal = {
+        "schema_version": CHAMBER_SCHEMA_VERSION,
+        "consent_schema_version": CONSENT_SCHEMA_VERSION,
+        "id": record_id("chamber_proposal", t_ms),
+        "t_ms": t_ms,
+        "actor": STEWARD_HANDLE,
+        "source": source,
+        "support_type": proposal_type,
+        "text": proposal_text,
+        "rationale": rationale_text,
+        "witness_only": True,
+        "authority": "support_proposal_not_control",
+    }
+    append_jsonl(chamber_paths(coll_dir)["proposals"], proposal)
+    append_chamber_event(
+        coll_dir,
+        "chamber_proposal_created",
+        STEWARD_HANDLE,
+        {"proposal_id": proposal["id"], "support_type": proposal_type},
+    )
+    return proposal | {"collab_id": meta["id"]}
+
+
+def read_chamber_proposals(coll_dir: Path) -> list[dict[str, Any]]:
+    proposals: list[dict[str, Any]] = []
+    for payload in read_jsonl_dicts(chamber_paths(coll_dir)["proposals"]):
+        try:
+            proposal_id = normalize_proposal_id(str(payload.get("id") or ""))
+            support_type = normalize_support_type(str(payload.get("support_type") or payload.get("type") or ""))
+        except ValueError:
+            continue
+        text = clamp_proposal_text(str(payload.get("text") or ""))
+        if not text:
+            continue
+        proposals.append(
+            payload
+            | {
+                "id": proposal_id,
+                "support_type": support_type,
+                "text": text,
+                "rationale": clamp_proposal_text(
+                    str(payload.get("rationale") or ""),
+                    PROPOSAL_RATIONALE_LIMIT,
+                ),
+                "witness_only": True,
+                "authority": "support_proposal_not_control",
+            }
+        )
+    return proposals
+
+
+def append_consent_receipt(
+    shared_dir: Path,
+    proposal_id: str,
+    actor: str,
+    stance: str,
+    *,
+    note: str = "",
+    target: str = "latest",
+    source: str = "steward_cli",
+) -> dict[str, Any]:
+    meta = select_collab(shared_dir, target, joined_only=False)
+    coll_dir = shared_dir / str(meta["id"])
+    ensure_chamber(coll_dir, meta)
+    normalized_proposal_id = normalize_proposal_id(proposal_id)
+    known_ids = {str(proposal.get("id")) for proposal in read_chamber_proposals(coll_dir)}
+    if normalized_proposal_id not in known_ids:
+        raise ValueError(f"proposal id {normalized_proposal_id!r} was not found")
+    normalized_actor = normalize_participant(actor)
+    normalized_stance = normalize_consent_stance(stance)
+    note_text = clamp_proposal_text(note, CONSENT_NOTE_LIMIT)
+    t_ms = now_ms()
+    receipt = {
+        "schema_version": CHAMBER_SCHEMA_VERSION,
+        "consent_schema_version": CONSENT_SCHEMA_VERSION,
+        "id": record_id("chamber_consent", t_ms),
+        "t_ms": t_ms,
+        "actor": normalized_actor,
+        "source": source,
+        "proposal_id": normalized_proposal_id,
+        "stance": normalized_stance,
+        "note": note_text,
+        "witness_only": True,
+        "authority": "consent_receipt_not_control",
+    }
+    append_jsonl(chamber_paths(coll_dir)["consent"], receipt)
+    append_chamber_event(
+        coll_dir,
+        "chamber_consent_recorded",
+        normalized_actor,
+        {
+            "consent_id": receipt["id"],
+            "proposal_id": normalized_proposal_id,
+            "stance": normalized_stance,
+        },
+    )
+    return receipt | {"collab_id": meta["id"]}
+
+
+def read_chamber_consent(coll_dir: Path) -> list[dict[str, Any]]:
+    receipts: list[dict[str, Any]] = []
+    for payload in read_jsonl_dicts(chamber_paths(coll_dir)["consent"]):
+        try:
+            proposal_id = normalize_proposal_id(str(payload.get("proposal_id") or ""))
+            actor = normalize_participant(str(payload.get("actor") or ""))
+            stance = normalize_consent_stance(str(payload.get("stance") or ""))
+        except ValueError:
+            continue
+        receipts.append(
+            payload
+            | {
+                "proposal_id": proposal_id,
+                "actor": actor,
+                "stance": stance,
+                "note": clamp_proposal_text(str(payload.get("note") or ""), CONSENT_NOTE_LIMIT),
+                "witness_only": True,
+                "authority": "consent_receipt_not_control",
+            }
+        )
+    return receipts
+
+
+def _compact_consent_receipt(row: dict[str, Any], text_limit: int = 180) -> dict[str, Any]:
+    compact = {
+        "id": row.get("id"),
+        "t_ms": row.get("t_ms"),
+        "actor": row.get("actor"),
+        "proposal_id": row.get("proposal_id"),
+        "stance": row.get("stance"),
+        "witness_only": True,
+        "authority": "consent_receipt_not_control",
+    }
+    note = truncate_for_prompt(str(row.get("note") or ""), text_limit)
+    if note:
+        compact["note"] = note
+    return compact
+
+
+def _proposal_status(latest_by_actor: dict[str, dict[str, Any]]) -> str:
+    if all(latest_by_actor.get(actor, {}).get("stance") == "consent" for actor in CHAMBER_MEMBERS):
+        return "active"
+    if any(latest_by_actor.get(actor, {}).get("stance") == "withhold" for actor in CHAMBER_MEMBERS):
+        return "withheld"
+    if any(latest_by_actor.get(actor, {}).get("stance") == "revise" for actor in CHAMBER_MEMBERS):
+        return "revision_requested"
+    return "pending"
+
+
+def _compact_proposal(
+    proposal: dict[str, Any],
+    latest_by_actor: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    latest_by_actor = latest_by_actor or {}
+    consented_actors = [
+        actor
+        for actor in CHAMBER_MEMBERS
+        if latest_by_actor.get(actor, {}).get("stance") == "consent"
+    ]
+    withheld_actors = [
+        actor
+        for actor in CHAMBER_MEMBERS
+        if latest_by_actor.get(actor, {}).get("stance") == "withhold"
+    ]
+    revise_actors = [
+        actor
+        for actor in CHAMBER_MEMBERS
+        if latest_by_actor.get(actor, {}).get("stance") == "revise"
+    ]
+    pending_actors = [actor for actor in CHAMBER_MEMBERS if actor not in latest_by_actor]
+    return {
+        "id": proposal.get("id"),
+        "t_ms": proposal.get("t_ms"),
+        "support_type": proposal.get("support_type"),
+        "text": truncate_for_prompt(str(proposal.get("text") or ""), 260),
+        "rationale": truncate_for_prompt(str(proposal.get("rationale") or ""), 220),
+        "status": _proposal_status(latest_by_actor),
+        "consented_actors": consented_actors,
+        "withheld_actors": withheld_actors,
+        "revise_actors": revise_actors,
+        "pending_actors": pending_actors,
+        "latest_by_actor": {
+            actor: _compact_consent_receipt(row)
+            for actor, row in latest_by_actor.items()
+            if actor in CHAMBER_MEMBERS
+        },
+        "witness_only": True,
+        "authority": "support_proposal_not_control",
+    }
+
+
+def build_proposal_states(coll_dir: Path) -> list[dict[str, Any]]:
+    proposals = read_chamber_proposals(coll_dir)
+    proposal_ids = {str(proposal.get("id")) for proposal in proposals}
+    receipts = [
+        receipt
+        for receipt in read_chamber_consent(coll_dir)
+        if str(receipt.get("proposal_id") or "") in proposal_ids
+    ]
+    latest_by_proposal: dict[str, dict[str, dict[str, Any]]] = {
+        str(proposal.get("id")): {} for proposal in proposals
+    }
+    for receipt in receipts:
+        proposal_id = str(receipt.get("proposal_id") or "")
+        actor = str(receipt.get("actor") or "")
+        if proposal_id in latest_by_proposal and actor in CHAMBER_MEMBERS:
+            latest_by_proposal[proposal_id][actor] = receipt
+    proposal_states = [
+        _compact_proposal(proposal, latest_by_proposal.get(str(proposal.get("id")), {}))
+        for proposal in proposals
+    ]
+    return proposal_states
+
+
+def build_consent_protocol(coll_dir: Path) -> dict[str, Any]:
+    proposal_states = build_proposal_states(coll_dir)
+    proposals_total = len(read_chamber_proposals(coll_dir))
+    proposal_ids = {str(proposal.get("id")) for proposal in read_chamber_proposals(coll_dir)}
+    receipts_total = len(
+        [
+            receipt
+            for receipt in read_chamber_consent(coll_dir)
+            if str(receipt.get("proposal_id") or "") in proposal_ids
+        ]
+    )
+    latest_receipts = [
+        receipt
+        for receipt in read_chamber_consent(coll_dir)
+        if str(receipt.get("proposal_id") or "") in proposal_ids
+    ]
+    active_supports = [
+        proposal for proposal in proposal_states if proposal.get("status") == "active"
+    ]
+    pending_proposals = [
+        proposal
+        for proposal in proposal_states
+        if proposal.get("status") in {"pending", "revision_requested"}
+    ]
+    latest_receipt = _compact_consent_receipt(latest_receipts[-1]) if latest_receipts else None
+    return {
+        "consent_schema_version": CONSENT_SCHEMA_VERSION,
+        "participants": CHAMBER_MEMBERS,
+        "activation_threshold": CONSENT_THRESHOLD,
+        "required_latest_stance": "consent",
+        "proposals_total": proposals_total,
+        "receipts_total": receipts_total,
+        "active_supports_count": len(active_supports),
+        "pending_proposals_count": len(pending_proposals),
+        "active_supports": active_supports[-5:],
+        "recent_proposals": proposal_states[-6:],
+        "latest_receipt": latest_receipt,
+        "witness_only": True,
+        "authority": "consent_state_context_not_control",
+    }
+
+
+def build_active_relational_supports(consent_protocol: dict[str, Any]) -> dict[str, Any]:
+    supports = (
+        consent_protocol.get("active_supports")
+        if isinstance(consent_protocol.get("active_supports"), list)
+        else []
+    )
+    compact = []
+    for support in supports:
+        if not isinstance(support, dict):
+            continue
+        compact.append(
+            {
+                "id": support.get("id"),
+                "support_type": support.get("support_type"),
+                "text": truncate_for_prompt(str(support.get("text") or ""), 220),
+                "consented_actors": support.get("consented_actors") or [],
+                "witness_only": True,
+                "authority": "active_support_context_not_control",
+            }
+        )
+    return {
+        "consent_schema_version": CONSENT_SCHEMA_VERSION,
+        "activation_threshold": CONSENT_THRESHOLD,
+        "count": len(compact),
+        "supports": compact,
+        "witness_only": True,
+        "authority": "active_supports_context_not_control",
+    }
+
+
+def render_consent_prompt_line(
+    consent_protocol: dict[str, Any],
+    active_relational_supports: dict[str, Any] | None = None,
+) -> str:
+    if not isinstance(consent_protocol, dict):
+        return ""
+    pending = int(consent_protocol.get("pending_proposals_count") or 0)
+    active_count = int(consent_protocol.get("active_supports_count") or 0)
+    parts = [
+        "Consent protocol: "
+        f"{pending} pending proposal(s), {active_count} active support(s); "
+        "activation requires Astrid, Minime, and steward consent; "
+        "consent state is context only, not command or control."
+    ]
+    supports = []
+    if isinstance(active_relational_supports, dict):
+        supports = active_relational_supports.get("supports") or []
+    if not supports:
+        supports = consent_protocol.get("active_supports") or []
+    if isinstance(supports, list) and supports:
+        support = supports[-1] if isinstance(supports[-1], dict) else {}
+        if support:
+            parts.append(
+                "Active consented support: "
+                f"{support.get('support_type', 'unknown')}; "
+                "interpretive context, not command or control."
+            )
+    else:
+        recent = consent_protocol.get("recent_proposals")
+        if isinstance(recent, list) and recent:
+            proposal = recent[-1] if isinstance(recent[-1], dict) else {}
+            if proposal:
+                parts.append(
+                    "Latest support proposal: "
+                    f"{proposal.get('support_type', 'unknown')} "
+                    f"status={proposal.get('status', 'pending')}; "
+                    "await explicit consent receipts, not behavior control."
+                )
+    return bounded_join(parts, 520)
 
 
 def append_steward_note(
@@ -2456,9 +2858,11 @@ def render_prompt_summary(
     phase_cartography: dict[str, Any] | None = None,
     presence_protocol: dict[str, Any] | None = None,
     annotation_lane: dict[str, Any] | None = None,
+    consent_protocol: dict[str, Any] | None = None,
+    active_relational_supports: dict[str, Any] | None = None,
 ) -> str:
     parts = [
-        "Triadic chamber witness: steward notes, intentions, memory edits, presence receipts, and annotations are shared context, not commands.",
+        "Triadic chamber witness: steward notes, intentions, memory edits, presence receipts, annotations, proposals, and consent receipts are shared context, not commands.",
         f"Phase {phase} ({phase_source}).",
         f"Room {chamber_doc.get('collab_id')} topic \"{chamber_doc.get('topic', '')}\".",
     ]
@@ -2466,6 +2870,10 @@ def render_prompt_summary(
         presence_line = render_presence_prompt_line(presence_protocol)
         if presence_line:
             parts.append(presence_line)
+    if isinstance(consent_protocol, dict):
+        consent_line = render_consent_prompt_line(consent_protocol, active_relational_supports)
+        if consent_line:
+            parts.append(consent_line)
     if active_intention:
         parts.append(
             "Active steward intention: "
@@ -2552,6 +2960,8 @@ def build_chamber_state(
     phase_cartography: dict[str, Any] | None = None,
     presence_protocol: dict[str, Any] | None = None,
     annotation_lane: dict[str, Any] | None = None,
+    consent_protocol: dict[str, Any] | None = None,
+    active_relational_supports: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if resonance_rows is None:
         resonance_rows = build_resonance_rows(resonance_payloads)
@@ -2588,6 +2998,8 @@ def build_chamber_state(
         "phase_cartography": phase_cartography,
         "presence_protocol": presence_protocol,
         "annotation_lane": annotation_lane,
+        "consent_protocol": consent_protocol,
+        "active_relational_supports": active_relational_supports,
     }
     state["prompt_summary"] = render_prompt_summary(
         chamber_doc,
@@ -2601,6 +3013,8 @@ def build_chamber_state(
         phase_cartography=phase_cartography,
         presence_protocol=presence_protocol,
         annotation_lane=annotation_lane,
+        consent_protocol=consent_protocol,
+        active_relational_supports=active_relational_supports,
     )
     return state
 
@@ -2698,6 +3112,12 @@ def build_chamber_memory(coll_dir: Path, state: dict[str, Any]) -> dict[str, Any
     annotation_lane = state.get("annotation_lane")
     if not isinstance(annotation_lane, dict):
         annotation_lane = build_annotation_lane(coll_dir)
+    consent_protocol = state.get("consent_protocol")
+    if not isinstance(consent_protocol, dict):
+        consent_protocol = build_consent_protocol(coll_dir)
+    active_relational_supports = state.get("active_relational_supports")
+    if not isinstance(active_relational_supports, dict):
+        active_relational_supports = build_active_relational_supports(consent_protocol)
     collab_id = str(state.get("collab_id") or coll_dir.name)
     topic = str(state.get("topic") or "")
     intention_clause = ""
@@ -2712,7 +3132,7 @@ def build_chamber_memory(coll_dir: Path, state: dict[str, Any]) -> dict[str, Any
         "Treat steward notes as witness context, not commands. "
         "Read chamber_state.json for the live snapshot and chamber_events.jsonl "
         "for append-only history before changing the room. "
-        "Use presence receipts and annotations as public uptake signals only."
+        "Use presence receipts, annotations, proposals, and consent receipts as public uptake signals only."
     )
     memory = {
         "schema_version": CHAMBER_SCHEMA_VERSION,
@@ -2729,6 +3149,9 @@ def build_chamber_memory(coll_dir: Path, state: dict[str, Any]) -> dict[str, Any
             "active_steward_intention": active_intention is not None,
             "presence_receipts": int(presence_protocol.get("receipts_total") or 0),
             "chamber_annotations": int(annotation_lane.get("annotations_total") or 0),
+            "support_proposals": int(consent_protocol.get("proposals_total") or 0),
+            "consent_receipts": int(consent_protocol.get("receipts_total") or 0),
+            "active_relational_supports": int(active_relational_supports.get("count") or 0),
             "events": len(events),
             "event_types": event_counts,
         },
@@ -2738,6 +3161,8 @@ def build_chamber_memory(coll_dir: Path, state: dict[str, Any]) -> dict[str, Any
         "phase_cartography": phase_cartography,
         "presence_protocol": presence_protocol,
         "annotation_lane": annotation_lane,
+        "consent_protocol": consent_protocol,
+        "active_relational_supports": active_relational_supports,
         "recent_presence_receipts": presence_protocol.get("recent_receipts", []),
         "recent_chamber_annotations": annotation_lane.get("recent_annotations", []),
         "recent_steward_notes": [
@@ -2768,16 +3193,19 @@ def build_chamber_memory(coll_dir: Path, state: dict[str, Any]) -> dict[str, Any
             "Astrid, Minime, and steward are the chamber members.",
             "The shared chamber handle is the active collab_<id> reservoir handle.",
             "The steward lane is witness-level context unless a later bounded-influence phase changes it.",
+            "Relational supports activate only when Astrid, Minime, and steward all consent.",
         ],
         "boundaries": [
-            "Steward notes, intentions, presence receipts, and annotations are context, not commands.",
+            "Steward notes, intentions, presence receipts, annotations, proposals, and consent receipts are context, not commands.",
             "Phase labels orient re-entry; they do not control runtime behavior.",
             "Presence receipts and annotations are public uptake context, not commands.",
+            "Consented supports are relational context only; they do not control runtime behavior.",
             "Keep Minime on Ollama; do not borrow Astrid's 8090 lane.",
         ],
         "next_checks": [
             "Read chamber_state.json for live resonance before acting.",
             "Check presence receipts before claiming Astrid or Minime explicitly noticed the chamber.",
+            "Check consent_protocol before claiming a support has triadic consent.",
             "Append steward notes and intentions only as witness context.",
             "Keep Minime on Ollama; do not borrow Astrid's 8090 lane.",
         ],
@@ -2923,6 +3351,29 @@ def render_reentry_markdown(memory: dict[str, Any]) -> str:
         if annotation_lines
         else "- no chamber annotations yet"
     )
+    consent = memory.get("consent_protocol")
+    active_supports = memory.get("active_relational_supports")
+    consent_lines = []
+    if isinstance(consent, dict):
+        consent_line = render_consent_prompt_line(
+            consent,
+            active_supports if isinstance(active_supports, dict) else None,
+        )
+        if consent_line:
+            consent_lines.append("- " + consent_line)
+        for row in consent.get("recent_proposals") or []:
+            if not isinstance(row, dict):
+                continue
+            consent_lines.append(
+                "- "
+                f"{row.get('status', 'pending')} {row.get('support_type', 'unknown')} "
+                f"{row.get('id')}: {row.get('text', '')}"
+            )
+    consent_section = (
+        "\n".join(consent_lines)
+        if consent_lines
+        else "- no support proposals or consent receipts yet"
+    )
     return (
         f"# Triadic Chamber Re-entry: {memory.get('collab_id')}\n\n"
         f"Phase: `{memory.get('phase')}` ({memory.get('phase_source', 'inferred')})\n\n"
@@ -2940,6 +3391,8 @@ def render_reentry_markdown(memory: dict[str, Any]) -> str:
         f"{presence_section}\n\n"
         "## Annotation Lane\n\n"
         f"{annotation_section}\n\n"
+        "## Consent Protocol\n\n"
+        f"{consent_section}\n\n"
         "## Boundaries\n\n"
         + "\n".join(f"- {item}" for item in memory.get("boundaries") or [])
         + "\n\n"
@@ -2993,6 +3446,8 @@ def refresh_chamber_files_from_disk(coll_dir: Path, meta: dict[str, Any]) -> dic
     phase_cartography = build_phase_cartography(coll_dir, relational_metrics)
     presence_protocol = build_presence_protocol(coll_dir)
     annotation_lane = build_annotation_lane(coll_dir)
+    consent_protocol = build_consent_protocol(coll_dir)
+    active_relational_supports = build_active_relational_supports(consent_protocol)
     state = existing | {
         "schema_version": CHAMBER_SCHEMA_VERSION,
         "mode": CHAMBER_MODE,
@@ -3020,6 +3475,8 @@ def refresh_chamber_files_from_disk(coll_dir: Path, meta: dict[str, Any]) -> dic
         "phase_cartography": phase_cartography,
         "presence_protocol": presence_protocol,
         "annotation_lane": annotation_lane,
+        "consent_protocol": consent_protocol,
+        "active_relational_supports": active_relational_supports,
     }
     state["prompt_summary"] = render_prompt_summary(
         chamber_doc,
@@ -3033,6 +3490,8 @@ def refresh_chamber_files_from_disk(coll_dir: Path, meta: dict[str, Any]) -> dic
         phase_cartography=phase_cartography,
         presence_protocol=presence_protocol,
         annotation_lane=annotation_lane,
+        consent_protocol=consent_protocol,
+        active_relational_supports=active_relational_supports,
     )
     write_chamber_state(coll_dir, state)
     write_chamber_memory(coll_dir, state)
@@ -3126,6 +3585,15 @@ def render_status(shared_dir: Path, target: str = "latest") -> str:
             annotation_line = render_annotation_prompt_line(annotation)
             if annotation_line:
                 lines.append(annotation_line)
+        consent = memory.get("consent_protocol")
+        if isinstance(consent, dict):
+            active_supports = memory.get("active_relational_supports")
+            lines.append(
+                render_consent_prompt_line(
+                    consent,
+                    active_supports if isinstance(active_supports, dict) else None,
+                )
+            )
     if not memory:
         relational = state.get("relational_metrics")
         if isinstance(relational, dict):
@@ -3170,6 +3638,15 @@ def render_status(shared_dir: Path, target: str = "latest") -> str:
             annotation_line = render_annotation_prompt_line(annotation)
             if annotation_line:
                 lines.append(annotation_line)
+        consent = state.get("consent_protocol")
+        if isinstance(consent, dict):
+            active_supports = state.get("active_relational_supports")
+            lines.append(
+                render_consent_prompt_line(
+                    consent,
+                    active_supports if isinstance(active_supports, dict) else None,
+                )
+            )
     if notes:
         lines.append("recent steward notes:")
         for note in notes:
@@ -3394,6 +3871,89 @@ def render_annotations(shared_dir: Path, target: str = "latest", limit: int = 12
     return "\n".join(lines)
 
 
+def render_proposals(shared_dir: Path, target: str = "latest", limit: int = 12) -> str:
+    meta = select_collab(shared_dir, target, joined_only=False)
+    coll_dir = shared_dir / str(meta["id"])
+    protocol = build_consent_protocol(coll_dir)
+    proposals = build_proposal_states(coll_dir)
+    if not isinstance(proposals, list):
+        proposals = []
+    tail = proposals[-limit:] if len(proposals) > limit else proposals
+    lines = [f"Triadic support proposals: {meta['id']}"]
+    lines.append(render_consent_prompt_line(protocol))
+    if tail:
+        lines.append("proposals:")
+        for row in tail:
+            if not isinstance(row, dict):
+                continue
+            lines.append(
+                "- "
+                f"{row.get('t_ms')} {row.get('status', 'pending')} "
+                f"{row.get('support_type', 'unknown')} {row.get('id')}: "
+                f"{truncate_for_prompt(str(row.get('text') or ''), 180)}"
+            )
+    else:
+        lines.append("proposals: none yet")
+    lines.append("boundary: proposals are relational context, not commands or control")
+    return "\n".join(lines)
+
+
+def render_proposal_status(
+    shared_dir: Path,
+    target: str = "latest",
+    proposal_id: str | None = None,
+) -> str:
+    meta = select_collab(shared_dir, target, joined_only=False)
+    coll_dir = shared_dir / str(meta["id"])
+    proposals = build_proposal_states(coll_dir)
+    if not isinstance(proposals, list):
+        proposals = []
+    selected: dict[str, Any] | None = None
+    if proposal_id:
+        normalized = normalize_proposal_id(proposal_id)
+        for row in proposals:
+            if isinstance(row, dict) and row.get("id") == normalized:
+                selected = row
+                break
+        if selected is None:
+            return f"(proposal {normalized} not found in {meta['id']})"
+    elif proposals:
+        selected = proposals[-1] if isinstance(proposals[-1], dict) else None
+    if selected is None:
+        return "(no support proposals yet)"
+    lines = [
+        f"Triadic proposal status: {meta['id']}",
+        f"id: {selected.get('id')}",
+        f"type: {selected.get('support_type')}",
+        f"status: {selected.get('status')}",
+        f"text: {selected.get('text')}",
+    ]
+    if selected.get("rationale"):
+        lines.append(f"rationale: {selected.get('rationale')}")
+    lines.append(
+        "actors: "
+        f"consent={','.join(selected.get('consented_actors') or []) or 'none'} "
+        f"withhold={','.join(selected.get('withheld_actors') or []) or 'none'} "
+        f"revise={','.join(selected.get('revise_actors') or []) or 'none'} "
+        f"pending={','.join(selected.get('pending_actors') or []) or 'none'}"
+    )
+    latest = selected.get("latest_by_actor")
+    if isinstance(latest, dict) and latest:
+        lines.append("latest receipts:")
+        for actor in CHAMBER_MEMBERS:
+            row = latest.get(actor)
+            if not isinstance(row, dict):
+                continue
+            note = row.get("note")
+            lines.append(
+                "- "
+                f"{actor}: {row.get('stance')} {row.get('id')}"
+                + (f" note={note}" if note else "")
+            )
+    lines.append("boundary: active support is context only, not command or control")
+    return "\n".join(lines)
+
+
 def render_weather(shared_dir: Path, target: str = "latest", limit: int = 12) -> str:
     meta = select_collab(shared_dir, target, joined_only=False)
     coll_dir = shared_dir / str(meta["id"])
@@ -3507,6 +4067,27 @@ def render_history(shared_dir: Path, target: str = "latest", limit: int = 20) ->
                 f"{compact.get('target')}: {compact.get('text')}"
             ),
         ))
+    for proposal in build_proposal_states(coll_dir):
+        rows.append((
+            int(proposal.get("t_ms") or 0),
+            "proposal",
+            (
+                f"{proposal.get('status', 'pending')} "
+                f"{proposal.get('support_type', 'unknown')} "
+                f"{proposal.get('id')}: {truncate_for_prompt(str(proposal.get('text') or ''), 140)}"
+            ),
+        ))
+    for receipt in read_chamber_consent(coll_dir):
+        compact = _compact_consent_receipt(receipt, 140)
+        rows.append((
+            int(receipt.get("t_ms") or 0),
+            "consent",
+            (
+                f"{compact.get('actor')} {compact.get('stance')} "
+                f"{compact.get('proposal_id')}"
+                + (f": {compact.get('note')}" if compact.get("note") else "")
+            ),
+        ))
     for event in read_chamber_events(coll_dir):
         rows.append((
             int(event.get("t_ms") or 0),
@@ -3583,6 +4164,23 @@ def main() -> int:
     annotation_add.add_argument("text", nargs="+")
     annotation_list = annotation_sub.add_parser("list", help="list chamber annotations")
     annotation_list.add_argument("--limit", type=int, default=12)
+    proposal_parser = sub.add_parser("proposal", help="create or inspect support proposals")
+    proposal_sub = proposal_parser.add_subparsers(dest="proposal_command", required=True)
+    proposal_create = proposal_sub.add_parser("create", help="create a witness-only support proposal")
+    proposal_create.add_argument("support_type", choices=sorted(CONSENT_SUPPORT_TYPES))
+    proposal_create.add_argument("text", nargs="+")
+    proposal_create.add_argument("--rationale", default="")
+    proposal_list = proposal_sub.add_parser("list", help="list support proposals")
+    proposal_list.add_argument("--limit", type=int, default=12)
+    proposal_status = proposal_sub.add_parser("status", help="show proposal consent status")
+    proposal_status.add_argument("proposal_id", nargs="?")
+    consent_parser = sub.add_parser("consent", help="record explicit chamber consent receipts")
+    consent_sub = consent_parser.add_subparsers(dest="consent_command", required=True)
+    consent_record = consent_sub.add_parser("record", help="record a public consent receipt")
+    consent_record.add_argument("proposal_id")
+    consent_record.add_argument("actor", choices=CHAMBER_MEMBERS)
+    consent_record.add_argument("stance", choices=sorted(CONSENT_STANCES))
+    consent_record.add_argument("--note", default="")
     note_parser = sub.add_parser("note", help="append a steward witness note")
     note_parser.add_argument("text", nargs="+")
     intent_parser = sub.add_parser("intent", help="set or clear the steward intention")
@@ -3663,6 +4261,39 @@ def main() -> int:
             return 0
         if args.annotation_command == "list":
             print(render_annotations(args.shared_dir, args.target, args.limit))
+            return 0
+    if args.command == "proposal":
+        if args.proposal_command == "create":
+            proposal = append_chamber_proposal(
+                args.shared_dir,
+                args.support_type,
+                " ".join(args.text),
+                rationale=args.rationale,
+                target=args.target,
+            )
+            meta = select_collab(args.shared_dir, args.target)
+            refresh_chamber_files_from_disk(args.shared_dir / str(meta["id"]), meta)
+            print(f"created {proposal['id']} for {proposal['collab_id']}")
+            return 0
+        if args.proposal_command == "list":
+            print(render_proposals(args.shared_dir, args.target, args.limit))
+            return 0
+        if args.proposal_command == "status":
+            print(render_proposal_status(args.shared_dir, args.target, args.proposal_id))
+            return 0
+    if args.command == "consent":
+        if args.consent_command == "record":
+            receipt = append_consent_receipt(
+                args.shared_dir,
+                args.proposal_id,
+                args.actor,
+                args.stance,
+                note=args.note,
+                target=args.target,
+            )
+            meta = select_collab(args.shared_dir, args.target)
+            refresh_chamber_files_from_disk(args.shared_dir / str(meta["id"]), meta)
+            print(f"recorded {receipt['id']} for {receipt['proposal_id']}")
             return 0
     if args.command == "note":
         note = append_steward_note(args.shared_dir, " ".join(args.text), target=args.target)

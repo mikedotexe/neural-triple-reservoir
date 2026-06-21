@@ -170,6 +170,8 @@ class TriadicChamberFileTests(unittest.TestCase):
             self.assertTrue(paths["memory_edits"].is_file())
             self.assertTrue(paths["presence"].is_file())
             self.assertTrue(paths["annotations"].is_file())
+            self.assertTrue(paths["proposals"].is_file())
+            self.assertTrue(paths["consent"].is_file())
             self.assertTrue(paths["events"].is_file())
             self.assertIn("activated", paths["events"].read_text())
 
@@ -322,6 +324,154 @@ class TriadicChamberFileTests(unittest.TestCase):
             history = chamber.render_history(shared, meta["id"], limit=20)
             self.assertIn("presence:", history)
             self.assertIn("annotation:", history)
+
+    def test_proposals_and_consent_activate_only_with_triadic_receipts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shared = Path(tmp)
+            meta = write_collab(shared)
+            coll_dir = shared / meta["id"]
+            chamber.activate(shared, meta["id"])
+
+            proposal = chamber.append_chamber_proposal(
+                shared,
+                "repair_invitation",
+                "Invite a repair-oriented re-entry before hardening interpretations.",
+                rationale="The room weather has been mixed.",
+                target=meta["id"],
+            )
+            self.assertIn("chamber_proposal_", proposal["id"])
+            with self.assertRaises(ValueError):
+                chamber.append_consent_receipt(
+                    shared,
+                    "chamber_proposal_missing",
+                    "astrid",
+                    "consent",
+                    target=meta["id"],
+                )
+            chamber.append_consent_receipt(
+                shared,
+                proposal["id"],
+                "astrid",
+                "consent",
+                note="I can hold this as context.",
+                target=meta["id"],
+            )
+            chamber.append_consent_receipt(
+                shared,
+                proposal["id"],
+                "minime",
+                "consent",
+                target=meta["id"],
+            )
+
+            pending = chamber.build_consent_protocol(coll_dir)
+            self.assertEqual(pending["active_supports_count"], 0)
+            self.assertEqual(pending["pending_proposals_count"], 1)
+            chamber.append_consent_receipt(
+                shared,
+                proposal["id"],
+                "steward",
+                "consent",
+                target=meta["id"],
+            )
+            active = chamber.build_consent_protocol(coll_dir)
+            active_supports = chamber.build_active_relational_supports(active)
+
+            self.assertEqual(active["active_supports_count"], 1)
+            self.assertEqual(active_supports["count"], 1)
+            self.assertEqual(active["active_supports"][0]["support_type"], "repair_invitation")
+            chamber.append_consent_receipt(
+                shared,
+                proposal["id"],
+                "minime",
+                "revise",
+                note="Needs softer wording.",
+                target=meta["id"],
+            )
+            revised = chamber.build_consent_protocol(coll_dir)
+            self.assertEqual(revised["active_supports_count"], 0)
+            self.assertEqual(revised["recent_proposals"][-1]["status"], "revision_requested")
+
+    def test_consent_state_renders_into_state_memory_reentry_and_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shared = Path(tmp)
+            meta = write_collab(shared)
+            coll_dir = shared / meta["id"]
+            chamber.activate(shared, meta["id"])
+            proposal = chamber.append_chamber_proposal(
+                shared,
+                "integration_check",
+                "Name what each participant is carrying before the next move.",
+                target=meta["id"],
+            )
+            for actor in ("astrid", "minime", "steward"):
+                chamber.append_consent_receipt(
+                    shared,
+                    proposal["id"],
+                    actor,
+                    "consent",
+                    target=meta["id"],
+                )
+
+            state = chamber.refresh_chamber_files_from_disk(coll_dir, meta)
+            memory = json.loads((coll_dir / "chamber_memory.json").read_text())
+            reentry = (coll_dir / "chamber_reentry.md").read_text()
+            history = chamber.render_history(shared, meta["id"], limit=20)
+
+            self.assertIn("consent_protocol", state)
+            self.assertIn("active_relational_supports", state)
+            self.assertIn("Consent protocol", state["prompt_summary"])
+            self.assertIn("not command or control", state["prompt_summary"])
+            self.assertEqual(state["active_relational_supports"]["count"], 1)
+            self.assertEqual(memory["counts"]["active_relational_supports"], 1)
+            self.assertIn("Consent Protocol", reentry)
+            self.assertIn("proposal:", history)
+            self.assertIn("consent:", history)
+
+    def test_proposal_and_consent_validation_and_bounds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shared = Path(tmp)
+            meta = write_collab(shared)
+            chamber.activate(shared, meta["id"])
+
+            with self.assertRaises(ValueError):
+                chamber.append_chamber_proposal(shared, "command_mode", "text", target=meta["id"])
+            with self.assertRaises(ValueError):
+                chamber.append_chamber_proposal(shared, "rest_window", "   ", target=meta["id"])
+            proposal = chamber.append_chamber_proposal(
+                shared,
+                "rest_window",
+                "x" * (chamber.PROPOSAL_TEXT_LIMIT + 100),
+                rationale="r" * (chamber.PROPOSAL_RATIONALE_LIMIT + 100),
+                target=meta["id"],
+            )
+            self.assertIn("[truncated]", proposal["text"])
+            self.assertIn("[truncated]", proposal["rationale"])
+            with self.assertRaises(ValueError):
+                chamber.append_consent_receipt(
+                    shared,
+                    proposal["id"],
+                    "astrid",
+                    "execute",
+                    target=meta["id"],
+                )
+            with self.assertRaises(ValueError):
+                chamber.append_consent_receipt(
+                    shared,
+                    proposal["id"],
+                    "ghost",
+                    "consent",
+                    target=meta["id"],
+                )
+            receipt = chamber.append_consent_receipt(
+                shared,
+                proposal["id"],
+                "astrid",
+                "withhold",
+                note="n" * (chamber.CONSENT_NOTE_LIMIT + 100),
+                target=meta["id"],
+            )
+            self.assertIn("[truncated]", receipt["note"])
 
     def test_presence_and_annotation_reject_invalid_inputs(self):
         with tempfile.TemporaryDirectory() as tmp:
