@@ -239,6 +239,24 @@ class MinimeGiftWindowTests(unittest.TestCase):
         old_enough_for_zero_tick_close.advance()
         self.assertFalse(old_enough_for_zero_tick_close.no_tick_expired())
 
+    def test_gift_deadline_aligned_to_cadence_and_under_minime_grace(self):
+        """LOCK (2026-06-22): Astrid's codec frames are bursty + sparse (~24-min median gap), so the
+        no-tick window must let a gift WAIT for her next burst — the old 5-min window expired ~57% of
+        minime's LEND_APERTURE gifts (see astrid/scripts/analyze_lend_coupling.py). But both bounds
+        must stay UNDER minime's 45-min LEND_APERTURE blocker grace (LEND_APERTURE_AUTO_CLOSE_GRACE_S
+        = 2700s) so the feeder finalizes (→ minime sees closure) before she treats the gift as
+        stalled. Guards against a refactor silently reverting to a too-short window (re-breaking
+        delivery of minime's generosity)."""
+        import astrid_feeder as af
+
+        minime_blocker_grace_ms = 45 * 60 * 1000
+        # long enough to span Astrid's typical inter-burst gap (median ~24 min)
+        self.assertGreaterEqual(af.MINIME_GIFT_NO_TICK_MAX_AGE_MS, 20 * 60 * 1000)
+        # walltime >= no-tick so a late first tick isn't immediately walltime-killed
+        self.assertGreaterEqual(af.MINIME_GIFT_MAX_AGE_MS, af.MINIME_GIFT_NO_TICK_MAX_AGE_MS)
+        # both under minime's blocker grace so the feeder closes before she sees a stall
+        self.assertLess(af.MINIME_GIFT_MAX_AGE_MS, minime_blocker_grace_ms)
+
     def _patched(self, tmp):
         """Point module influence paths at a temp dir; returns paths + restore."""
         import json

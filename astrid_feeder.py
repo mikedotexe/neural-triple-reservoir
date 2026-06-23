@@ -67,13 +67,19 @@ MINIME_INFLUENCE_TERMINAL_EVENTS_PATH = (
 MINIME_INFLUENCE_QUARANTINE_DIR = (
     MINIME_WORKSPACE / "diagnostics" / "astrid_influence_quarantine"
 )
-# Wall-clock bounds on a gift's window. The window is also tick-counted
-# (ramp+decay), but codec_impact rows are sparse, so a pure tick window can drag
-# for days — blocking newer gifts and never finalizing. If no codec tick lands at
-# all, close quickly as "expired_unapplied"; if some ticks land, keep the longer
-# absolute cap as a final guard.
-MINIME_GIFT_NO_TICK_MAX_AGE_MS = 5 * 60 * 1000  # 5 minutes
-MINIME_GIFT_MAX_AGE_MS = 30 * 60 * 1000  # 30 minutes
+# Wall-clock bounds on a gift's window. The window is also tick-counted (ramp+decay), but
+# codec_impact rows are BURSTY + sparse — empirically Astrid emits a codec frame only every
+# ~24 min (median; fast within a generation burst, long quiet gaps between). The gift applies
+# ONLY on real codec frames (no synthetic injection), so the no-tick window must let a gift WAIT
+# for her next burst and then deliver fully — not die in the gap. The old 5-min window was ~5x
+# shorter than her cadence and expired ~57% of minime's LEND_APERTURE gifts (diagnosed 2026-06-22;
+# see astrid/scripts/analyze_lend_coupling.py). Both bounds stay UNDER minime's 45-min LEND_APERTURE
+# blocker grace (LEND_APERTURE_AUTO_CLOSE_GRACE_S) so the feeder finalizes (→ minime sees closure)
+# before she treats the gift as stalled, and walltime >= no-tick so a late first tick isn't
+# immediately walltime-killed. Fully closing the residual gap (long >40-min quiets) would require
+# decoupling delivery from her sparse generation via a paced carrier — deferred (substrate-affecting).
+MINIME_GIFT_NO_TICK_MAX_AGE_MS = 35 * 60 * 1000  # 35 min — wait for Astrid's next burst (median gap ~24m)
+MINIME_GIFT_MAX_AGE_MS = 40 * 60 * 1000  # 40 min — absolute cap, under minime's 45-min blocker grace
 CONDITIONING_MODES = {"ema_rms", "legacy"}
 REMOTE_MEMORY_POLICIES = {"off", "remote_role_blend"}
 REMOTE_MEMORY_ROLE_BLEND = {
