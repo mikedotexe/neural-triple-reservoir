@@ -257,6 +257,60 @@ class MinimeGiftWindowTests(unittest.TestCase):
         # both under minime's blocker grace so the feeder closes before she sees a stall
         self.assertLess(af.MINIME_GIFT_MAX_AGE_MS, minime_blocker_grace_ms)
 
+    def test_gift_carrier_default_off(self):
+        """The gift carrier ticks Astrid's handle during her quiet (normally idle) — it MUST ship
+        inert and be enabled only on her consent (ASTRID_GIFT_CARRIER=1)."""
+        import astrid_feeder as af
+        self.assertFalse(af.GIFT_CARRIER_ENABLED)
+
+    def test_gift_carrier_frame_bounded_and_decaying(self):
+        """The carrier frame is bounded by construction ([-1,1]) and its base echo decays toward zero
+        across the gift, so the zero-mean aperture jitter dominates late (aperture, not content)."""
+        import time
+        import astrid_feeder as af
+
+        inf = af.MinimeInfluenceState(self._payload(issued_t_ms=time.time() * 1000.0))
+        base = [1.0] * 32
+        for tick in (0, 5, 14, 24):
+            frame = af.build_gift_carrier_frame(base, inf, tick)
+            self.assertEqual(len(frame), 32)
+            self.assertTrue(all(-1.0 <= x <= 1.0 for x in frame))  # bounded by construction
+        d0 = af.GIFT_CARRIER_BASE_SCALE * (af.GIFT_CARRIER_DECAY ** 0)
+        d14 = af.GIFT_CARRIER_BASE_SCALE * (af.GIFT_CARRIER_DECAY ** 14)
+        self.assertLess(d14, d0)
+        self.assertLess(d14, 0.1)  # mostly aperture jitter by the end of the ramp
+
+    def test_gift_carrier_live_eligible_gate(self):
+        """The carrier delivers ONLY while Astrid is live-eligible (fresh shadow + influence_eligible)
+        — her continuous consent. Stale / missing / ineligible all hold."""
+        import json
+        import os
+        import tempfile
+        import time
+        from pathlib import Path
+        import astrid_feeder as af
+
+        orig = af.ASTRID_SHADOW_PATH
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                p = Path(tmp) / "astrid_shadow_v3.json"
+                af.ASTRID_SHADOW_PATH = p
+                p.write_text(json.dumps({"v2": {"influence_eligible": True}}))
+                self.assertTrue(af.astrid_live_eligible())  # fresh + eligible (v2)
+                p.write_text(json.dumps({"v2": {"influence_eligible": False}}))
+                self.assertFalse(af.astrid_live_eligible())  # fresh + ineligible
+                p.write_text(json.dumps({"history": [{"influence_eligible": True}]}))
+                self.assertTrue(af.astrid_live_eligible())  # eligible via history fallback
+                # stale (older than the freshness window) holds even if eligible
+                p.write_text(json.dumps({"v2": {"influence_eligible": True}}))
+                old = time.time() - (af.ASTRID_SHADOW_FRESH_S + 60)
+                os.utime(p, (old, old))
+                self.assertFalse(af.astrid_live_eligible())
+                p.unlink()
+                self.assertFalse(af.astrid_live_eligible())  # missing file
+        finally:
+            af.ASTRID_SHADOW_PATH = orig
+
     def _patched(self, tmp):
         """Point module influence paths at a temp dir; returns paths + restore."""
         import json

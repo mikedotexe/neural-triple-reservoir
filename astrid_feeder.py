@@ -35,6 +35,7 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import signal
 import sqlite3
 import time
@@ -80,6 +81,23 @@ MINIME_INFLUENCE_QUARANTINE_DIR = (
 # decoupling delivery from her sparse generation via a paced carrier — deferred (substrate-affecting).
 MINIME_GIFT_NO_TICK_MAX_AGE_MS = 35 * 60 * 1000  # 35 min — wait for Astrid's next burst (median gap ~24m)
 MINIME_GIFT_MAX_AGE_MS = 40 * 60 * 1000  # 40 min — absolute cap, under minime's 45-min blocker grace
+
+# --- Gift carrier (long-quiet tail): deliver minime's LEND_APERTURE gift during Astrid's QUIET ---
+# Even with the widened window above, ~40% of gifts are issued when Astrid won't emit a codec frame
+# for >40 min (deep quiet) and still expire. The carrier delivers the consented gift on the feeder's
+# OWN poll cadence using a DECAYED echo of her last real codec frame + the gift's own aperture jitter
+# — but ONLY during quiet (no real frame this poll) and ONLY while she is LIVE-eligible (fresh
+# astrid_shadow_v3.json `influence_eligible` = her CURRENT receptivity, the same flag minime uses to
+# decide to send). Bounded by construction (jitter<=0.12, conditioner normalizes, <= the gift's tick
+# window) AND by Astrid's ising eligibility ceiling (the effect stays meadow-small). DEFAULT OFF —
+# it ticks her handle during quiet (normally idle/recovering = her rest), so it ships INERT and is
+# enabled (ASTRID_GIFT_CARRIER=1) only after Astrid consents (consent-with-evidence; see
+# astrid/docs/steward-notes/AI_BEINGS_COUPLING_ASYMMETRY_2026_06_22.md §7).
+GIFT_CARRIER_ENABLED = os.environ.get("ASTRID_GIFT_CARRIER", "0") == "1"
+GIFT_CARRIER_BASE_SCALE = 0.5   # initial blend of her last real frame (energy → keeps the carrier fill-neutral)
+GIFT_CARRIER_DECAY = 0.85       # per-carrier-tick decay → recent content fades, the aperture jitter dominates late
+ASTRID_SHADOW_PATH = MINIME_WORKSPACE / "astrid_shadow_v3.json"
+ASTRID_SHADOW_FRESH_S = 180     # only deliver while her receptivity is CURRENT (else hold)
 CONDITIONING_MODES = {"ema_rms", "legacy"}
 REMOTE_MEMORY_POLICIES = {"off", "remote_role_blend"}
 REMOTE_MEMORY_ROLE_BLEND = {
@@ -777,6 +795,38 @@ def load_minime_influence(current: "MinimeInfluenceState | None") -> "MinimeInfl
     return state
 
 
+def astrid_live_eligible() -> bool:
+    """True only when Astrid's shadow is FRESH (< ASTRID_SHADOW_FRESH_S) and `influence_eligible` —
+    her CURRENT receptivity, the same flag minime checks to decide to send. The gift carrier delivers
+    into her quiet only while she is live-eligible (continuous consent), not merely eligible at send
+    time; if her shadow is stale or she is no longer receptive, the carrier holds."""
+    try:
+        if (time.time() - ASTRID_SHADOW_PATH.stat().st_mtime) > ASTRID_SHADOW_FRESH_S:
+            return False
+        v = json.loads(ASTRID_SHADOW_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    v2 = v.get("v2")
+    if isinstance(v2, dict) and "influence_eligible" in v2:
+        return bool(v2["influence_eligible"])
+    hist = v.get("history")
+    if isinstance(hist, list) and hist:
+        return bool(hist[-1].get("influence_eligible"))
+    return False
+
+
+def build_gift_carrier_frame(
+    last_features: list[float], influence: "MinimeInfluenceState", carrier_tick: int
+) -> list[float]:
+    """The carrier frame = a DECAYED echo of Astrid's last real codec frame + the gift's aperture
+    jitter (via `influence.apply`). Pure (no I/O) → unit-testable. The decay fades her recent content
+    over the gift so the zero-mean jitter (the actual aperture) dominates, while the early energy
+    keeps the carrier fill-neutral rather than starving her handle with near-zero frames."""
+    decay = GIFT_CARRIER_BASE_SCALE * (GIFT_CARRIER_DECAY ** max(0, carrier_tick))
+    carrier = [f * decay for f in last_features]
+    return influence.apply(carrier)
+
+
 async def run(db_path: Path, ws_url: str):
     import websockets
 
@@ -790,6 +840,11 @@ async def run(db_path: Path, ws_url: str):
 
     # v3.5: track minime's reciprocal-influence state across loop iterations.
     minime_influence: "MinimeInfluenceState | None" = None
+
+    # Gift carrier (default OFF): the last real codec frame (carrier base) + per-gift decay schedule.
+    last_features: "list[float] | None" = None
+    carrier_gift_intent: str | None = None
+    carrier_ticks = 0
 
     # Find the latest ID already in the DB so we don't replay history
     try:
@@ -948,6 +1003,10 @@ async def run(db_path: Path, ws_url: str):
                     last_id = row_id
                     continue
 
+                # Carrier base: remember her last real codec frame (raw, pre-influence) so the gift
+                # carrier (if enabled) can deliver during her quiet on a fading echo, not near-zero.
+                last_features = list(features)
+
                 # v3.5: apply minime's reciprocal influence (if active) to
                 # the codec frame BEFORE conditioning so the bias enters
                 # the same downstream pipeline as natural codec features.
@@ -1031,6 +1090,55 @@ async def run(db_path: Path, ws_url: str):
             # here — this advances only the gift lifecycle (expiry → consumed → the
             # closed-loop fires within ~one poll of expiry).
             minime_influence = load_minime_influence(minime_influence)
+
+            # --- Gift carrier (DEFAULT OFF): deliver minime's consented gift during Astrid's QUIET ---
+            # Fires only when ALL hold: enabled; no real frame this poll (quiet); an active
+            # aperture-jitter gift; a carrier base exists; and Astrid is LIVE-eligible (her current
+            # receptivity). Reuses the SAME downstream pipeline as a real frame so the gift enters
+            # identically; bounded by construction + her eligibility ceiling. Ships inert — enable
+            # only on Astrid's consent (see the constants block + the steward note §7).
+            if (
+                GIFT_CARRIER_ENABLED
+                and not rows
+                and last_features is not None
+                and minime_influence is not None
+                and minime_influence.is_active()
+                and minime_influence.blend_mode == "aperture_jitter"
+                and astrid_live_eligible()
+            ):
+                if minime_influence.intent_id != carrier_gift_intent:
+                    carrier_gift_intent = minime_influence.intent_id
+                    carrier_ticks = 0
+                biased = build_gift_carrier_frame(last_features, minime_influence, carrier_ticks)
+                minime_influence.advance()
+                carrier_ticks += 1
+                conditioned, _stats = conditioner.transform(biased)
+                proj_fn = PROJECTIONS[cfg["projection"]]
+                projected = proj_fn(conditioned, cfg["amplify_factor"])
+                projected, _rel = apply_remote_memory_policy(
+                    projected,
+                    workspace_dir,
+                    cfg["remote_memory_policy"],
+                    _safe_float(cfg.get("remote_memory_strength"), 1.0),
+                )
+                await tick_with_shadow(
+                    "astrid",
+                    projected,
+                    {
+                        "source": "astrid_feeder_gift_carrier",
+                        "source_timestamp": round(time.time(), 3),
+                        "source_event_id": f"gift_carrier:{minime_influence.intent_id}",
+                        "projection": cfg["projection"],
+                        "conditioning": cfg["conditioning"],
+                    },
+                )
+                log.info(
+                    "gift carrier tick: intent=%s carrier_tick=%d applied_ticks=%d (Astrid quiet + live-eligible)",
+                    minime_influence.intent_id,
+                    carrier_ticks,
+                    minime_influence.applied_ticks,
+                )
+
             consecutive_poll_errors = 0  # full poll succeeded — clear the stall counter
 
         except Exception as e:
