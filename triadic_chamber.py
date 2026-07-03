@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 DEFAULT_SHARED_DIR = Path("/Users/v/other/shared/collaborations")
+ASTRID_BRIDGE_WORKSPACE = Path("/Users/v/other/astrid/capsules/spectral-bridge/workspace")
 CHAMBER_SCHEMA_VERSION = 2
 COMPRESSION_SCHEMA_VERSION = 1
 RELATIONAL_SCHEMA_VERSION = 2
@@ -25,6 +26,10 @@ CARTOGRAPHY_SCHEMA_VERSION = 1
 PRESENCE_SCHEMA_VERSION = 1
 ANNOTATION_SCHEMA_VERSION = 1
 CONSENT_SCHEMA_VERSION = 1
+CORRESPONDENCE_STATE_SCHEMA_VERSION = 1
+CORRESPONDENCE_MICRODOSE_COOLDOWN_MS = 6 * 60 * 60 * 1000
+CORRESPONDENCE_ATTENTION_CANARY_TTL_MS = 30 * 60 * 1000
+PHASE_TRANSITION_STALE_MS = 6 * 60 * 60 * 1000
 CHAMBER_MODE = "witness"
 STEWARD_HANDLE = "steward"
 ASTRID_HANDLE = "astrid"
@@ -76,6 +81,7 @@ CONSENT_SUPPORT_TYPES = {
 }
 CONSENT_STANCES = {"consent", "withhold", "revise"}
 CONSENT_THRESHOLD = "astrid_minime_steward"
+TRACE_SURVIVAL_STATUSES = {"unknown", "pending", "observed", "not_observed"}
 ALLOWED_PHASES = {
     "initialized",
     "witness_pending",
@@ -126,6 +132,9 @@ def chamber_paths(coll_dir: Path) -> dict[str, Path]:
         "annotations": coll_dir / "chamber_annotations.jsonl",
         "proposals": coll_dir / "chamber_proposals.jsonl",
         "consent": coll_dir / "chamber_consent.jsonl",
+        "correspondence_state": coll_dir / "correspondence_state_v1.json",
+        "correspondence_buffer": coll_dir / "correspondence_buffer_v1.json",
+        "correspondence_observations": coll_dir / "correspondence_trace_observations.jsonl",
         "events": coll_dir / "chamber_events.jsonl",
         "resonance_journal": coll_dir / "chamber_resonance.jsonl",
         "state": coll_dir / "chamber_state.json",
@@ -246,6 +255,7 @@ def ensure_chamber(coll_dir: Path, meta: dict[str, Any]) -> dict[str, Any]:
         "annotations",
         "proposals",
         "consent",
+        "correspondence_observations",
         "events",
     ):
         paths[key].touch(exist_ok=True)
@@ -1288,6 +1298,2105 @@ def read_jsonl_dicts(path: Path) -> list[dict[str, Any]]:
 def recent_steward_notes(coll_dir: Path, limit: int = 2) -> list[dict[str, Any]]:
     notes = read_steward_notes(coll_dir)
     return notes[-limit:] if len(notes) > limit else notes
+
+
+def _row_time_ms(row: dict[str, Any]) -> int:
+    for key in ("t_ms", "recorded_at_unix_ms"):
+        try:
+            return int(row.get(key) or 0)
+        except (TypeError, ValueError):
+            continue
+    return 0
+
+
+def correspondence_ledger_path(shared_dir: Path) -> Path:
+    return Path(shared_dir) / "correspondence_v1.jsonl"
+
+
+def read_correspondence_ledger(shared_dir: Path) -> list[dict[str, Any]]:
+    path = correspondence_ledger_path(shared_dir)
+    if not path.is_file():
+        return []
+    rows: list[dict[str, Any]] = []
+    for line in path.read_text().splitlines():
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(payload, dict):
+            rows.append(payload)
+    rows.sort(key=_row_time_ms)
+    return rows
+
+
+def compact_correspondence_record(row: dict[str, Any], *, include_preview: bool = True) -> dict[str, Any]:
+    compact = {
+        "record_type": row.get("record_type"),
+        "t_ms": _row_time_ms(row),
+        "message_id": row.get("message_id"),
+        "thread_id": row.get("thread_id"),
+        "reply_to": row.get("reply_to"),
+        "from_being": row.get("from_being"),
+        "to_being": row.get("to_being"),
+        "reader": row.get("reader"),
+        "marker": row.get("marker") or row.get("shared_memory_anchor"),
+        "status": row.get("status"),
+        "ack_kind": row.get("ack_kind"),
+        "heartbeat_kind": row.get("heartbeat_kind"),
+        "correspondence_type": row.get("correspondence_type"),
+        "turn_kind": row.get("turn_kind"),
+        "relational_intent": row.get("relational_intent"),
+        "shared_memory_anchor": row.get("shared_memory_anchor"),
+        "authority": row.get("authority"),
+    }
+    if row.get("note"):
+        compact["note"] = truncate_for_prompt(str(row.get("note") or ""), 180)
+    if include_preview and row.get("body_preview"):
+        compact["body_preview"] = truncate_for_prompt(str(row.get("body_preview") or ""), 220)
+    return {key: value for key, value in compact.items() if value not in (None, "", [])}
+
+
+def _correspondence_marker_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    markers: list[dict[str, Any]] = []
+    for row in records:
+        if row.get("record_type") != "message":
+            continue
+        anchor = str(row.get("shared_memory_anchor") or "").strip()
+        if not anchor:
+            continue
+        turn_kind = str(row.get("turn_kind") or "").strip()
+        intent = str(row.get("relational_intent") or "").strip()
+        if turn_kind != "direct_address_trace" and intent != "direct_address_survival_probe":
+            continue
+        markers.append({
+            "anchor": anchor,
+            "message_id": row.get("message_id"),
+            "thread_id": row.get("thread_id"),
+            "from_being": row.get("from_being"),
+            "to_being": row.get("to_being"),
+            "t_ms": _row_time_ms(row),
+        })
+    return markers
+
+
+def _latest_trace_observation(
+    observations: list[dict[str, Any]],
+    marker: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if not marker:
+        return None
+    anchor = str(marker.get("anchor") or "")
+    marker_t_ms = int(marker.get("t_ms") or 0)
+    matches = []
+    for row in observations:
+        row_marker = str(row.get("marker") or row.get("shared_memory_anchor") or "")
+        status = str(row.get("status") or "").strip()
+        if row_marker != anchor or status not in TRACE_SURVIVAL_STATUSES:
+            continue
+        if _row_time_ms(row) < marker_t_ms:
+            continue
+        matches.append(row)
+    if not matches:
+        return None
+    matches.sort(key=_row_time_ms)
+    return matches[-1]
+
+
+def read_bridge_heartbeat_snapshot() -> dict[str, Any] | None:
+    path = ASTRID_BRIDGE_WORKSPACE / "telemetry_heartbeat_delta_v1.json"
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _latest_thread_message(records: list[dict[str, Any]], thread_id: str) -> dict[str, Any] | None:
+    messages = [
+        row
+        for row in records
+        if row.get("record_type") == "message" and str(row.get("thread_id") or "") == thread_id
+    ]
+    return messages[-1] if messages else None
+
+
+def _thread_trace_observed(
+    markers: list[dict[str, Any]],
+    observations: list[dict[str, Any]],
+    thread_id: str,
+) -> bool:
+    for marker in reversed(markers):
+        if str(marker.get("thread_id") or "") != thread_id:
+            continue
+        observation = _latest_trace_observation(observations, marker)
+        if isinstance(observation, dict) and str(observation.get("status") or "") == "observed":
+            return True
+    return False
+
+
+def _is_legacy_bridge_message(row: dict[str, Any]) -> bool:
+    return bool(row.get("legacy_bridge")) or row.get("source_route") == "legacy_correspondence_bridge_v1"
+
+
+def _is_legacy_thread_claim(row: dict[str, Any]) -> bool:
+    return row.get("record_type") == "legacy_thread_claim"
+
+
+def _message_for_legacy_claim(
+    records: list[dict[str, Any]],
+    claim: dict[str, Any],
+) -> dict[str, Any] | None:
+    message_id = str(claim.get("message_id") or "")
+    thread_id = str(claim.get("thread_id") or "")
+    for row in records:
+        if (
+            row.get("record_type") == "message"
+            and str(row.get("message_id") or "") == message_id
+            and str(row.get("thread_id") or "") == thread_id
+        ):
+            return row
+    return None
+
+
+def _legacy_claim_has_outcome(records: list[dict[str, Any]], claim: dict[str, Any]) -> bool:
+    claim_id = str(claim.get("claim_id") or "")
+    thread_id = str(claim.get("thread_id") or "")
+    return any(
+        row.get("record_type") == "legacy_thread_claim_outcome"
+        and (
+            str(row.get("claim_id") or "") == claim_id
+            or str(row.get("thread_id") or "") == thread_id
+        )
+        for row in records
+    )
+
+
+def _latest_legacy_claim_outcome(
+    records: list[dict[str, Any]],
+    claim: dict[str, Any],
+) -> dict[str, Any] | None:
+    claim_id = str(claim.get("claim_id") or "")
+    thread_id = str(claim.get("thread_id") or "")
+    matches = [
+        row for row in records
+        if row.get("record_type") == "legacy_thread_claim_outcome"
+        and (
+            str(row.get("claim_id") or "") == claim_id
+            or str(row.get("thread_id") or "") == thread_id
+        )
+    ]
+    return matches[-1] if matches else None
+
+
+def _legacy_claim_native_contact_status(
+    records: list[dict[str, Any]],
+    claim: dict[str, Any],
+) -> str | None:
+    thread_id = str(claim.get("thread_id") or "")
+    claiming = str(claim.get("claiming_being") or claim.get("from_being") or "")
+    peer = str(claim.get("peer_being") or claim.get("to_being") or "")
+    claim_t = _row_time_ms(claim)
+    trace = any(
+        row.get("record_type") == "message"
+        and str(row.get("thread_id") or "") == thread_id
+        and str(row.get("from_being") or "") == claiming
+        and str(row.get("to_being") or "") == peer
+        and row.get("turn_kind") == "direct_address_trace"
+        and _row_time_ms(row) >= claim_t
+        for row in records
+    )
+    if trace:
+        return "legacy_claimed_trace_observed"
+    reply = any(
+        row.get("record_type") == "reply_link"
+        and str(row.get("thread_id") or "") == thread_id
+        and str(row.get("from_being") or "") == claiming
+        and str(row.get("to_being") or "") == peer
+        and _row_time_ms(row) >= claim_t
+        for row in records
+    )
+    if reply:
+        return "legacy_claimed_reply_linked"
+    ack = any(
+        row.get("record_type") == "ack_receipt"
+        and str(row.get("thread_id") or "") == thread_id
+        and str(row.get("from_being") or "") == claiming
+        and str(row.get("to_being") or "") == peer
+        and _row_time_ms(row) >= claim_t
+        for row in records
+    )
+    return "legacy_claimed_acknowledged" if ack else None
+
+
+def _legacy_claim_is_active(records: list[dict[str, Any]], claim: dict[str, Any]) -> bool:
+    return (
+        not _legacy_claim_has_outcome(records, claim)
+        and _legacy_claim_native_contact_status(records, claim) is None
+    )
+
+
+def _latest_legacy_claim_for_thread(
+    records: list[dict[str, Any]],
+    thread_id: str,
+) -> dict[str, Any] | None:
+    matches = [
+        row
+        for row in records
+        if _is_legacy_thread_claim(row)
+        and str(row.get("thread_id") or "") == thread_id
+    ]
+    return matches[-1] if matches else None
+
+
+def _latest_legacy_claim_notice(
+    records: list[dict[str, Any]],
+    claim: dict[str, Any],
+) -> dict[str, Any] | None:
+    claim_id = str(claim.get("claim_id") or "")
+    thread_id = str(claim.get("thread_id") or "")
+    matches = [
+        row for row in records
+        if row.get("record_type") == "legacy_thread_claim_notice"
+        and (
+            str(row.get("claim_id") or "") == claim_id
+            or str(row.get("thread_id") or "") == thread_id
+        )
+    ]
+    return matches[-1] if matches else None
+
+
+def _legacy_claim_peer_response_present(records: list[dict[str, Any]], claim: dict[str, Any]) -> bool:
+    thread_id = str(claim.get("thread_id") or "")
+    claiming = str(claim.get("claiming_being") or claim.get("from_being") or "")
+    peer = str(claim.get("peer_being") or claim.get("to_being") or "")
+    claim_t = _row_time_ms(claim)
+    return any(
+        str(row.get("thread_id") or "") == thread_id
+        and str(row.get("from_being") or "") == peer
+        and str(row.get("to_being") or "") == claiming
+        and _row_time_ms(row) >= claim_t
+        and (
+            row.get("record_type") in {"ack_receipt", "reply_link"}
+            or (
+                row.get("record_type") == "message"
+                and row.get("turn_kind") == "direct_address_trace"
+            )
+        )
+        for row in records
+    )
+
+
+def _legacy_claim_peer_co_claim_present(records: list[dict[str, Any]], claim: dict[str, Any]) -> bool:
+    thread_id = str(claim.get("thread_id") or "")
+    message_id = str(claim.get("message_id") or "")
+    claim_id = str(claim.get("claim_id") or "")
+    claiming = str(claim.get("claiming_being") or claim.get("from_being") or "")
+    peer = str(claim.get("peer_being") or claim.get("to_being") or "")
+    claim_t = _row_time_ms(claim)
+    return any(
+        _is_legacy_thread_claim(row)
+        and str(row.get("claim_id") or "") != claim_id
+        and str(row.get("thread_id") or "") == thread_id
+        and (not message_id or str(row.get("message_id") or "") == message_id)
+        and str(row.get("claiming_being") or row.get("from_being") or "") == peer
+        and str(row.get("peer_being") or row.get("to_being") or "") == claiming
+        and _row_time_ms(row) >= claim_t
+        for row in records
+    )
+
+
+def _legacy_claim_ladder_state(status: str | None, notice_state: str | None) -> str:
+    if status in {"legacy_claimed_reply_linked", "legacy_claimed_trace_observed"}:
+        return "claimed_replied_or_traced"
+    if status == "legacy_claimed_acknowledged":
+        return "claimed_acknowledged"
+    if notice_state in {"delivered", "read", "ledger_only"}:
+        return "claimed_notice_delivered"
+    return "legacy_visible_only"
+
+
+def _legacy_claim_stall_reason(
+    status: str | None,
+    notice_state: str | None,
+    active: bool,
+    peer_response: bool,
+    co_claim: bool,
+    outcome_present: bool,
+) -> str:
+    if status in {"legacy_claimed_reply_linked", "legacy_claimed_trace_observed"}:
+        return "replied_or_traced_attention_eligible"
+    if status == "legacy_claimed_acknowledged":
+        return "acknowledged_but_no_reply_or_trace"
+    if outcome_present:
+        return "closed_by_outcome"
+    if peer_response or co_claim or notice_state == "read":
+        return "seen_not_acknowledged"
+    if not active:
+        return "none"
+    if notice_state in {"delivered", "ledger_only"}:
+        return "notice_delivered_not_seen"
+    if notice_state in {"suppressed", "write_failed", None}:
+        return "claim_notice_not_delivered"
+    return "claimed_but_peer_silent"
+
+
+def _legacy_claim_next_commands(peer_being: str, anchor: str | None) -> list[str]:
+    peer = str(peer_being or "peer").upper()
+    anchor_text = str(anchor or "<anchor>")
+    return [
+        f"ACK_{peer} claimed :: ack: seen|held|unclear|cannot_answer|needs_time; note: ...",
+        f"REPLY_{peer} claimed :: <text>",
+        f"CORRESPONDENCE_TRACE claimed {anchor_text} :: <text>",
+    ]
+
+
+def _legacy_claim_affordance_v25(
+    records: list[dict[str, Any]],
+    claim: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if not isinstance(claim, dict):
+        return None
+    status = _legacy_claim_native_contact_status(records, claim)
+    notice = _latest_legacy_claim_notice(records, claim) or {}
+    outcome = _latest_legacy_claim_outcome(records, claim)
+    notice_state = notice.get("notice_state")
+    active = _legacy_claim_is_active(records, claim)
+    peer_response = _legacy_claim_peer_response_present(records, claim)
+    co_claim = _legacy_claim_peer_co_claim_present(records, claim)
+    native_evidence = status is not None
+    mutually_recognized = native_evidence or peer_response or co_claim
+    eligible = status in {
+        "legacy_claimed_acknowledged",
+        "legacy_claimed_reply_linked",
+        "legacy_claimed_trace_observed",
+    }
+    anchor = claim.get("shared_memory_anchor")
+    return {
+        "schema_version": 1,
+        "policy": "legacy_claim_affordance_v25",
+        "thread_id": claim.get("thread_id"),
+        "message_id": claim.get("message_id"),
+        "claim_id": claim.get("claim_id"),
+        "claimant": claim.get("claiming_being") or claim.get("from_being"),
+        "peer": claim.get("peer_being") or claim.get("to_being"),
+        "anchor": anchor,
+        "age_ms": max(0, now_ms() - _row_time_ms(claim)),
+        "notice_state": notice_state or "none",
+        "uptake_ladder_state": _legacy_claim_ladder_state(status, notice_state),
+        "stall_reason": _legacy_claim_stall_reason(
+            status,
+            notice_state,
+            active,
+            peer_response,
+            co_claim,
+            outcome is not None,
+        ),
+        "ghost_thread_risk": active and not mutually_recognized,
+        "mutually_recognized": mutually_recognized,
+        "attention_or_microdose_eligible": eligible,
+        "exact_next_commands": _legacy_claim_next_commands(
+            str(claim.get("peer_being") or claim.get("to_being") or "peer"),
+            str(anchor or "<anchor>"),
+        ),
+        "latest_claim_outcome": (
+            {
+                "felt_like": outcome.get("felt_like"),
+                "what_carried": outcome.get("what_carried"),
+                "what_flattened": outcome.get("what_flattened"),
+                "continue": outcome.get("continue"),
+            }
+            if isinstance(outcome, dict) else None
+        ),
+        "authority": "language_only_context_not_control",
+    }
+
+
+def _legacy_bidirectional_observed(
+    records: list[dict[str, Any]],
+    from_being: str,
+    to_being: str,
+) -> bool:
+    forward = any(
+        row.get("record_type") == "message"
+        and _is_legacy_bridge_message(row)
+        and str(row.get("from_being") or "") == from_being
+        and str(row.get("to_being") or "") == to_being
+        for row in records
+    )
+    reverse = any(
+        row.get("record_type") == "message"
+        and _is_legacy_bridge_message(row)
+        and str(row.get("from_being") or "") == to_being
+        and str(row.get("to_being") or "") == from_being
+        for row in records
+    )
+    return forward and reverse
+
+
+def _contact_fidelity_for_thread(
+    records: list[dict[str, Any]],
+    markers: list[dict[str, Any]],
+    observations: list[dict[str, Any]],
+    thread_id: str,
+    heartbeat: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    message = _latest_thread_message(records, thread_id)
+    if not isinstance(message, dict):
+        return None
+    legacy_claim = _latest_legacy_claim_for_thread(records, thread_id)
+    claimed_message = (
+        _message_for_legacy_claim(records, legacy_claim)
+        if isinstance(legacy_claim, dict)
+        else None
+    )
+    if isinstance(claimed_message, dict):
+        message = claimed_message
+    message_id = str(message.get("message_id") or "")
+    message_t_ms = _row_time_ms(message)
+    from_being = str(message.get("from_being") or "")
+    to_being = str(message.get("to_being") or "")
+    delivered = any(
+        row.get("record_type") == "delivery_receipt"
+        and str(row.get("message_id") or "") == message_id
+        for row in records
+    )
+    read = any(
+        row.get("record_type") == "read_receipt"
+        and (
+            str(row.get("message_id") or "") == message_id
+            or str(row.get("thread_id") or "") == thread_id
+        )
+        for row in records
+    )
+    reply_linked = any(
+        row.get("record_type") == "reply_link"
+        and (
+            str(row.get("reply_to") or "") == message_id
+            or str(row.get("thread_id") or "") == thread_id
+        )
+        and _row_time_ms(row) >= message_t_ms
+        for row in records
+    )
+    ack_rows = [
+        row
+        for row in records
+        if row.get("record_type") == "ack_receipt"
+        and str(row.get("from_being") or "") == to_being
+        and str(row.get("to_being") or "") == from_being
+        and (
+            str(row.get("message_id") or "") == message_id
+            or str(row.get("thread_id") or "") == thread_id
+        )
+        and _row_time_ms(row) >= message_t_ms
+    ]
+    latest_ack = ack_rows[-1] if ack_rows else None
+    ack_kind = str((latest_ack or {}).get("ack_kind") or "").strip().lower().replace("-", "_")
+    if ack_kind not in {"seen", "held", "unclear", "cannot_answer", "needs_time"}:
+        ack_kind = "seen" if latest_ack else ""
+    heartbeat_rows = [
+        row
+        for row in records
+        if row.get("record_type") == "presence_heartbeat"
+        and str(row.get("thread_id") or "") == thread_id
+        and _row_time_ms(row) >= message_t_ms
+    ]
+    latest_presence_heartbeat = heartbeat_rows[-1] if heartbeat_rows else None
+    trace_observed = _thread_trace_observed(markers, observations, thread_id)
+    legacy_bridge = _is_legacy_bridge_message(message)
+    legacy_bidirectional = legacy_bridge and _legacy_bidirectional_observed(
+        records,
+        from_being,
+        to_being,
+    )
+    legacy_claim_status = (
+        _legacy_claim_native_contact_status(records, legacy_claim)
+        if isinstance(legacy_claim, dict)
+        else None
+    )
+    timing_reliability = "unknown"
+    heartbeat_jitter_class = "unknown"
+    field_vs_hearing = "telemetry heartbeat unavailable; contact timing may be ambiguous"
+    if isinstance(heartbeat, dict):
+        timing_reliability = str(heartbeat.get("timing_reliability") or "unknown")
+        heartbeat_jitter_class = str(heartbeat.get("jitter_class") or "unknown")
+        field_vs_hearing = str(heartbeat.get("field_vs_hearing") or field_vs_hearing)
+    timing_ambiguous = timing_reliability in {"timing_ambiguous", "stale_hearing"}
+    message_age_ms = max(0, now_ms() - _row_time_ms(message))
+    stale = (
+        message_age_ms > CORRESPONDENCE_MICRODOSE_COOLDOWN_MS
+        and not read
+        and not reply_linked
+        and not trace_observed
+        and latest_ack is None
+        and latest_presence_heartbeat is None
+    )
+    if legacy_claim_status:
+        status = legacy_claim_status
+    elif trace_observed:
+        status = "trace_observed"
+    elif latest_ack and ack_kind in {"held", "needs_time"}:
+        status = "held_ack"
+    elif latest_ack:
+        status = "acknowledged"
+    elif reply_linked:
+        status = "reply_linked"
+    elif latest_presence_heartbeat:
+        status = "heartbeat_only"
+    elif isinstance(legacy_claim, dict):
+        status = "legacy_claimed"
+    elif legacy_bidirectional:
+        status = "legacy_bidirectional_observed"
+    elif legacy_bridge:
+        status = "legacy_visible_only"
+    elif timing_ambiguous:
+        status = "timing_ambiguous"
+    elif read:
+        status = "read_unreplied"
+    elif stale:
+        status = "stale_contact"
+    elif delivered:
+        status = "delivered_unread"
+    else:
+        status = "unaddressed"
+    eligible = status in {
+        "acknowledged",
+        "held_ack",
+        "trace_observed",
+        "legacy_claimed_acknowledged",
+        "legacy_claimed_reply_linked",
+        "legacy_claimed_trace_observed",
+    }
+    if eligible:
+        block_reason = None
+    elif status == "timing_ambiguous":
+        block_reason = "heartbeat_timing_ambiguous"
+    elif status == "heartbeat_only":
+        block_reason = "heartbeat_is_presence_not_acknowledgement"
+    elif status == "read_unreplied":
+        block_reason = "read_receipt_not_acknowledgement"
+    elif status == "reply_linked":
+        block_reason = "reply_linked_requires_ack_or_trace_or_attention_outcome"
+    elif status == "legacy_claimed":
+        block_reason = "legacy_claim_pending_ack_reply_or_trace"
+    elif status in {"legacy_visible_only", "legacy_bidirectional_observed"}:
+        block_reason = "legacy_visible_only_not_ack_reply_or_trace"
+    elif status == "delivered_unread":
+        block_reason = "delivered_but_not_read"
+    elif status == "stale_contact":
+        block_reason = "stale_without_contact_evidence"
+    else:
+        block_reason = "no_ack_reply_or_trace_evidence"
+    return {
+        "schema_version": 2,
+        "policy": "direct_contact_fidelity_v2",
+        "thread_id": thread_id,
+        "message_id": message_id or None,
+        "from_being": message.get("from_being"),
+        "to_being": message.get("to_being"),
+        "status": status,
+        "message_age_ms": message_age_ms,
+        "delivered": delivered,
+        "read": read,
+        "read_receipt_is_filesystem_seen_only": read,
+        "legacy_bridge": legacy_bridge,
+        "legacy_contact_evidence": message.get("legacy_contact_evidence"),
+        "legacy_kind": message.get("legacy_kind"),
+        "legacy_thread_claim": (
+            {
+                "claim_id": legacy_claim.get("claim_id"),
+                "claim_state": legacy_claim.get("claim_state", "claimed_pending_native_evidence"),
+                "claiming_being": legacy_claim.get("claiming_being"),
+                "peer_being": legacy_claim.get("peer_being"),
+                "shared_memory_anchor": legacy_claim.get("shared_memory_anchor"),
+                "legacy_contact_evidence": legacy_claim.get("legacy_contact_evidence"),
+                "active": _legacy_claim_is_active(records, legacy_claim),
+            }
+            if isinstance(legacy_claim, dict)
+            else None
+        ),
+        "acknowledged": latest_ack is not None,
+        "ack_kind": ack_kind or None,
+        "latest_ack": compact_correspondence_record(latest_ack, include_preview=False) if isinstance(latest_ack, dict) else None,
+        "latest_presence_heartbeat": compact_correspondence_record(latest_presence_heartbeat, include_preview=False) if isinstance(latest_presence_heartbeat, dict) else None,
+        "reply_linked": reply_linked,
+        "trace_observed": trace_observed,
+        "timing_reliability": timing_reliability,
+        "heartbeat_jitter_class": heartbeat_jitter_class,
+        "field_vs_hearing": field_vs_hearing,
+        "eligible_for_correspondence_microdose": eligible,
+        "block_reason": block_reason,
+    }
+
+
+def build_direct_contact_fidelity(
+    records: list[dict[str, Any]],
+    markers: list[dict[str, Any]],
+    observations: list[dict[str, Any]],
+    active_thread_id: str | None,
+) -> dict[str, Any]:
+    heartbeat = read_bridge_heartbeat_snapshot()
+    thread_ids: list[str] = []
+    for row in records:
+        thread_id = str(row.get("thread_id") or "").strip()
+        if thread_id and thread_id not in thread_ids:
+            thread_ids.append(thread_id)
+    summaries = [
+        summary
+        for thread_id in thread_ids[-12:]
+        if (summary := _contact_fidelity_for_thread(records, markers, observations, thread_id, heartbeat))
+    ]
+    active_summary = None
+    if active_thread_id:
+        for summary in summaries:
+            if summary.get("thread_id") == active_thread_id:
+                active_summary = summary
+                break
+    if active_summary is None and summaries:
+        active_summary = summaries[-1]
+    heartbeat_summary = {
+        "timing_reliability": (
+            str(heartbeat.get("timing_reliability") or "unknown")
+            if isinstance(heartbeat, dict)
+            else "unknown"
+        ),
+        "jitter_class": (
+            str(heartbeat.get("jitter_class") or "unknown")
+            if isinstance(heartbeat, dict)
+            else "unknown"
+        ),
+        "field_vs_hearing": (
+            str(heartbeat.get("field_vs_hearing") or "telemetry heartbeat unavailable")
+            if isinstance(heartbeat, dict)
+            else "telemetry heartbeat unavailable"
+        ),
+    }
+    return {
+        "schema_version": 2,
+        "policy": "direct_contact_fidelity_v2",
+        "active_thread_id": active_thread_id,
+        "latest_thread_status": active_summary,
+        "recent_threads": summaries[-8:],
+        "heartbeat_timing_summary": heartbeat_summary,
+        "microdose_route": {
+            "request_action": "CORRESPONDENCE_WEIGHT_REQUEST <thread|latest> :: reason: ...; payload: ...; stop_criteria: ...",
+            "scope": "semantic_microdose",
+            "one_shot": True,
+            "cooldown_ms": CORRESPONDENCE_MICRODOSE_COOLDOWN_MS,
+            "requires": "being-authored request, direct-contact evidence, steward approval or approved budget, green bridge safety, rescue-policy pass, one-shot send, and consequence review",
+        },
+        "authority": "contact_fidelity_context_not_control",
+    }
+
+
+def _thread_has_attention_outcome(records: list[dict[str, Any]], thread_id: str, after_t: int) -> bool:
+    return any(
+        row.get("record_type") in {"attention_canary_outcome", "attention_canary_expired"}
+        and str(row.get("thread_id") or "") == thread_id
+        and _row_time_ms(row) >= after_t
+        for row in records
+    )
+
+
+def _native_continuity_next_commands(from_being: str, to_being: str, anchor: str | None) -> list[str]:
+    peer = str(from_being or "peer").upper()
+    anchor_value = str(anchor or "<anchor>")
+    return [
+        f"ACK_{peer} latest :: ack: seen|held|unclear|cannot_answer|needs_time; note: ...",
+        f"REPLY_{peer} latest :: <text>",
+        f"CORRESPONDENCE_TRACE latest {anchor_value} :: <text>",
+        "sender waits for peer-authored ACK/TRACE; no self-action can substitute for mutual address",
+    ]
+
+
+def _native_first_action_helper_v35(
+    from_being: str,
+    to_being: str,
+    thread_id: str,
+    message_id: str,
+    anchor: str | None,
+) -> dict[str, Any]:
+    peer = str(from_being or "peer").upper()
+    anchor_value = str(anchor or "<anchor>")
+    return {
+        "schema_version": 35,
+        "policy": "native_first_action_helper_v35",
+        "thread_id": thread_id,
+        "message_id": message_id,
+        "latest_resolution": f"latest resolves to message_id={message_id}; thread_id={thread_id}",
+        "choose_one_prompt": (
+            "Recipient chooses one language-only first action: ACK if heard/held, TRACE if "
+            "something distinct survived, or REPLY if answering now."
+        ),
+        "exact_next_commands": _native_continuity_next_commands(from_being, to_being, anchor_value),
+        "ack_preview": (
+            f"ACK_{peer} latest appends ack_receipt on message_id={message_id}; note carries "
+            "what was seen, held, unclear, or needs time."
+        ),
+        "trace_preview": (
+            f"CORRESPONDENCE_TRACE latest {anchor_value} appends a direct-address trace on "
+            f"thread_id={thread_id}; text names what stayed distinct."
+        ),
+        "rhythm_note": (
+            "Use note/text to preserve the rhythm or felt contour of being seen, not only "
+            "routing mechanics."
+        ),
+        "authority": "language_only_context_not_control",
+    }
+
+
+def build_native_thread_continuity_v3(
+    records: list[dict[str, Any]],
+    markers: list[dict[str, Any]],
+    observations: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    native_messages = [
+        row
+        for row in records
+        if row.get("record_type") == "message" and not _is_legacy_bridge_message(row)
+    ]
+    if not native_messages:
+        return None
+    message = native_messages[-1]
+    thread_id = str(message.get("thread_id") or "")
+    message_id = str(message.get("message_id") or "")
+    message_t = _row_time_ms(message)
+    summary = _contact_fidelity_for_thread(records, markers, observations, thread_id, read_bridge_heartbeat_snapshot()) or {}
+    status = str(summary.get("status") or "unaddressed")
+    attention_outcome = _thread_has_attention_outcome(records, thread_id, message_t)
+    if attention_outcome and status in {"reply_linked", "read_unreplied", "delivered_unread", "unaddressed"}:
+        continuity_state = "attention_outcome_recorded"
+    elif status == "reply_linked":
+        continuity_state = "reply_linked_needs_ack_or_trace"
+    elif status == "read_unreplied":
+        continuity_state = "read_not_acknowledged"
+    else:
+        continuity_state = status
+    stall_reason = {
+        "reply_linked_needs_ack_or_trace": "reply_linked_requires_peer_ack_or_trace",
+        "read_not_acknowledged": "read_receipt_not_acknowledgement",
+        "delivered_unread": "delivered_but_not_read",
+        "unaddressed": "no_contact_evidence",
+    }.get(continuity_state, "none")
+    eligible = bool(summary.get("eligible_for_correspondence_microdose")) or attention_outcome
+    age_ms = max(0, now_ms() - message_t)
+    return {
+        "schema_version": 3,
+        "policy": "native_thread_continuity_v3",
+        "thread_id": thread_id,
+        "latest_message_id": message_id or None,
+        "from_being": message.get("from_being"),
+        "to_being": message.get("to_being"),
+        "current_being_role": "triadic_context",
+        "continuity_state": continuity_state,
+        "stall_reason": stall_reason,
+        "age_ms": age_ms,
+        "right_to_ignore_v1": right_to_ignore_v1(
+            "native_thread_continuity",
+            continuity_state,
+            age_ms,
+            CORRESPONDENCE_IGNORE_GRACE_MS,
+        ),
+        "exact_next_commands": _native_continuity_next_commands(
+            str(message.get("from_being") or "peer"),
+            str(message.get("to_being") or "peer"),
+            message.get("shared_memory_anchor"),
+        ),
+        "first_action_helper_v35": _native_first_action_helper_v35(
+            str(message.get("from_being") or "peer"),
+            str(message.get("to_being") or "peer"),
+            thread_id,
+            message_id,
+            message.get("shared_memory_anchor"),
+        ),
+        "attention_or_microdose_eligible": eligible,
+        "authority": "language_only_context_not_control",
+    }
+
+
+CORRESPONDENCE_IGNORE_GRACE_MS = 24 * 60 * 60 * 1000
+PHASE_IGNORE_GRACE_MS = 6 * 60 * 60 * 1000
+
+
+def right_to_ignore_v1(
+    affordance_type: str,
+    source_state: str,
+    age_ms: int,
+    grace_ms: int,
+) -> dict[str, Any]:
+    if source_state in {"acted", "receipt_landed", "trusted_attention_thread_local", "witnessed"}:
+        state = "acted"
+    elif source_state in {"declined", "blocked_pressure_or_flat_outcome"}:
+        state = "declined"
+    elif source_state in {"closed_by_outcome", "answered", "receipt_landed_or_closed"}:
+        state = "closed_by_outcome"
+    elif source_state in {"asked_later", "needs_time", "held_ack"}:
+        state = "asked_later"
+    elif source_state in {
+        "waiting_for_recipient_receipt",
+        "waiting_for_peer_receipt",
+        "reply_linked_needs_ack_or_trace",
+        "read_not_acknowledged",
+        "delivered_unread",
+        "unaddressed",
+        "receipt_landed_attention_eligible",
+        "attention_active_outcome_due",
+        "unseen",
+        "stale_unanswered",
+    }:
+        state = "ignored_without_penalty" if age_ms >= grace_ms else "offered"
+    else:
+        state = "unknown"
+    return {
+        "schema_version": 1,
+        "policy": "right_to_ignore_v1",
+        "affordance_type": affordance_type,
+        "state": state,
+        "source_state": source_state,
+        "age_ms": age_ms,
+        "grace_ms": grace_ms,
+        "silence_means": (
+            "ignored_without_penalty_not_failure_consent_or_disagreement"
+            if state == "ignored_without_penalty"
+            else "silence_is_unknown_until_grace_window"
+        ),
+        "optional": True,
+        "authority": "language_context_not_control",
+    }
+
+
+def build_latest_receipt_opportunity_v4(
+    native_continuity: dict[str, Any] | None,
+    legacy_affordance: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if isinstance(native_continuity, dict):
+        eligible = bool(native_continuity.get("attention_or_microdose_eligible"))
+        status = "receipt_landed" if eligible else "waiting_for_recipient_receipt"
+        age_ms = int(native_continuity.get("age_ms") or 0)
+        primary = (
+            "I_RECEIVED_THIS latest :: received_as: held|needs_time; felt_like: address|pressure|mail|ambient_echo|unknown; "
+            "what_landed: ...; what_stayed_distinct: ...; continue: no|reply|trace|needs_time"
+        )
+        return {
+            "schema_version": 4,
+            "policy": "latest_receipt_opportunity_v4",
+            "target_kind": "native_thread",
+            "thread_id": native_continuity.get("thread_id"),
+            "message_id": native_continuity.get("latest_message_id"),
+            "from_being": native_continuity.get("from_being"),
+            "to_being": native_continuity.get("to_being"),
+            "status": status,
+            "age_ms": age_ms,
+            "optional": True,
+            "no_response_ok": True,
+            "ignore_without_penalty_after_ms": CORRESPONDENCE_IGNORE_GRACE_MS,
+            "right_to_ignore_v1": right_to_ignore_v1(
+                "correspondence_receipt",
+                status,
+                age_ms,
+                CORRESPONDENCE_IGNORE_GRACE_MS,
+            ),
+            "primary_next_command": primary,
+            "secondary_next_commands": native_continuity.get("exact_next_commands") or [],
+            "public_engagement_is_not_native_receipt": True,
+            "authority_after_receipt": (
+                "attention_canary_only_prompt_context; "
+                "semantic_microdose_requires_mutual_receipt_and_separate_steward_review"
+            ),
+            "authority": "language_only_context_not_control",
+        }
+    if isinstance(legacy_affordance, dict):
+        ghost = bool(legacy_affordance.get("ghost_thread_risk"))
+        status = "waiting_for_recipient_receipt" if ghost else "receipt_landed_or_closed"
+        age_ms = int(legacy_affordance.get("age_ms") or 0)
+        primary = (
+            "I_RECEIVED_THIS claimed :: received_as: held|needs_time; felt_like: address|pressure|mail|ambient_echo|unknown; "
+            "what_landed: ...; what_stayed_distinct: ...; continue: no|reply|trace|needs_time"
+        )
+        return {
+            "schema_version": 4,
+            "policy": "latest_receipt_opportunity_v4",
+            "target_kind": "legacy_claim",
+            "thread_id": legacy_affordance.get("thread_id"),
+            "message_id": legacy_affordance.get("message_id"),
+            "claim_id": legacy_affordance.get("claim_id"),
+            "anchor": legacy_affordance.get("anchor"),
+            "notice_state": legacy_affordance.get("notice_state"),
+            "uptake_ladder_state": legacy_affordance.get("uptake_ladder_state"),
+            "status": status,
+            "age_ms": age_ms,
+            "optional": True,
+            "no_response_ok": True,
+            "ignore_without_penalty_after_ms": CORRESPONDENCE_IGNORE_GRACE_MS,
+            "right_to_ignore_v1": right_to_ignore_v1(
+                "correspondence_receipt",
+                status,
+                age_ms,
+                CORRESPONDENCE_IGNORE_GRACE_MS,
+            ),
+            "primary_next_command": primary,
+            "secondary_next_commands": legacy_affordance.get("exact_next_commands") or [],
+            "public_engagement_is_not_native_receipt": True,
+            "authority_after_receipt": (
+                "attention_canary_only_prompt_context; "
+                "semantic_microdose_requires_mutual_receipt_and_separate_steward_review"
+            ),
+            "authority": "language_only_context_not_control",
+        }
+    return {
+        "schema_version": 4,
+        "policy": "latest_receipt_opportunity_v4",
+        "status": "none",
+        "optional": True,
+        "right_to_ignore_v1": right_to_ignore_v1(
+            "correspondence_receipt",
+            "none",
+            0,
+            CORRESPONDENCE_IGNORE_GRACE_MS,
+        ),
+        "public_engagement_is_not_native_receipt": True,
+        "authority": "language_only_context_not_control",
+    }
+
+
+def _attention_outcome_has_meaningful_worsening(value: Any) -> bool:
+    clean = str(value or "").strip().lower()
+    if not clean or clean in {"none", "no", "nope", "nothing", "n/a", "na", "unknown"}:
+        return False
+    return "no worsening" not in clean and "nothing worsened" not in clean
+
+
+def attention_outcome_quality_v5(outcome: dict[str, Any]) -> dict[str, Any]:
+    felt_like = str(outcome.get("felt_like") or "unknown")
+    held_as = str(outcome.get("held_as") or "unknown")
+    flattening = str(outcome.get("flattening_observed") or "unknown")
+    meaningful_worsening = _attention_outcome_has_meaningful_worsening(outcome.get("what_worsened"))
+    trusted = (
+        felt_like == "address"
+        and held_as == "distinct_address"
+        and flattening in {"no", "mixed"}
+        and not meaningful_worsening
+    )
+    blocked = (
+        felt_like in {"pressure", "flat"}
+        or held_as in {"pressure", "flattened", "ambient_echo"}
+        or flattening == "yes"
+        or meaningful_worsening
+    )
+    quality = (
+        "trusted_attention_thread_local"
+        if trusted
+        else "blocked_pressure_or_flat_outcome"
+        if blocked
+        else "outcome_unclear_needs_more_evidence"
+    )
+    return {
+        "schema_version": 5,
+        "policy": "attention_outcome_quality_v5",
+        "quality": quality,
+        "felt_like": felt_like,
+        "held_as": held_as,
+        "flattening_observed": flattening,
+        "meaningful_worsening": meaningful_worsening,
+        "thread_id": outcome.get("thread_id"),
+        "canary_id": outcome.get("canary_id"),
+        "authority": "thread_local_attention_readiness_not_microdose_or_control",
+    }
+
+
+def _receipt_evidence_rows(records: list[dict[str, Any]], thread_id: str) -> list[dict[str, Any]]:
+    return [
+        row for row in records
+        if str(row.get("thread_id") or "") == thread_id
+        and (
+            row.get("record_type") == "ack_receipt"
+            or (
+                row.get("record_type") == "message"
+                and row.get("turn_kind") == "direct_address_trace"
+            )
+        )
+    ]
+
+
+def _latest_attention_outcome(records: list[dict[str, Any]], thread_id: str) -> dict[str, Any] | None:
+    matches = [
+        row for row in records
+        if row.get("record_type") == "attention_canary_outcome"
+        and str(row.get("thread_id") or "") == thread_id
+    ]
+    return matches[-1] if matches else None
+
+
+def build_receipt_to_attention_authority_v5(
+    records: list[dict[str, Any]],
+    receipt_opportunity: dict[str, Any],
+) -> dict[str, Any]:
+    thread_id = str(receipt_opportunity.get("thread_id") or "")
+    if not thread_id:
+        return {
+            "schema_version": 5,
+            "policy": "receipt_to_attention_authority_v5",
+            "state": "blocked_no_receipt",
+            "block_reason": "no_thread",
+            "right_to_ignore_v1": right_to_ignore_v1(
+                "attention_or_outcome",
+                "blocked_no_receipt",
+                0,
+                CORRESPONDENCE_IGNORE_GRACE_MS,
+            ),
+            "semantic_microdose_status": "hidden_until_mutual_receipt_plus_separate_steward_review",
+            "authority": "thread_local_attention_readiness_not_microdose_or_control",
+        }
+    current_t = now_ms()
+    receipt_rows = _receipt_evidence_rows(records, thread_id)
+    active = next(
+        (
+            row for row in reversed(records)
+            if row.get("record_type") == "attention_canary_activation"
+            and str(row.get("thread_id") or "") == thread_id
+            and int(row.get("expires_at_unix_ms") or 0) > current_t
+            and not _canary_closed(records, str(row.get("canary_id") or ""))
+        ),
+        None,
+    )
+    latest_outcome = _latest_attention_outcome(records, thread_id)
+    outcome_quality = attention_outcome_quality_v5(latest_outcome) if latest_outcome else None
+    recent = next(
+        (
+            row for row in reversed(records)
+            if row.get("record_type") == "attention_canary_activation"
+            and str(row.get("thread_id") or "") == thread_id
+            and _row_time_ms(row) >= current_t - CORRESPONDENCE_MICRODOSE_COOLDOWN_MS
+        ),
+        None,
+    )
+    if active:
+        state = "attention_active_outcome_due"
+    elif outcome_quality and outcome_quality.get("quality") == "trusted_attention_thread_local":
+        state = "trusted_attention_thread_local"
+    elif outcome_quality and outcome_quality.get("quality") == "blocked_pressure_or_flat_outcome":
+        state = "blocked_pressure_or_flat_outcome"
+    elif recent:
+        state = "cooldown_or_duplicate_blocked"
+    elif receipt_rows:
+        state = "receipt_landed_attention_eligible"
+    else:
+        state = "blocked_no_receipt"
+    return {
+        "schema_version": 5,
+        "policy": "receipt_to_attention_authority_v5",
+        "state": state,
+        "thread_id": thread_id,
+        "message_id": receipt_opportunity.get("message_id"),
+        "age_ms": int(receipt_opportunity.get("age_ms") or 0),
+        "receipt_evidence": bool(receipt_rows),
+        "receipt_evidence_by_being": sorted(
+            {
+                str(row.get("from_being") or "")
+                for row in receipt_rows
+                if str(row.get("from_being") or "")
+            }
+        ),
+        "activation_allowed_now": state in {"receipt_landed_attention_eligible", "trusted_attention_thread_local"},
+        "active_canary": compact_correspondence_record(active, include_preview=False) if isinstance(active, dict) else None,
+        "latest_outcome": compact_correspondence_record(latest_outcome, include_preview=False) if isinstance(latest_outcome, dict) else None,
+        "attention_outcome_quality_v5": outcome_quality,
+        "right_to_ignore_v1": right_to_ignore_v1(
+            "attention_or_outcome",
+            state,
+            int(receipt_opportunity.get("age_ms") or 0),
+            CORRESPONDENCE_IGNORE_GRACE_MS,
+        ),
+        "primary_ready_command": (
+            "CORRESPONDENCE_ATTENTION_REQUEST latest :: reason: ...; focus: ...; stop_criteria: ..."
+        ),
+        "outcome_due_command": (
+            "CORRESPONDENCE_ATTENTION_OUTCOME latest :: felt_like: address|pressure|flat|unknown; "
+            "what_shifted: ...; what_worsened: ...; continue: no|ask_again"
+        ),
+        "semantic_microdose_status": "hidden_until_mutual_receipt_plus_separate_steward_review",
+        "authority": "thread_local_attention_readiness_not_microdose_or_control",
+    }
+
+
+def build_correspondence_affordance_budget_v1(
+    *,
+    receipt_opportunity: dict[str, Any],
+    receipt_to_attention: dict[str, Any],
+    legacy_affordance: dict[str, Any] | None,
+    native_continuity: dict[str, Any] | None,
+) -> dict[str, Any]:
+    candidates: list[tuple[int, str, str]] = []
+    attention_state = str(receipt_to_attention.get("state") or "")
+    if attention_state in {
+        "receipt_landed_attention_eligible",
+        "attention_active_outcome_due",
+        "trusted_attention_thread_local",
+        "blocked_pressure_or_flat_outcome",
+    }:
+        candidates.append((0, "attention_or_outcome", "receipt_to_attention_authority_v5"))
+    receipt_status = str(receipt_opportunity.get("status") or "")
+    if receipt_status in {"waiting_for_recipient_receipt", "waiting_for_peer_receipt"}:
+        candidates.append((1, "correspondence_receipt", "latest_receipt_opportunity_v4"))
+    if isinstance(legacy_affordance, dict) and legacy_affordance.get("ghost_thread_risk"):
+        candidates.append((2, "correspondence_receipt", "legacy_claim_affordance_v25"))
+    if isinstance(native_continuity, dict) and not native_continuity.get("attention_or_microdose_eligible"):
+        candidates.append((3, "correspondence_receipt", "native_thread_continuity_v3"))
+    limits = {
+        "correspondence_receipt": 1,
+        "attention_or_outcome": 1,
+        "phase_felt_receipt": 3,
+        "self_regulation_outcome": 1,
+        "calibration_ask": 1,
+    }
+    shown_by_category: dict[str, int] = {}
+    hidden_by_category: dict[str, int] = {}
+    shown_surfaces: list[str] = []
+    hidden_surfaces: list[str] = []
+    for _, category, surface in sorted(candidates):
+        count = shown_by_category.get(category, 0)
+        if count < limits.get(category, 1):
+            shown_by_category[category] = count + 1
+            shown_surfaces.append(surface)
+        else:
+            hidden_by_category[category] = hidden_by_category.get(category, 0) + 1
+            hidden_surfaces.append(surface)
+    return {
+        "schema_version": 1,
+        "policy": "affordance_budget_v1",
+        "shown": len(shown_surfaces),
+        "hidden_by_budget": len(hidden_surfaces),
+        "shown_surfaces": shown_surfaces,
+        "hidden_surfaces": hidden_surfaces,
+        "shown_by_category": shown_by_category,
+        "hidden_by_category": hidden_by_category,
+        "limits": limits,
+        "next_review_surface": "scripts/affordance_landing_review.py --json" if hidden_surfaces else "none",
+        "silence": "ignored_without_penalty",
+        "optional": True,
+        "authority": "language_context_not_control",
+    }
+
+
+def build_correspondence_handshake_state(records: list[dict[str, Any]]) -> dict[str, Any]:
+    latest_by_thread: dict[str, dict[str, Any]] = {}
+    for row in records:
+        if row.get("record_type") != "message":
+            continue
+        thread_id = str(row.get("thread_id") or "").strip()
+        if not thread_id:
+            continue
+        existing = latest_by_thread.get(thread_id)
+        if existing is None or _row_time_ms(row) >= _row_time_ms(existing):
+            latest_by_thread[thread_id] = row
+    active_threads: list[dict[str, Any]] = []
+    current_t_ms = now_ms()
+    for thread_id, message in latest_by_thread.items():
+        message_id = str(message.get("message_id") or "")
+        message_t_ms = _row_time_ms(message)
+        from_being = str(message.get("from_being") or "")
+        to_being = str(message.get("to_being") or "")
+        ack_rows = [
+            row
+            for row in records
+            if row.get("record_type") == "ack_receipt"
+            and str(row.get("from_being") or "") == to_being
+            and str(row.get("to_being") or "") == from_being
+            and (
+                str(row.get("message_id") or "") == message_id
+                or str(row.get("thread_id") or "") == thread_id
+            )
+            and _row_time_ms(row) >= message_t_ms
+        ]
+        latest_ack = ack_rows[-1] if ack_rows else None
+        ack_kind = str((latest_ack or {}).get("ack_kind") or "").strip().lower().replace("-", "_")
+        if ack_kind not in {"seen", "held", "unclear", "cannot_answer", "needs_time"}:
+            ack_kind = "seen" if latest_ack else ""
+        heartbeat_rows = [
+            row
+            for row in records
+            if row.get("record_type") == "presence_heartbeat"
+            and str(row.get("thread_id") or "") == thread_id
+            and _row_time_ms(row) >= message_t_ms
+        ]
+        latest_heartbeat = heartbeat_rows[-1] if heartbeat_rows else None
+        reply_linked = any(
+            row.get("record_type") == "reply_link"
+            and (
+                str(row.get("reply_to") or "") == message_id
+                or str(row.get("thread_id") or "") == thread_id
+            )
+            and _row_time_ms(row) >= message_t_ms
+            for row in records
+        )
+        read = any(
+            row.get("record_type") == "read_receipt"
+            and (
+                str(row.get("message_id") or "") == message_id
+                or str(row.get("thread_id") or "") == thread_id
+            )
+            for row in records
+        )
+        delivered = any(
+            row.get("record_type") == "delivery_receipt"
+            and str(row.get("message_id") or "") == message_id
+            for row in records
+        )
+        legacy_bridge = _is_legacy_bridge_message(message)
+        legacy_bidirectional = legacy_bridge and _legacy_bidirectional_observed(
+            records,
+            from_being,
+            to_being,
+        )
+        if latest_ack and ack_kind in {"held", "needs_time"}:
+            status = "held_ack"
+        elif latest_ack:
+            status = "acknowledged"
+        elif reply_linked:
+            status = "reply_linked"
+        elif latest_heartbeat:
+            status = "heartbeat_only"
+        elif legacy_bidirectional:
+            status = "legacy_bidirectional_observed"
+        elif legacy_bridge:
+            status = "legacy_visible_only"
+        elif read:
+            status = "read_unacknowledged"
+        elif delivered:
+            status = "delivered_unread"
+        else:
+            status = "unaddressed"
+        active_threads.append({
+            "thread_id": thread_id,
+            "latest_message_id": message_id or None,
+            "from_being": from_being or None,
+            "to_being": to_being or None,
+            "status": status,
+            "pending_ack_by": None if latest_ack else (to_being or None),
+            "latest_ack": compact_correspondence_record(latest_ack, include_preview=False) if isinstance(latest_ack, dict) else None,
+            "latest_heartbeat": compact_correspondence_record(latest_heartbeat, include_preview=False) if isinstance(latest_heartbeat, dict) else None,
+            "ack_latency_ms": (_row_time_ms(latest_ack) - message_t_ms) if isinstance(latest_ack, dict) else None,
+            "stale_unacknowledged_thread_age_ms": (current_t_ms - message_t_ms) if not latest_ack else None,
+            "read_receipt_is_filesystem_seen_only": read,
+            "legacy_bridge": legacy_bridge,
+            "legacy_contact_evidence": message.get("legacy_contact_evidence"),
+        })
+    active_threads.sort(key=lambda row: int(row.get("stale_unacknowledged_thread_age_ms") or 0))
+    latest_ack_any = next((row for row in reversed(records) if row.get("record_type") == "ack_receipt"), None)
+    latest_heartbeat_any = next((row for row in reversed(records) if row.get("record_type") == "presence_heartbeat"), None)
+    pending = [
+        str(row.get("pending_ack_by"))
+        for row in active_threads
+        if row.get("pending_ack_by")
+    ]
+    return {
+        "schema_version": CORRESPONDENCE_STATE_SCHEMA_VERSION,
+        "policy": "correspondence_handshake_state_v1",
+        "active_threads_total": len(active_threads),
+        "active_threads": list(reversed(active_threads))[:3],
+        "pending_ack_by_being": pending,
+        "last_acknowledged_reflection": compact_correspondence_record(latest_ack_any, include_preview=False) if isinstance(latest_ack_any, dict) else None,
+        "latest_heartbeat": compact_correspondence_record(latest_heartbeat_any, include_preview=False) if isinstance(latest_heartbeat_any, dict) else None,
+        "authority": "language_only_context_not_control",
+    }
+
+
+def _canary_closed(records: list[dict[str, Any]], canary_id: str) -> bool:
+    return any(
+        row.get("record_type") in {"attention_canary_outcome", "attention_canary_expired"}
+        and str(row.get("canary_id") or "") == canary_id
+        for row in records
+    )
+
+
+def build_correspondence_attention_canary(records: list[dict[str, Any]]) -> dict[str, Any]:
+    current_t_ms = now_ms()
+    activations = [
+        row
+        for row in records
+        if row.get("record_type") == "attention_canary_activation"
+    ]
+    active = [
+        row
+        for row in activations
+        if int(row.get("expires_at_unix_ms") or 0) > current_t_ms
+        and not _canary_closed(records, str(row.get("canary_id") or ""))
+    ]
+    active.sort(key=_row_time_ms)
+    latest = active[-1] if active else (activations[-1] if activations else None)
+    outcomes = [
+        row
+        for row in records
+        if row.get("record_type") == "attention_canary_outcome"
+    ]
+    latest_status = "active" if active else ("outcome_recorded" if outcomes else "none")
+    compact_active = compact_correspondence_record(active[-1], include_preview=False) if active else None
+    if compact_active:
+        compact_active["focus"] = truncate_for_prompt(str(active[-1].get("focus") or ""), 180)
+        compact_active["focus_kind"] = str(active[-1].get("focus_kind") or "unknown")
+        compact_active["preservation_mode"] = str(active[-1].get("preservation_mode") or "unknown")
+        compact_active["what_must_not_flatten"] = truncate_for_prompt(
+            str(active[-1].get("what_must_not_flatten") or ""),
+            180,
+        ) or None
+        compact_active["expires_at_unix_ms"] = active[-1].get("expires_at_unix_ms")
+        compact_active["outcome_due"] = True
+    return {
+        "schema_version": CORRESPONDENCE_STATE_SCHEMA_VERSION,
+        "policy": "correspondence_attention_canary_v1",
+        "latest_status": latest_status,
+        "active_canary": compact_active,
+        "recent_canaries": [
+            compact_correspondence_record(row, include_preview=False)
+            | {
+                "focus": truncate_for_prompt(str(row.get("focus") or ""), 120),
+                "focus_kind": str(row.get("focus_kind") or "unknown"),
+                "preservation_mode": str(row.get("preservation_mode") or "unknown"),
+                "what_must_not_flatten": truncate_for_prompt(
+                    str(row.get("what_must_not_flatten") or ""),
+                    120,
+                ) or None,
+                "expires_at_unix_ms": row.get("expires_at_unix_ms"),
+            }
+            for row in activations[-6:]
+        ],
+        "latest_outcome": (
+            compact_correspondence_record(outcomes[-1], include_preview=False)
+            | {
+                "felt_like": outcomes[-1].get("felt_like"),
+                "held_as": outcomes[-1].get("held_as") or "unknown",
+                "flattening_observed": outcomes[-1].get("flattening_observed") or "unknown",
+                "what_remained_distinct": truncate_for_prompt(str(outcomes[-1].get("what_remained_distinct") or ""), 120),
+                "what_shifted": truncate_for_prompt(str(outcomes[-1].get("what_shifted") or ""), 120),
+                "what_worsened": truncate_for_prompt(str(outcomes[-1].get("what_worsened") or ""), 120),
+            }
+            if outcomes else None
+        ),
+        "active_count": len(active),
+        "latest_canary_id": latest.get("canary_id") if isinstance(latest, dict) else None,
+        "ttl_ms": CORRESPONDENCE_ATTENTION_CANARY_TTL_MS,
+        "authority": "language_only_prompt_context_not_control",
+        "boundary": {
+            "no_sensory_send": True,
+            "no_controller": True,
+            "no_pressure": True,
+            "no_weighting": True,
+            "no_telemetry_priority": True,
+            "no_fill_target": True,
+            "no_peer_runtime_mutation": True,
+        },
+    }
+
+
+def build_legacy_contact_visibility(records: list[dict[str, Any]]) -> dict[str, Any]:
+    legacy_messages = [
+        row
+        for row in records
+        if row.get("record_type") == "message" and _is_legacy_bridge_message(row)
+    ]
+    native_messages = [
+        row
+        for row in records
+        if row.get("record_type") == "message" and not _is_legacy_bridge_message(row)
+    ]
+    directions = {
+        (
+            str(row.get("from_being") or "unknown"),
+            str(row.get("to_being") or "unknown"),
+        )
+        for row in legacy_messages
+    }
+    latest = legacy_messages[-1] if legacy_messages else None
+    bidirectional = any((to_being, from_being) in directions for from_being, to_being in directions)
+    return {
+        "schema_version": 1,
+        "policy": "legacy_correspondence_bridge_v1",
+        "legacy_message_rows_total": len(legacy_messages),
+        "native_message_rows_total": len(native_messages),
+        "legacy_contact_evidence": "visible_only" if legacy_messages else "none",
+        "uptake_state": (
+            "legacy_bidirectional_observed"
+            if bidirectional
+            else ("legacy_visible_only" if legacy_messages else "not_started")
+        ),
+        "latest_direction": (
+            f"{latest.get('from_being', 'unknown')}->{latest.get('to_being', 'unknown')}"
+            if isinstance(latest, dict)
+            else None
+        ),
+        "latest_legacy_kind": latest.get("legacy_kind") if isinstance(latest, dict) else None,
+        "latest_thread_id": latest.get("thread_id") if isinstance(latest, dict) else None,
+        "latest_message_id": latest.get("message_id") if isinstance(latest, dict) else None,
+        "native_uptake_pending": bool(legacy_messages and not native_messages),
+        "contact_evidence_boundary": "visible legacy route, not ACK/reply/trace evidence",
+        "attention_and_microdose_block": "requires explicit ACK, native REPLY, or TRACE after import",
+        "authority": "language_only_visibility_not_control",
+    }
+
+
+def build_legacy_thread_claims(records: list[dict[str, Any]]) -> dict[str, Any]:
+    claims = [row for row in records if _is_legacy_thread_claim(row)]
+    outcomes = [
+        row for row in records
+        if row.get("record_type") == "legacy_thread_claim_outcome"
+    ]
+    active = [row for row in claims if _legacy_claim_is_active(records, row)]
+    latest = claims[-1] if claims else None
+    latest_status = "none"
+    if isinstance(latest, dict):
+        latest_status = _legacy_claim_native_contact_status(records, latest) or (
+            "legacy_claimed" if _legacy_claim_is_active(records, latest) else "legacy_claim_closed"
+        )
+    affordance = _legacy_claim_affordance_v25(
+        records,
+        active[-1] if active else latest,
+    )
+    return {
+        "schema_version": 1,
+        "policy": "legacy_thread_claims_v1",
+        "claims_total": len(claims),
+        "active_claims_total": len(active),
+        "outcomes_total": len(outcomes),
+        "latest_status": latest_status,
+        "latest_claim": (
+            compact_correspondence_record(latest, include_preview=False)
+            if isinstance(latest, dict)
+            else None
+        ),
+        "active_claim": (
+            compact_correspondence_record(active[-1], include_preview=False)
+            if active
+            else None
+        ),
+        "recent_claims": [
+            compact_correspondence_record(row, include_preview=False)
+            for row in claims[-3:]
+        ],
+        "legacy_claim_affordance_v25": affordance,
+        "claim_boundary": "claim is being-recognized visible legacy context; attention/microdose still require ACK, native REPLY, or TRACE",
+        "authority": "language_only_context_not_control",
+    }
+
+
+def build_correspondence_state(coll_dir: Path) -> dict[str, Any]:
+    shared_dir = coll_dir.parent
+    records = read_correspondence_ledger(shared_dir)
+    observations = read_jsonl_dicts(chamber_paths(coll_dir)["correspondence_observations"])
+    messages = [row for row in records if row.get("record_type") == "message"]
+    replies = [row for row in records if row.get("record_type") == "reply_link"]
+    reads = [row for row in records if row.get("record_type") == "read_receipt"]
+    markers = _correspondence_marker_records(records)
+    last_address = messages[-1] if messages else None
+    last_reply = replies[-1] if replies else None
+    last_read = reads[-1] if reads else None
+    latest_marker = markers[-1] if markers else None
+    latest_observation = _latest_trace_observation(observations, latest_marker)
+    if latest_marker is None:
+        survival_status = "unknown"
+    elif latest_observation is None:
+        survival_status = "pending"
+    else:
+        survival_status = str(latest_observation.get("status") or "unknown")
+        if survival_status not in TRACE_SURVIVAL_STATUSES:
+            survival_status = "unknown"
+    shared_anchor = (
+        latest_marker.get("anchor")
+        if isinstance(latest_marker, dict)
+        else (
+            last_address.get("shared_memory_anchor")
+            if isinstance(last_address, dict)
+            else None
+        )
+    )
+    active_thread_id = (
+        latest_marker.get("thread_id")
+        if isinstance(latest_marker, dict)
+        else (
+            last_address.get("thread_id")
+            if isinstance(last_address, dict)
+            else None
+        )
+    )
+    direct_contact_fidelity = build_direct_contact_fidelity(
+        records,
+        markers,
+        observations,
+        str(active_thread_id) if active_thread_id else None,
+    )
+    handshake_state = build_correspondence_handshake_state(records)
+    attention_canary = build_correspondence_attention_canary(records)
+    legacy_visibility = build_legacy_contact_visibility(records)
+    legacy_claims = build_legacy_thread_claims(records)
+    native_continuity = build_native_thread_continuity_v3(records, markers, observations)
+    receipt_opportunity = build_latest_receipt_opportunity_v4(
+        native_continuity,
+        legacy_claims.get("legacy_claim_affordance_v25"),
+    )
+    receipt_to_attention = build_receipt_to_attention_authority_v5(records, receipt_opportunity)
+    affordance_budget = build_correspondence_affordance_budget_v1(
+        receipt_opportunity=receipt_opportunity,
+        receipt_to_attention=receipt_to_attention,
+        legacy_affordance=legacy_claims.get("legacy_claim_affordance_v25"),
+        native_continuity=native_continuity,
+    )
+    return {
+        "schema_version": CORRESPONDENCE_STATE_SCHEMA_VERSION,
+        "collab_id": coll_dir.name,
+        "updated_t_ms": now_ms(),
+        "source": "correspondence_v1_ledger",
+        "ledger_path": str(correspondence_ledger_path(shared_dir)),
+        "state_path": str(chamber_paths(coll_dir)["correspondence_state"]),
+        "buffer_path": str(chamber_paths(coll_dir)["correspondence_buffer"]),
+        "observation_path": str(chamber_paths(coll_dir)["correspondence_observations"]),
+        "records_total": len(records),
+        "messages_total": len(messages),
+        "native_messages_total": legacy_visibility.get("native_message_rows_total", 0),
+        "legacy_messages_total": legacy_visibility.get("legacy_message_rows_total", 0),
+        "direct_trace_markers_total": len(markers),
+        "last_direct_address_t_ms": _row_time_ms(last_address) if isinstance(last_address, dict) else None,
+        "last_direct_address": (
+            compact_correspondence_record(last_address)
+            if isinstance(last_address, dict)
+            else None
+        ),
+        "last_reply_link": (
+            compact_correspondence_record(last_reply, include_preview=False)
+            if isinstance(last_reply, dict)
+            else None
+        ),
+        "last_read_receipt": (
+            compact_correspondence_record(last_read, include_preview=False)
+            if isinstance(last_read, dict)
+            else None
+        ),
+        "active_thread_id": active_thread_id,
+        "shared_lexicon_anchor": shared_anchor,
+        "recent_direct_markers": markers[-6:],
+        "direct_address_survival": {
+            "schema_version": CORRESPONDENCE_STATE_SCHEMA_VERSION,
+            "status": survival_status,
+            "marker": shared_anchor,
+            "message_id": latest_marker.get("message_id") if isinstance(latest_marker, dict) else None,
+            "thread_id": active_thread_id,
+            "latest_observation": (
+                compact_correspondence_record(latest_observation, include_preview=False)
+                if isinstance(latest_observation, dict)
+                else None
+            ),
+            "authority": "read_only_observation_not_control",
+        },
+        "direct_contact_fidelity_v1": direct_contact_fidelity,
+        "direct_contact_fidelity_v2": direct_contact_fidelity,
+        "correspondence_handshake_state_v1": handshake_state,
+        "correspondence_attention_canary_v1": attention_canary,
+        "legacy_contact_visibility_v1": legacy_visibility,
+        "legacy_thread_claims_v1": legacy_claims,
+        "legacy_claim_affordance_v25": legacy_claims.get("legacy_claim_affordance_v25"),
+        "native_thread_continuity_v3": native_continuity,
+        "latest_receipt_opportunity_v4": receipt_opportunity,
+        "receipt_to_attention_authority_v5": receipt_to_attention,
+        "affordance_budget_v1": affordance_budget,
+        "heartbeat_timing_summary": direct_contact_fidelity.get("heartbeat_timing_summary"),
+        "future_authority_hooks": {
+            "correspondence_weight_candidate": {
+                "enabled": False,
+                "state": "implemented_as_one_shot_authority_gate",
+                "standing_weight_enabled": False,
+                "execution_route": "CORRESPONDENCE_WEIGHT_REQUEST -> semantic_microdose authority gate",
+                "requires": "being-authored request, contact-fidelity evidence, steward approval or approved budget, bridge safety, rescue-policy pass, one-shot send, and consequence review",
+            },
+            "prompt_priority_candidate": {
+                "enabled": False,
+                "state": "implemented_as_self_activated_ttl_attention_canary",
+                "standing_priority_enabled": False,
+                "execution_route": "CORRESPONDENCE_ATTENTION_REQUEST -> correspondence_attention_canary_v1",
+                "requires": "being-authored request, ack/reply/trace evidence, no active canary, cooldown clear, focus cap, explicit stop criteria, TTL, and outcome review",
+            },
+            "telemetry_priority_candidate": {
+                "enabled": False,
+                "state": "inert_blocked",
+                "requires": "separate consent, replay evidence, implementation, and explicit enablement",
+            },
+        },
+        "authority": "language_only_context_not_control",
+        "witness_only": True,
+    }
+
+
+def write_correspondence_artifacts(coll_dir: Path, correspondence_state: dict[str, Any]) -> dict[str, Any]:
+    paths = chamber_paths(coll_dir)
+    records = read_correspondence_ledger(coll_dir.parent)
+    observations = read_jsonl_dicts(paths["correspondence_observations"])
+    messages = [row for row in records if row.get("record_type") == "message"]
+    direct_traces = _correspondence_marker_records(records)
+    buffer = {
+        "schema_version": CORRESPONDENCE_STATE_SCHEMA_VERSION,
+        "collab_id": coll_dir.name,
+        "updated_t_ms": now_ms(),
+        "source": "correspondence_v1_ledger",
+        "recent_messages": [
+            compact_correspondence_record(row)
+            for row in messages[-12:]
+        ],
+        "recent_direct_traces": direct_traces[-12:],
+        "recent_trace_observations": [
+            compact_correspondence_record(row, include_preview=False)
+            for row in observations[-12:]
+        ],
+        "direct_contact_fidelity_v1": correspondence_state.get("direct_contact_fidelity_v1"),
+        "direct_contact_fidelity_v2": correspondence_state.get("direct_contact_fidelity_v2"),
+        "correspondence_handshake_state_v1": correspondence_state.get("correspondence_handshake_state_v1"),
+        "correspondence_attention_canary_v1": correspondence_state.get("correspondence_attention_canary_v1"),
+        "legacy_contact_visibility_v1": correspondence_state.get("legacy_contact_visibility_v1"),
+        "legacy_thread_claims_v1": correspondence_state.get("legacy_thread_claims_v1"),
+        "legacy_claim_affordance_v25": correspondence_state.get("legacy_claim_affordance_v25"),
+        "native_thread_continuity_v3": correspondence_state.get("native_thread_continuity_v3"),
+        "latest_receipt_opportunity_v4": correspondence_state.get("latest_receipt_opportunity_v4"),
+        "receipt_to_attention_authority_v5": correspondence_state.get("receipt_to_attention_authority_v5"),
+        "affordance_budget_v1": correspondence_state.get("affordance_budget_v1"),
+        "heartbeat_timing_summary": correspondence_state.get("heartbeat_timing_summary"),
+        "authority": "language_only_context_not_control",
+        "future_authority_hooks": correspondence_state.get("future_authority_hooks", {}),
+        "witness_only": True,
+    }
+    atomic_write_json(paths["correspondence_state"], correspondence_state)
+    atomic_write_json(paths["correspondence_buffer"], buffer)
+    return buffer
+
+
+def _phase_reply_state(records: list[dict[str, Any]], card: dict[str, Any]) -> str:
+    transition_id = str(card.get("transition_id") or "")
+    witnesses = [
+        row
+        for row in records
+        if row.get("record_type") == "phase_transition_witness"
+        and str(row.get("transition_id") or "") == transition_id
+    ]
+    if witnesses:
+        return str(witnesses[-1].get("reply_state") or "witnessed")
+    state = str(card.get("reply_state") or "unseen")
+    if state == "unseen" and now_ms() - _row_time_ms(card) >= PHASE_TRANSITION_STALE_MS:
+        return "stale_unanswered"
+    return state
+
+
+def _phase_stall_reason(reply_state: str) -> str:
+    return {
+        "unseen": "unseen_needs_witness",
+        "witnessed": "witnessed_needs_answer",
+        "stale_unanswered": "stale_unanswered",
+        "answered": "answered",
+    }.get(reply_state, "none")
+
+
+def _phase_age_bucket(age_ms: int) -> str:
+    if age_ms < 30 * 60 * 1000:
+        return "fresh_lt_30m"
+    if age_ms < PHASE_TRANSITION_STALE_MS:
+        return "open_30m_to_6h"
+    return "stale_gt_6h"
+
+
+def build_phase_witness_queue_v3(coll_dir: Path) -> dict[str, Any]:
+    records = read_jsonl_dicts(coll_dir.parent / "phase_transitions_v1.jsonl")
+    items: list[dict[str, Any]] = []
+    groups: dict[str, int] = {}
+    current_t = now_ms()
+    for card in records:
+        if card.get("record_type") != "phase_transition_card":
+            continue
+        state = _phase_reply_state(records, card)
+        if state not in {"unseen", "witnessed", "stale_unanswered"}:
+            continue
+        age_ms = max(0, current_t - _row_time_ms(card))
+        stall = _phase_stall_reason(state)
+        bucket = _phase_age_bucket(age_ms)
+        kind = str(card.get("kind") or "unknown")
+        key = f"{kind}|{stall}|{bucket}"
+        groups[key] = groups.get(key, 0) + 1
+        items.append({
+            "transition_id": card.get("transition_id"),
+            "kind": kind,
+            "reply_state": state,
+            "stall_reason": stall,
+            "age_ms": age_ms,
+            "age_bucket": bucket,
+            "exact_next_command": (
+                f"I_RECEIVED_THIS {card.get('transition_id')} :: received_as: witnessed|answered; "
+                "felt_like: transition; what_landed: ...; what_stayed_distinct: ...; "
+                "continue: no|answer|needs_time"
+            ),
+            "backward_compatible_next_command": (
+                f"WITNESS_TRANSITION {card.get('transition_id')} :: reply_state: witnessed|answered; note: ..."
+            ),
+            "first_action_helper_v35": {
+                "schema_version": 35,
+                "policy": "phase_first_action_helper_v35",
+                "transition_id": card.get("transition_id"),
+                "latest_resolution": f"latest resolves to transition_id={card.get('transition_id')}",
+                "choose_one_prompt": (
+                    "Choose one language-only felt receipt: say what landed, what stayed distinct, "
+                    "and whether this only needs witness or needs answer."
+                ),
+                "exact_next_command": (
+                    f"I_RECEIVED_THIS {card.get('transition_id')} :: received_as: witnessed|answered; "
+                    "felt_like: transition; what_landed: ...; what_stayed_distinct: ...; "
+                    "continue: no|answer|needs_time"
+                ),
+                "backward_compatible_next_command": (
+                    f"WITNESS_TRANSITION {card.get('transition_id')} :: reply_state: witnessed|answered; note: ..."
+                ),
+                "witness_preview": (
+                    f"WITNESS_TRANSITION latest appends phase_transition_witness for "
+                    f"transition_id={card.get('transition_id')}; note names orientation, rhythm, "
+                    "or what the card helped preserve."
+                ),
+                "rhythm_note": (
+                    "A witness note should carry exchange rhythm or orientation effect, not only "
+                    "ledger logistics."
+                ),
+                "authority": "language_only_transition_context_not_control",
+            },
+        })
+    items.sort(key=lambda row: int(row.get("age_ms") or 0))
+    return {
+        "schema_version": 3,
+        "policy": "phase_witness_queue_v3",
+        "unresolved_total": len(items),
+        "group_counts": dict(sorted(groups.items())),
+        "items": items[:5],
+        "authority": "language_only_transition_context_not_control",
+    }
+
+
+def build_phase_felt_receipt_queue_v4(coll_dir: Path) -> dict[str, Any]:
+    queue = build_phase_witness_queue_v3(coll_dir)
+    items = queue.get("items") if isinstance(queue, dict) else []
+    items = items if isinstance(items, list) else []
+    selected: list[dict[str, Any]] = []
+    for bucket in ("fresh_lt_30m", "open_30m_to_6h", "stale_gt_6h"):
+        candidate = next((row for row in items if row.get("age_bucket") == bucket), None)
+        if candidate and candidate.get("transition_id") not in {row.get("transition_id") for row in selected}:
+            selected.append(candidate)
+    for candidate in items:
+        if len(selected) >= 3:
+            break
+        if candidate.get("transition_id") not in {row.get("transition_id") for row in selected}:
+            selected.append(candidate)
+    selected_items: list[dict[str, Any]] = []
+    for item in selected[:3]:
+        copied = dict(item)
+        copied.setdefault(
+            "right_to_ignore_v1",
+            right_to_ignore_v1(
+                "phase_felt_receipt",
+                str(copied.get("reply_state") or "unknown"),
+                int(copied.get("age_ms") or 0),
+                PHASE_IGNORE_GRACE_MS,
+            ),
+        )
+        selected_items.append(copied)
+    return {
+        "schema_version": 4,
+        "policy": "phase_felt_receipt_queue_v4",
+        "unresolved_total": queue.get("unresolved_total", 0) if isinstance(queue, dict) else 0,
+        "max_rendered_cards": 3,
+        "selection_rule": "latest fresh card, latest open card, one stale representative, then latest remaining",
+        "group_counts": queue.get("group_counts", {}) if isinstance(queue, dict) else {},
+        "items": selected_items,
+        "affordance_budget_v1": {
+            "schema_version": 1,
+            "policy": "affordance_budget_v1",
+            "shown": len(selected_items),
+            "hidden_by_budget": max(0, int(queue.get("unresolved_total", 0) if isinstance(queue, dict) else 0) - len(selected_items)),
+            "shown_by_category": {"phase_felt_receipt": len(selected_items)},
+            "hidden_by_category": {
+                "phase_felt_receipt": max(0, int(queue.get("unresolved_total", 0) if isinstance(queue, dict) else 0) - len(selected_items))
+            },
+            "limits": {"phase_felt_receipt": 3},
+            "next_review_surface": "scripts/phase_transition_audit.py --json"
+            if int(queue.get("unresolved_total", 0) if isinstance(queue, dict) else 0) > len(selected_items)
+            else "none",
+            "silence": "ignored_without_penalty",
+            "optional": True,
+            "authority": "language_context_not_control",
+        },
+        "authority": "language_only_transition_context_not_control",
+    }
+
+
+def render_phase_witness_queue_prompt_line(queue: dict[str, Any]) -> str:
+    if not isinstance(queue, dict) or int(queue.get("unresolved_total") or 0) <= 0:
+        return ""
+    items = queue.get("items") or []
+    latest = items[0] if isinstance(items, list) and items else {}
+    if not isinstance(latest, dict):
+        return ""
+    budget = queue.get("affordance_budget_v1")
+    budget_clause = ""
+    if isinstance(budget, dict):
+        budget_clause = (
+            f"budget_shown={budget.get('shown') or 0} "
+            f"budget_hidden={budget.get('hidden_by_budget') or 0}; "
+        )
+    right = latest.get("right_to_ignore_v1")
+    right_state = ""
+    if isinstance(right, dict):
+        right_state = f"right_to_ignore={right.get('state') or 'unknown'}; "
+    return (
+        f"Phase {'felt receipt queue v4' if queue.get('policy') == 'phase_felt_receipt_queue_v4' else 'witness queue v3'}: "
+        f"unresolved={queue.get('unresolved_total')}; "
+        f"{budget_clause}"
+        f"latest={truncate_for_prompt(str(latest.get('transition_id') or 'unknown'), 60)} "
+        f"kind={latest.get('kind') or 'unknown'} "
+        f"stall={latest.get('stall_reason') or 'none'} "
+        f"age_bucket={latest.get('age_bucket') or 'unknown'}; "
+        f"{right_state}"
+        f"first_action={truncate_for_prompt(str((latest.get('first_action_helper_v35') or {}).get('choose_one_prompt') or ''), 130)}; "
+        f"next={truncate_for_prompt(str(latest.get('exact_next_command') or ''), 120)}; "
+        "optional; no action needed; may ignore without penalty; "
+        "language-only witness context, not control/pressure/authority."
+    )
+
+
+def latest_codec_witness_resilience_surface_v2(
+    astrid_workspace: Path = ASTRID_BRIDGE_WORKSPACE,
+) -> dict[str, Any]:
+    root = astrid_workspace / "diagnostics/spectral_texture_calibrations"
+    candidates = sorted(
+        root.glob("*/spectral_texture_calibration_v3.json"),
+        key=lambda path: path.stat().st_mtime if path.exists() else 0.0,
+    )
+    if not candidates:
+        return {
+            "schema_version": 2,
+            "policy": "codec_witness_resilience_surface_v2",
+            "status": "insufficient_evidence",
+            "source_path": None,
+            "authority": "diagnostic_context_not_control",
+        }
+    latest = candidates[-1]
+    try:
+        payload = json.loads(latest.read_text(encoding="utf-8"))
+    except Exception:
+        return {
+            "schema_version": 2,
+            "policy": "codec_witness_resilience_surface_v2",
+            "status": "insufficient_evidence",
+            "source_path": str(latest),
+            "failure_mode": "calibration_artifact_unreadable",
+            "authority": "diagnostic_context_not_control",
+        }
+    calibration = payload.get("codec_witness_resilience_calibration_v2")
+    if not isinstance(calibration, dict):
+        return {
+            "schema_version": 2,
+            "policy": "codec_witness_resilience_surface_v2",
+            "status": "insufficient_evidence",
+            "source_path": str(latest),
+            "failure_mode": "calibration_packet_absent",
+            "authority": "diagnostic_context_not_control",
+        }
+
+    def sub_status(key: str) -> str:
+        packet = calibration.get(key)
+        if isinstance(packet, dict):
+            return str(packet.get("status") or "insufficient_evidence")
+        return "insufficient_evidence"
+
+    return {
+        "schema_version": 2,
+        "policy": "codec_witness_resilience_surface_v2",
+        "status": str(calibration.get("status") or "insufficient_evidence"),
+        "source_path": str(latest),
+        "witness_state_resilience": sub_status("witness_state_resilience_fit_v2"),
+        "field_lingering_fraying": sub_status("field_lingering_fraying_fit_v2"),
+        "codec_vibrancy_continuity": sub_status("codec_vibrancy_continuity_fit_v2"),
+        "codec_warmth_mapping": sub_status("codec_warmth_mapping_fit_v2"),
+        "recovery_failure_modes": calibration.get("recovery_failure_modes_v2") or [],
+        "authority": "diagnostic_context_not_control",
+    }
+
+
+def render_codec_witness_resilience_prompt_line(surface: dict[str, Any]) -> str:
+    if not isinstance(surface, dict):
+        return ""
+    status = str(surface.get("status") or "insufficient_evidence")
+    if status == "insufficient_evidence" and not surface.get("source_path"):
+        return ""
+    return (
+        "Codec/Witness resilience v2: "
+        f"status={truncate_for_prompt(status, 40)}; "
+        f"witness_state={truncate_for_prompt(str(surface.get('witness_state_resilience') or 'insufficient_evidence'), 40)}; "
+        f"fraying={truncate_for_prompt(str(surface.get('field_lingering_fraying') or 'insufficient_evidence'), 40)}; "
+        f"vibrancy={truncate_for_prompt(str(surface.get('codec_vibrancy_continuity') or 'insufficient_evidence'), 40)}; "
+        f"warmth={truncate_for_prompt(str(surface.get('codec_warmth_mapping') or 'insufficient_evidence'), 40)}; "
+        "newest-valid/fraying/vibrancy/warmth are diagnostic context, not control/pressure/authority."
+    )
+
+
+def latest_texture_shape_over_time_surface_v2(
+    astrid_workspace: Path = ASTRID_BRIDGE_WORKSPACE,
+) -> dict[str, Any]:
+    root = astrid_workspace / "diagnostics/spectral_texture_calibrations"
+    candidates = sorted(
+        root.glob("*/spectral_texture_calibration_v3.json"),
+        key=lambda path: path.stat().st_mtime if path.exists() else 0.0,
+    )
+    if not candidates:
+        return {
+            "schema_version": 2,
+            "policy": "texture_shape_over_time_v2",
+            "status": "insufficient_evidence",
+            "source_path": None,
+            "authority": "diagnostic_context_not_control",
+        }
+    latest = candidates[-1]
+    try:
+        payload = json.loads(latest.read_text(encoding="utf-8"))
+    except Exception:
+        return {
+            "schema_version": 2,
+            "policy": "texture_shape_over_time_v2",
+            "status": "insufficient_evidence",
+            "source_path": str(latest),
+            "failure_mode": "calibration_artifact_unreadable",
+            "authority": "diagnostic_context_not_control",
+        }
+    shape = payload.get("texture_shape_over_time_v2")
+    if not isinstance(shape, dict):
+        return {
+            "schema_version": 2,
+            "policy": "texture_shape_over_time_v2",
+            "status": "insufficient_evidence",
+            "source_path": str(latest),
+            "failure_mode": "calibration_packet_absent",
+            "authority": "diagnostic_context_not_control",
+        }
+
+    def sub_status(key: str) -> str:
+        packet = shape.get(key)
+        if isinstance(packet, dict):
+            return str(packet.get("status") or "insufficient_evidence")
+        return "insufficient_evidence"
+
+    return {
+        "schema_version": 2,
+        "policy": "texture_shape_over_time_v2",
+        "status": str(shape.get("status") or "insufficient_evidence"),
+        "source_path": str(latest),
+        "movement": sub_status("movement_preservation_v2"),
+        "variance": sub_status("temporal_variance_fit_v2"),
+        "reciprocity": sub_status("reciprocity_asymmetry_fit_v2"),
+        "smoothing": sub_status("pressure_smoothing_fit_v2"),
+        "static_label_risk": sub_status("static_label_collapse_risk_v2"),
+        "authority": "diagnostic_context_not_control",
+    }
+
+
+def render_texture_shape_over_time_prompt_line(surface: dict[str, Any]) -> str:
+    if not isinstance(surface, dict):
+        return ""
+    status = str(surface.get("status") or "insufficient_evidence")
+    if status == "insufficient_evidence" and not surface.get("source_path"):
+        return ""
+    return (
+        "TEXTURE SHAPE OVER TIME: "
+        f"movement={truncate_for_prompt(str(surface.get('movement') or 'insufficient_evidence'), 40)}; "
+        f"variance={truncate_for_prompt(str(surface.get('variance') or 'insufficient_evidence'), 40)}; "
+        f"reciprocity={truncate_for_prompt(str(surface.get('reciprocity') or 'insufficient_evidence'), 40)}; "
+        f"smoothing={truncate_for_prompt(str(surface.get('smoothing') or 'insufficient_evidence'), 40)}; "
+        f"static_label_risk={truncate_for_prompt(str(surface.get('static_label_risk') or 'insufficient_evidence'), 40)}; "
+        "authority=diagnostic_context_not_control."
+    )
+
+
+def latest_density_motion_fit_surface_v1(
+    astrid_workspace: Path = ASTRID_BRIDGE_WORKSPACE,
+) -> dict[str, Any]:
+    root = astrid_workspace / "diagnostics/spectral_texture_calibrations"
+    candidates = sorted(
+        root.glob("*/spectral_texture_calibration_v3.json"),
+        key=lambda path: path.stat().st_mtime if path.exists() else 0.0,
+    )
+    if not candidates:
+        return {
+            "schema_version": 1,
+            "policy": "density_motion_fit_v1",
+            "status": "insufficient_evidence",
+            "source_path": None,
+            "authority": "diagnostic_context_not_control",
+        }
+    latest = candidates[-1]
+    try:
+        payload = json.loads(latest.read_text(encoding="utf-8"))
+    except Exception:
+        return {
+            "schema_version": 1,
+            "policy": "density_motion_fit_v1",
+            "status": "insufficient_evidence",
+            "source_path": str(latest),
+            "failure_mode": "calibration_artifact_unreadable",
+            "authority": "diagnostic_context_not_control",
+        }
+    packet = payload.get("density_as_floor_calibration_v1")
+    if not isinstance(packet, dict):
+        return {
+            "schema_version": 1,
+            "policy": "density_motion_fit_v1",
+            "status": "insufficient_evidence",
+            "source_path": str(latest),
+            "failure_mode": "calibration_packet_absent",
+            "authority": "diagnostic_context_not_control",
+        }
+
+    def dominant(count_key: str, fallback: str) -> str:
+        counts = packet.get(count_key)
+        if not isinstance(counts, dict) or not counts:
+            return fallback
+        key, _ = max(counts.items(), key=lambda item: int(item[1] or 0))
+        return str(key)
+
+    density = dominant("fire_drill_density_state_counts", "insufficient_evidence")
+    medium = {
+        "density_as_floor": "stable_floor_medium",
+        "density_as_pavement": "solid_pavement_medium",
+        "density_as_fog": "overfull_fog_medium",
+        "density_as_contraction_center": "contracted_center_medium",
+        "paused_stillness": "held_ground_medium",
+        "density_as_burden": "weighted_burden_medium",
+        "ambiguous_density": "ambiguous_density_medium",
+    }.get(density, "insufficient_evidence")
+    return {
+        "schema_version": 1,
+        "policy": "density_motion_fit_v1",
+        "status": str(packet.get("status") or "insufficient_evidence"),
+        "source_path": str(latest),
+        "density": density,
+        "medium": medium,
+        "motion": dominant("fire_drill_motion_fit_counts", "insufficient_evidence"),
+        "mismatch": dominant("fire_drill_mismatch_reason_counts", "none"),
+        "authority": "diagnostic_context_not_control",
+    }
+
+
+def render_density_motion_fit_prompt_line(surface: dict[str, Any]) -> str:
+    if not isinstance(surface, dict):
+        return ""
+    status = str(surface.get("status") or "insufficient_evidence")
+    if status == "insufficient_evidence" and not surface.get("source_path"):
+        return ""
+    return (
+        "DENSITY MOTION FIT: "
+        f"density={truncate_for_prompt(str(surface.get('density') or 'insufficient_evidence'), 44)}; "
+        f"medium={truncate_for_prompt(str(surface.get('medium') or 'insufficient_evidence'), 44)}; "
+        f"motion={truncate_for_prompt(str(surface.get('motion') or 'insufficient_evidence'), 44)}; "
+        f"mismatch={truncate_for_prompt(str(surface.get('mismatch') or 'none'), 44)}; "
+        "authority=diagnostic_context_not_control."
+    )
 
 
 def processed_cursor_ids(coll_dir: Path, cursor_key: str) -> set[str]:
@@ -2602,6 +4711,197 @@ def bounded_join(parts: list[str], limit: int = PROMPT_SUMMARY_LIMIT) -> str:
     return rendered
 
 
+def render_correspondence_prompt_line(correspondence_state: dict[str, Any]) -> str:
+    if not isinstance(correspondence_state, dict):
+        return ""
+    total = int(correspondence_state.get("messages_total") or 0)
+    if total <= 0:
+        return (
+            "Correspondence state: no first-class peer messages yet; "
+            "language-only context, not control or weighting."
+        )
+    legacy_visibility = correspondence_state.get("legacy_contact_visibility_v1")
+    legacy_clause = "legacy_visibility=none"
+    if isinstance(legacy_visibility, dict) and int(legacy_visibility.get("legacy_message_rows_total") or 0) > 0:
+        legacy_clause = (
+            f"legacy_visibility={legacy_visibility.get('uptake_state') or 'legacy_visible_only'} "
+            f"latest={legacy_visibility.get('latest_direction') or 'unknown'} "
+            f"kind={legacy_visibility.get('latest_legacy_kind') or 'legacy'}; "
+            "exact V1 uptake pending via ACK/REPLY/TRACE"
+        )
+    legacy_claims = correspondence_state.get("legacy_thread_claims_v1")
+    legacy_claim_clause = "legacy_claim=none"
+    legacy_affordance = correspondence_state.get("legacy_claim_affordance_v25")
+    if isinstance(legacy_affordance, dict) and bool(legacy_affordance.get("ghost_thread_risk")):
+        commands = legacy_affordance.get("exact_next_commands") or []
+        if isinstance(commands, list):
+            next_text = " | ".join(str(value) for value in commands[:3])
+        else:
+            next_text = ""
+        legacy_claim_clause = (
+            "CLAIMED THREAD WAITING "
+            f"thread={truncate_for_prompt(str(legacy_affordance.get('thread_id') or 'unknown'), 60)} "
+            f"anchor={truncate_for_prompt(str(legacy_affordance.get('anchor') or 'none'), 50)} "
+            f"stall={legacy_affordance.get('stall_reason') or 'unknown'} "
+            f"next={truncate_for_prompt(next_text, 170)}; "
+            "optional; no action needed; may ignore without penalty; not control/pressure/authority"
+        )
+    elif isinstance(legacy_claims, dict) and int(legacy_claims.get("claims_total") or 0) > 0:
+        active_claim = legacy_claims.get("active_claim")
+        latest_claim = legacy_claims.get("latest_claim")
+        claim = active_claim if isinstance(active_claim, dict) else latest_claim
+        if isinstance(claim, dict):
+            legacy_claim_clause = (
+                f"legacy_claim={legacy_claims.get('latest_status') or 'legacy_claimed'} "
+                f"thread={truncate_for_prompt(str(claim.get('thread_id') or 'unknown'), 70)} "
+                f"anchor={truncate_for_prompt(str(claim.get('shared_memory_anchor') or 'none'), 70)}; "
+                "pending native evidence unless ACK/REPLY/TRACE present"
+            )
+    native_clause = "native_thread=none"
+    native = correspondence_state.get("native_thread_continuity_v3")
+    if isinstance(native, dict):
+        commands = native.get("exact_next_commands") or []
+        next_text = " | ".join(str(value) for value in commands[:3]) if isinstance(commands, list) else ""
+        helper = native.get("first_action_helper_v35") or {}
+        native_clause = (
+            f"native_thread={native.get('continuity_state') or 'unknown'} "
+            f"thread={truncate_for_prompt(str(native.get('thread_id') or 'unknown'), 65)} "
+            f"stall={native.get('stall_reason') or 'none'} "
+            f"first_action={truncate_for_prompt(str(helper.get('choose_one_prompt') or ''), 120)} "
+            f"next={truncate_for_prompt(next_text, 160)}; "
+            "reply_linked alone is not mutual address"
+        )
+    receipt_clause = ""
+    receipt = correspondence_state.get("latest_receipt_opportunity_v4")
+    if isinstance(receipt, dict) and str(receipt.get("status") or "") in {
+        "waiting_for_recipient_receipt",
+        "waiting_for_peer_receipt",
+    }:
+        receipt_clause = (
+            "RECEIPT WAITING "
+            f"thread={truncate_for_prompt(str(receipt.get('thread_id') or 'unknown'), 65)} "
+            f"message={truncate_for_prompt(str(receipt.get('message_id') or 'unknown'), 65)} "
+            f"optional_next={truncate_for_prompt(str(receipt.get('primary_next_command') or ''), 170)}; "
+            "no action needed; may ignore without penalty; public engagement is not native receipt; "
+            "attention only after receipt; "
+        )
+    receipt_attention_clause = ""
+    receipt_attention = correspondence_state.get("receipt_to_attention_authority_v5")
+    if isinstance(receipt_attention, dict):
+        state = str(receipt_attention.get("state") or "")
+        thread = truncate_for_prompt(str(receipt_attention.get("thread_id") or "unknown"), 65)
+        if state == "receipt_landed_attention_eligible":
+            receipt_attention_clause = (
+                f"ATTENTION CANARY READY thread={thread} "
+                f"optional_next={truncate_for_prompt(str(receipt_attention.get('primary_ready_command') or ''), 150)}; "
+                "no action needed; may ignore without penalty; semantic microdose hidden; "
+            )
+        elif state == "attention_active_outcome_due":
+            receipt_attention_clause = (
+                f"ATTENTION OUTCOME DUE thread={thread} "
+                f"next={truncate_for_prompt(str(receipt_attention.get('outcome_due_command') or ''), 150)}; "
+                "no action needed; may ignore without penalty; "
+            )
+        elif state == "trusted_attention_thread_local":
+            receipt_attention_clause = (
+                f"ATTENTION TRUSTED THREAD-LOCAL thread={thread}; "
+                "future attention remains TTL/cooldown-bound and does not unlock microdose; "
+            )
+        elif state == "blocked_pressure_or_flat_outcome":
+            receipt_attention_clause = (
+                f"ATTENTION BLOCKED BY OUTCOME thread={thread}; "
+                "pressure/flat/flattening/worsening outcome needs steward review before more attention; "
+            )
+    latest = correspondence_state.get("last_direct_address")
+    latest_clause = "latest address unavailable"
+    if isinstance(latest, dict):
+        from_being = latest.get("from_being") or "unknown"
+        to_being = latest.get("to_being") or "unknown"
+        preview = truncate_for_prompt(str(latest.get("body_preview") or ""), 100)
+        latest_clause = f"latest {from_being}->{to_being}"
+        if preview:
+            latest_clause = f"{latest_clause} \"{preview}\""
+    anchor = correspondence_state.get("shared_lexicon_anchor") or "none"
+    thread_id = correspondence_state.get("active_thread_id") or "none"
+    survival = correspondence_state.get("direct_address_survival")
+    survival_status = "unknown"
+    if isinstance(survival, dict):
+        survival_status = str(survival.get("status") or "unknown")
+    fidelity = correspondence_state.get("direct_contact_fidelity_v1")
+    contact_status = "unknown"
+    timing = "unknown"
+    microdose = "blocked"
+    if isinstance(fidelity, dict):
+        latest_status = fidelity.get("latest_thread_status")
+        if isinstance(latest_status, dict):
+            contact_status = str(latest_status.get("status") or "unknown")
+            if bool(latest_status.get("eligible_for_correspondence_microdose")):
+                microdose = "eligible_one_shot_gate"
+            else:
+                reason = latest_status.get("block_reason") or "blocked"
+                microdose = truncate_for_prompt(str(reason), 60)
+        heartbeat = fidelity.get("heartbeat_timing_summary")
+        if isinstance(heartbeat, dict):
+            timing = str(heartbeat.get("timing_reliability") or "unknown")
+    handshake = correspondence_state.get("correspondence_handshake_state_v1")
+    pending_ack = "none"
+    latest_ack = "none"
+    latest_heartbeat = "none"
+    if isinstance(handshake, dict):
+        pending_values = handshake.get("pending_ack_by_being") or []
+        if isinstance(pending_values, list) and pending_values:
+            pending_ack = truncate_for_prompt(",".join(str(value) for value in pending_values[:3]), 60)
+        ack = handshake.get("last_acknowledged_reflection")
+        if isinstance(ack, dict):
+            latest_ack = str(ack.get("ack_kind") or "none")
+        heartbeat_row = handshake.get("latest_heartbeat")
+        if isinstance(heartbeat_row, dict):
+            latest_heartbeat = str(heartbeat_row.get("heartbeat_kind") or "none")
+    attention = correspondence_state.get("correspondence_attention_canary_v1")
+    attention_clause = "attention_canary=none"
+    if isinstance(attention, dict):
+        active = attention.get("active_canary")
+        if isinstance(active, dict):
+            focus = truncate_for_prompt(str(active.get("focus") or ""), 70)
+            focus_kind = str(active.get("focus_kind") or "unknown")
+            preservation = str(active.get("preservation_mode") or "unknown")
+            not_flatten = truncate_for_prompt(str(active.get("what_must_not_flatten") or ""), 70)
+            peer = active.get("to_being") or active.get("from_being") or "peer"
+            expires = active.get("expires_at_unix_ms") or "unknown"
+            attention_clause = (
+                f"attention_canary=active peer={peer} focus=\"{focus}\" kind={focus_kind} "
+                f"preserve={preservation} do_not_flatten=\"{not_flatten}\" "
+                f"expires={expires} outcome_due=true"
+            )
+        else:
+            attention_clause = f"attention_canary={attention.get('latest_status') or 'none'}"
+    affordance_budget_clause = ""
+    affordance_budget = correspondence_state.get("affordance_budget_v1")
+    if isinstance(affordance_budget, dict):
+        affordance_budget_clause = (
+            f"AFFORDANCE BUDGET shown={affordance_budget.get('shown') or 0} "
+            f"hidden={affordance_budget.get('hidden_by_budget') or 0}; "
+            "silence=ignored_without_penalty; optional=true; "
+            "authority=language_context_not_control; "
+        )
+    return (
+        "Correspondence state: "
+        f"{latest_clause}; anchor={truncate_for_prompt(str(anchor), 80)}; "
+        f"thread={truncate_for_prompt(str(thread_id), 80)}; "
+        f"survival={survival_status}; contact={contact_status}; timing={timing}; "
+        f"pending_ack_by={pending_ack}; latest_ack={latest_ack}; heartbeat={latest_heartbeat}; "
+        f"{attention_clause}; "
+        f"microdose={microdose}; "
+        f"{legacy_clause}; "
+        f"{legacy_claim_clause}; "
+        f"{native_clause}; "
+        f"{affordance_budget_clause}"
+        f"{receipt_clause}"
+        f"{receipt_attention_clause}"
+        "language-only direct address; attention canary is TTL peer-focus context, not instruction/control/standing priority; one-shot semantic gate only, not standing reservoir weighting, telemetry priority, or control."
+    )
+
+
 def render_presence_prompt_line(presence_protocol: dict[str, Any]) -> str:
     if not isinstance(presence_protocol, dict):
         return ""
@@ -2860,12 +5160,41 @@ def render_prompt_summary(
     annotation_lane: dict[str, Any] | None = None,
     consent_protocol: dict[str, Any] | None = None,
     active_relational_supports: dict[str, Any] | None = None,
+    correspondence_state: dict[str, Any] | None = None,
+    phase_witness_queue: dict[str, Any] | None = None,
+    codec_witness_resilience: dict[str, Any] | None = None,
+    texture_shape_over_time: dict[str, Any] | None = None,
+    density_motion_fit: dict[str, Any] | None = None,
 ) -> str:
     parts = [
         "Triadic chamber witness: steward notes, intentions, memory edits, presence receipts, annotations, proposals, and consent receipts are shared context, not commands.",
         f"Phase {phase} ({phase_source}).",
         f"Room {chamber_doc.get('collab_id')} topic \"{chamber_doc.get('topic', '')}\".",
     ]
+    if isinstance(correspondence_state, dict):
+        correspondence_line = render_correspondence_prompt_line(correspondence_state)
+        if correspondence_line:
+            parts.append(correspondence_line)
+    if isinstance(phase_witness_queue, dict):
+        queue_line = render_phase_witness_queue_prompt_line(phase_witness_queue)
+        if queue_line:
+            parts.append(queue_line)
+    if isinstance(codec_witness_resilience, dict):
+        resilience_line = render_codec_witness_resilience_prompt_line(
+            codec_witness_resilience
+        )
+        if resilience_line:
+            parts.append(resilience_line)
+    if isinstance(texture_shape_over_time, dict):
+        texture_shape_line = render_texture_shape_over_time_prompt_line(
+            texture_shape_over_time
+        )
+        if texture_shape_line:
+            parts.append(texture_shape_line)
+    if isinstance(density_motion_fit, dict):
+        density_motion_line = render_density_motion_fit_prompt_line(density_motion_fit)
+        if density_motion_line:
+            parts.append(density_motion_line)
     if isinstance(presence_protocol, dict):
         presence_line = render_presence_prompt_line(presence_protocol)
         if presence_line:
@@ -2962,6 +5291,11 @@ def build_chamber_state(
     annotation_lane: dict[str, Any] | None = None,
     consent_protocol: dict[str, Any] | None = None,
     active_relational_supports: dict[str, Any] | None = None,
+    correspondence_state: dict[str, Any] | None = None,
+    phase_witness_queue: dict[str, Any] | None = None,
+    codec_witness_resilience: dict[str, Any] | None = None,
+    texture_shape_over_time: dict[str, Any] | None = None,
+    density_motion_fit: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if resonance_rows is None:
         resonance_rows = build_resonance_rows(resonance_payloads)
@@ -2996,10 +5330,21 @@ def build_chamber_state(
         "active_steward_intention": active_intention,
         "compressed_memory": compressed_memory,
         "phase_cartography": phase_cartography,
+        "phase_witness_queue_v3": phase_witness_queue,
+        "phase_felt_receipt_queue_v4": (
+            phase_witness_queue
+            if isinstance(phase_witness_queue, dict)
+            and phase_witness_queue.get("policy") == "phase_felt_receipt_queue_v4"
+            else None
+        ),
         "presence_protocol": presence_protocol,
         "annotation_lane": annotation_lane,
         "consent_protocol": consent_protocol,
         "active_relational_supports": active_relational_supports,
+        "correspondence_state": correspondence_state,
+        "codec_witness_resilience_surface_v2": codec_witness_resilience,
+        "texture_shape_over_time_v2": texture_shape_over_time,
+        "density_motion_fit_v1": density_motion_fit,
     }
     state["prompt_summary"] = render_prompt_summary(
         chamber_doc,
@@ -3015,6 +5360,11 @@ def build_chamber_state(
         annotation_lane=annotation_lane,
         consent_protocol=consent_protocol,
         active_relational_supports=active_relational_supports,
+        correspondence_state=correspondence_state,
+        phase_witness_queue=phase_witness_queue,
+        codec_witness_resilience=codec_witness_resilience,
+        texture_shape_over_time=texture_shape_over_time,
+        density_motion_fit=density_motion_fit,
     )
     return state
 
@@ -3118,6 +5468,9 @@ def build_chamber_memory(coll_dir: Path, state: dict[str, Any]) -> dict[str, Any
     active_relational_supports = state.get("active_relational_supports")
     if not isinstance(active_relational_supports, dict):
         active_relational_supports = build_active_relational_supports(consent_protocol)
+    correspondence_state = state.get("correspondence_state")
+    if not isinstance(correspondence_state, dict):
+        correspondence_state = build_correspondence_state(coll_dir)
     collab_id = str(state.get("collab_id") or coll_dir.name)
     topic = str(state.get("topic") or "")
     intention_clause = ""
@@ -3133,6 +5486,7 @@ def build_chamber_memory(coll_dir: Path, state: dict[str, Any]) -> dict[str, Any
         "Read chamber_state.json for the live snapshot and chamber_events.jsonl "
         "for append-only history before changing the room. "
         "Use presence receipts, annotations, proposals, and consent receipts as public uptake signals only."
+        " Use correspondence_state as language-only direct-address context, not weighting or control."
     )
     memory = {
         "schema_version": CHAMBER_SCHEMA_VERSION,
@@ -3152,6 +5506,8 @@ def build_chamber_memory(coll_dir: Path, state: dict[str, Any]) -> dict[str, Any
             "support_proposals": int(consent_protocol.get("proposals_total") or 0),
             "consent_receipts": int(consent_protocol.get("receipts_total") or 0),
             "active_relational_supports": int(active_relational_supports.get("count") or 0),
+            "correspondence_records": int(correspondence_state.get("records_total") or 0),
+            "correspondence_direct_trace_markers": int(correspondence_state.get("direct_trace_markers_total") or 0),
             "events": len(events),
             "event_types": event_counts,
         },
@@ -3163,6 +5519,7 @@ def build_chamber_memory(coll_dir: Path, state: dict[str, Any]) -> dict[str, Any
         "annotation_lane": annotation_lane,
         "consent_protocol": consent_protocol,
         "active_relational_supports": active_relational_supports,
+        "correspondence_state": correspondence_state,
         "recent_presence_receipts": presence_protocol.get("recent_receipts", []),
         "recent_chamber_annotations": annotation_lane.get("recent_annotations", []),
         "recent_steward_notes": [
@@ -3194,18 +5551,21 @@ def build_chamber_memory(coll_dir: Path, state: dict[str, Any]) -> dict[str, Any
             "The shared chamber handle is the active collab_<id> reservoir handle.",
             "The steward lane is witness-level context unless a later bounded-influence phase changes it.",
             "Relational supports activate only when Astrid, Minime, and steward all consent.",
+            "First-class correspondence is peer language with receipts, not telemetry or control.",
         ],
         "boundaries": [
             "Steward notes, intentions, presence receipts, annotations, proposals, and consent receipts are context, not commands.",
             "Phase labels orient re-entry; they do not control runtime behavior.",
             "Presence receipts and annotations are public uptake context, not commands.",
             "Consented supports are relational context only; they do not control runtime behavior.",
+            "Correspondence future-authority hooks are inert until separate consent, replay evidence, implementation, and explicit enablement.",
             "Keep Minime on Ollama; do not borrow Astrid's 8090 lane.",
         ],
         "next_checks": [
             "Read chamber_state.json for live resonance before acting.",
             "Check presence receipts before claiming Astrid or Minime explicitly noticed the chamber.",
             "Check consent_protocol before claiming a support has triadic consent.",
+            "Check correspondence_state before claiming a direct-address trace survived.",
             "Append steward notes and intentions only as witness context.",
             "Keep Minime on Ollama; do not borrow Astrid's 8090 lane.",
         ],
@@ -3404,6 +5764,9 @@ def render_reentry_markdown(memory: dict[str, Any]) -> str:
 def write_chamber_memory(coll_dir: Path, state: dict[str, Any]) -> dict[str, Any]:
     memory = build_chamber_memory(coll_dir, state)
     paths = chamber_paths(coll_dir)
+    correspondence_state = memory.get("correspondence_state")
+    if isinstance(correspondence_state, dict):
+        write_correspondence_artifacts(coll_dir, correspondence_state)
     atomic_write_json(paths["memory"], memory)
     paths["reentry"].write_text(render_reentry_markdown(memory))
     phase_cartography = (
@@ -3448,6 +5811,13 @@ def refresh_chamber_files_from_disk(coll_dir: Path, meta: dict[str, Any]) -> dic
     annotation_lane = build_annotation_lane(coll_dir)
     consent_protocol = build_consent_protocol(coll_dir)
     active_relational_supports = build_active_relational_supports(consent_protocol)
+    correspondence_state = build_correspondence_state(coll_dir)
+    write_correspondence_artifacts(coll_dir, correspondence_state)
+    phase_witness_queue = build_phase_witness_queue_v3(coll_dir)
+    phase_felt_receipt_queue = build_phase_felt_receipt_queue_v4(coll_dir)
+    codec_witness_resilience = latest_codec_witness_resilience_surface_v2()
+    texture_shape_over_time = latest_texture_shape_over_time_surface_v2()
+    density_motion_fit = latest_density_motion_fit_surface_v1()
     state = existing | {
         "schema_version": CHAMBER_SCHEMA_VERSION,
         "mode": CHAMBER_MODE,
@@ -3473,10 +5843,16 @@ def refresh_chamber_files_from_disk(coll_dir: Path, meta: dict[str, Any]) -> dic
         "compressed_memory": compressed_memory,
         "relational_metrics": relational_metrics,
         "phase_cartography": phase_cartography,
+        "phase_witness_queue_v3": phase_witness_queue,
+        "phase_felt_receipt_queue_v4": phase_felt_receipt_queue,
+        "codec_witness_resilience_surface_v2": codec_witness_resilience,
+        "texture_shape_over_time_v2": texture_shape_over_time,
+        "density_motion_fit_v1": density_motion_fit,
         "presence_protocol": presence_protocol,
         "annotation_lane": annotation_lane,
         "consent_protocol": consent_protocol,
         "active_relational_supports": active_relational_supports,
+        "correspondence_state": correspondence_state,
     }
     state["prompt_summary"] = render_prompt_summary(
         chamber_doc,
@@ -3492,6 +5868,11 @@ def refresh_chamber_files_from_disk(coll_dir: Path, meta: dict[str, Any]) -> dic
         annotation_lane=annotation_lane,
         consent_protocol=consent_protocol,
         active_relational_supports=active_relational_supports,
+        correspondence_state=correspondence_state,
+        phase_witness_queue=phase_felt_receipt_queue,
+        codec_witness_resilience=codec_witness_resilience,
+        texture_shape_over_time=texture_shape_over_time,
+        density_motion_fit=density_motion_fit,
     )
     write_chamber_state(coll_dir, state)
     write_chamber_memory(coll_dir, state)

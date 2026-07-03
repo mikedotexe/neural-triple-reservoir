@@ -381,6 +381,9 @@ async def refresh_chamber_state(ws, shared_dir: Path, meta: dict) -> bool:
     annotation_lane = chamber.build_annotation_lane(coll_dir)
     consent_protocol = chamber.build_consent_protocol(coll_dir)
     active_relational_supports = chamber.build_active_relational_supports(consent_protocol)
+    correspondence_state = chamber.build_correspondence_state(coll_dir)
+    chamber.write_correspondence_artifacts(coll_dir, correspondence_state)
+    codec_witness_resilience = chamber.latest_codec_witness_resilience_surface_v2()
     state = chamber.build_chamber_state(
         meta,
         chamber_doc,
@@ -398,6 +401,8 @@ async def refresh_chamber_state(ws, shared_dir: Path, meta: dict) -> bool:
         annotation_lane=annotation_lane,
         consent_protocol=consent_protocol,
         active_relational_supports=active_relational_supports,
+        correspondence_state=correspondence_state,
+        codec_witness_resilience=codec_witness_resilience,
     )
     chamber.write_chamber_state(coll_dir, state)
     chamber.write_chamber_memory(coll_dir, state)

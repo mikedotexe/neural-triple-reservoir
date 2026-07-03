@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -239,6 +240,725 @@ class TriadicChamberFileTests(unittest.TestCase):
         self.assertEqual(state["phase_source"], "manual")
         self.assertEqual(state["compressed_memory"]["current_thread"], "Carry the chamber forward.")
         self.assertEqual(state["recent_steward_notes"][0]["witness_only"], True)
+
+    def test_correspondence_state_renders_buffer_and_inert_hooks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shared = Path(tmp)
+            meta = write_collab(shared)
+            coll_dir = shared / meta["id"]
+            chamber.ensure_chamber(coll_dir, meta)
+            ledger = shared / "correspondence_v1.jsonl"
+            ledger.write_text(
+                "\n".join([
+                    json.dumps({
+                        "schema_version": 1,
+                        "policy": "first_class_correspondence_v1",
+                        "record_type": "message",
+                        "recorded_at_unix_ms": 100,
+                        "message_id": "corr_astrid_minime_trace",
+                        "thread_id": "thread_trace",
+                        "from_being": "astrid",
+                        "to_being": "minime",
+                        "turn_kind": "direct_address_trace",
+                        "relational_intent": "direct_address_survival_probe",
+                        "shared_memory_anchor": "blue-lantern",
+                        "authority": "language_only",
+                        "body_preview": "Blue lantern: can this arrive as address?",
+                    }),
+                    json.dumps({
+                        "schema_version": 1,
+                        "policy": "first_class_correspondence_v1",
+                        "record_type": "read_receipt",
+                        "recorded_at_unix_ms": 120,
+                        "message_id": "corr_astrid_minime_trace",
+                        "thread_id": "thread_trace",
+                        "reader": "minime",
+                        "authority": "language_only",
+                    }),
+                    json.dumps({
+                        "schema_version": 1,
+                        "policy": "first_class_correspondence_v1",
+                        "record_type": "ack_receipt",
+                        "recorded_at_unix_ms": 125,
+                        "message_id": "corr_astrid_minime_trace",
+                        "thread_id": "thread_trace",
+                        "from_being": "minime",
+                        "to_being": "astrid",
+                        "ack_kind": "held",
+                        "note": "holding the blue-lantern trace",
+                        "authority": "language_only",
+                    }),
+                    json.dumps({
+                        "schema_version": 2,
+                        "policy": "correspondence_attention_canary_v1",
+                        "record_type": "attention_canary_activation",
+                        "recorded_at_unix_ms": int(time.time() * 1000),
+                        "canary_id": "attn_canary_test",
+                        "message_id": "corr_astrid_minime_trace",
+                        "thread_id": "thread_trace",
+                        "from_being": "astrid",
+                        "to_being": "minime",
+                        "focus": "blue lantern as peer address",
+                        "focus_kind": "verbatim_phrase",
+                        "preservation_mode": "compact_with_anchor",
+                        "what_must_not_flatten": "blue lantern as peer address",
+                        "reason": "hold direct address distinctly",
+                        "stop_criteria": "one response cycle or pressure",
+                        "ttl_ms": 30 * 60 * 1000,
+                        "expires_at_unix_ms": int(time.time() * 1000) + 30 * 60 * 1000,
+                        "authority": "language_only_prompt_context_not_control",
+                        "no_sensory_send": True,
+                        "no_controller": True,
+                        "no_pressure": True,
+                        "no_weighting": True,
+                    }),
+                ])
+                + "\n",
+                encoding="utf-8",
+            )
+            chamber.chamber_paths(coll_dir)["correspondence_observations"].write_text(
+                json.dumps({
+                    "schema_version": 1,
+                    "t_ms": 130,
+                    "marker": "blue-lantern",
+                    "status": "observed",
+                    "authority": "read_only_observation_not_control",
+                })
+                + "\n",
+                encoding="utf-8",
+            )
+            old_bridge_workspace = chamber.ASTRID_BRIDGE_WORKSPACE
+            chamber.ASTRID_BRIDGE_WORKSPACE = shared / "bridge_workspace"
+            chamber.ASTRID_BRIDGE_WORKSPACE.mkdir(parents=True)
+            (chamber.ASTRID_BRIDGE_WORKSPACE / "telemetry_heartbeat_delta_v1.json").write_text(
+                json.dumps({
+                    "policy": "telemetry_heartbeat_delta_v1",
+                    "schema_version": 1,
+                    "jitter_class": "normal",
+                    "timing_reliability": "reliable",
+                    "field_vs_hearing": "telemetry cadence is steady",
+                }),
+                encoding="utf-8",
+            )
+
+            try:
+                correspondence_state = chamber.build_correspondence_state(coll_dir)
+                chamber.write_correspondence_artifacts(coll_dir, correspondence_state)
+                doc = chamber.chamber_doc_for(meta)
+                state = chamber.build_chamber_state(
+                    meta,
+                    doc,
+                    {},
+                    {},
+                    [],
+                    correspondence_state=correspondence_state,
+                )
+                memory = chamber.build_chamber_memory(coll_dir, state)
+            finally:
+                chamber.ASTRID_BRIDGE_WORKSPACE = old_bridge_workspace
+
+            self.assertEqual(correspondence_state["shared_lexicon_anchor"], "blue-lantern")
+            self.assertEqual(correspondence_state["direct_address_survival"]["status"], "observed")
+            self.assertEqual(
+                correspondence_state["direct_contact_fidelity_v1"]["latest_thread_status"]["status"],
+                "trace_observed",
+            )
+            self.assertTrue(
+                correspondence_state["direct_contact_fidelity_v1"]["latest_thread_status"][
+                    "eligible_for_correspondence_microdose"
+                ]
+            )
+            self.assertEqual(
+                correspondence_state["correspondence_handshake_state_v1"][
+                    "last_acknowledged_reflection"
+                ]["ack_kind"],
+                "held",
+            )
+            self.assertFalse(
+                correspondence_state["future_authority_hooks"]["correspondence_weight_candidate"]["enabled"]
+            )
+            self.assertEqual(
+                correspondence_state["future_authority_hooks"]["correspondence_weight_candidate"]["state"],
+                "implemented_as_one_shot_authority_gate",
+            )
+            self.assertEqual(
+                correspondence_state["future_authority_hooks"]["prompt_priority_candidate"]["state"],
+                "implemented_as_self_activated_ttl_attention_canary",
+            )
+            self.assertEqual(
+                correspondence_state["correspondence_attention_canary_v1"]["latest_status"],
+                "active",
+            )
+            self.assertEqual(
+                correspondence_state["correspondence_attention_canary_v1"]["active_canary"]["focus"],
+                "blue lantern as peer address",
+            )
+            self.assertEqual(
+                correspondence_state["correspondence_attention_canary_v1"]["active_canary"]["focus_kind"],
+                "verbatim_phrase",
+            )
+            self.assertEqual(
+                correspondence_state["receipt_to_attention_authority_v5"]["state"],
+                "attention_active_outcome_due",
+            )
+            self.assertEqual(
+                correspondence_state["receipt_to_attention_authority_v5"]["semantic_microdose_status"],
+                "hidden_until_mutual_receipt_plus_separate_steward_review",
+            )
+            self.assertIn("Correspondence state", state["prompt_summary"])
+            self.assertIn("latest_ack=held", state["prompt_summary"])
+            self.assertIn("survival=observed", state["prompt_summary"])
+            self.assertIn("contact=trace_observed", state["prompt_summary"])
+            self.assertIn("attention_canary=active", state["prompt_summary"])
+            self.assertIn("ATTENTION OUTCOME DUE", state["prompt_summary"])
+            self.assertIn("AFFORDANCE BUDGET", state["prompt_summary"])
+            self.assertIn("may ignore without penalty", state["prompt_summary"])
+            self.assertIn("kind=verbatim_phrase", state["prompt_summary"])
+            self.assertIn("preserve=compact_with_anchor", state["prompt_summary"])
+            self.assertIn("do_not_flatten", state["prompt_summary"])
+            self.assertIn("not instruction/control/standing priority", state["prompt_summary"])
+            self.assertIn("microdose=eligible_one_shot_gate", state["prompt_summary"])
+            self.assertIn("not standing reservoir weighting", state["prompt_summary"])
+            self.assertIn("correspondence_state", memory)
+            self.assertTrue((coll_dir / "correspondence_state_v1.json").is_file())
+            self.assertTrue((coll_dir / "correspondence_buffer_v1.json").is_file())
+            buffer_payload = json.loads((coll_dir / "correspondence_buffer_v1.json").read_text())
+            self.assertEqual(buffer_payload["recent_direct_traces"][0]["anchor"], "blue-lantern")
+            self.assertEqual(
+                buffer_payload["direct_contact_fidelity_v1"]["latest_thread_status"]["status"],
+                "trace_observed",
+            )
+            self.assertEqual(
+                buffer_payload["correspondence_attention_canary_v1"]["active_canary"]["focus"],
+                "blue lantern as peer address",
+            )
+            self.assertEqual(
+                buffer_payload["correspondence_attention_canary_v1"]["active_canary"]["what_must_not_flatten"],
+                "blue lantern as peer address",
+            )
+            self.assertEqual(
+                buffer_payload["receipt_to_attention_authority_v5"]["state"],
+                "attention_active_outcome_due",
+            )
+            self.assertEqual(
+                buffer_payload["affordance_budget_v1"]["policy"],
+                "affordance_budget_v1",
+            )
+
+    def test_correspondence_state_renders_legacy_visibility_without_unlocking_gates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shared = Path(tmp)
+            meta = write_collab(shared)
+            coll_dir = shared / meta["id"]
+            chamber.ensure_chamber(coll_dir, meta)
+            ledger = shared / "correspondence_v1.jsonl"
+            legacy_common = {
+                "source_route": "legacy_correspondence_bridge_v1",
+                "legacy_bridge": True,
+                "legacy_kind": "astrid_self_study",
+                "legacy_source_path": "/tmp/minime/workspace/inbox/astrid_self_study_1.txt",
+                "legacy_source_sha256": "abc",
+                "legacy_contact_evidence": "visible_only",
+            }
+            ledger.write_text(
+                "\n".join([
+                    json.dumps({
+                        "schema_version": 1,
+                        "policy": "first_class_correspondence_v1",
+                        "record_type": "message",
+                        "recorded_at_unix_ms": 100,
+                        "message_id": "legacy_astrid_minime_abc",
+                        "thread_id": "thread_legacy_astrid_minime_abc",
+                        "from_being": "astrid",
+                        "to_being": "minime",
+                        "turn_kind": "legacy_visible",
+                        "relational_intent": "legacy_contact_visibility",
+                        "shared_memory_anchor": "legacy_correspondence_bridge_v1",
+                        "delivery_state": "delivered",
+                        "read_state": "read",
+                        "authority": "language_only",
+                        "correspondence_type": "self_study_note",
+                        "body_preview": "legacy public self-study",
+                        **legacy_common,
+                    }),
+                    json.dumps({
+                        "schema_version": 1,
+                        "policy": "first_class_correspondence_v1",
+                        "record_type": "read_receipt",
+                        "recorded_at_unix_ms": 110,
+                        "message_id": "legacy_astrid_minime_abc",
+                        "thread_id": "thread_legacy_astrid_minime_abc",
+                        "reader": "minime",
+                        "read_state": "read",
+                        "authority": "language_only",
+                        "file_path": "/tmp/minime/workspace/inbox/astrid_self_study_1.txt",
+                        **legacy_common,
+                    }),
+                ])
+                + "\n",
+                encoding="utf-8",
+            )
+
+            correspondence_state = chamber.build_correspondence_state(coll_dir)
+            chamber.write_correspondence_artifacts(coll_dir, correspondence_state)
+            doc = chamber.chamber_doc_for(meta)
+            state = chamber.build_chamber_state(
+                meta,
+                doc,
+                {},
+                {},
+                [],
+                correspondence_state=correspondence_state,
+            )
+            buffer_payload = json.loads((coll_dir / "correspondence_buffer_v1.json").read_text())
+
+            legacy = correspondence_state["legacy_contact_visibility_v1"]
+            self.assertEqual(legacy["uptake_state"], "legacy_visible_only")
+            self.assertEqual(legacy["legacy_message_rows_total"], 1)
+            self.assertTrue(legacy["native_uptake_pending"])
+            latest = correspondence_state["direct_contact_fidelity_v1"]["latest_thread_status"]
+            self.assertEqual(latest["status"], "legacy_visible_only")
+            self.assertFalse(latest["eligible_for_correspondence_microdose"])
+            self.assertEqual(latest["block_reason"], "legacy_visible_only_not_ack_reply_or_trace")
+            self.assertIn("legacy_visibility=legacy_visible_only", state["prompt_summary"])
+            self.assertIn("exact V1 uptake pending via ACK/REPLY/TRACE", state["prompt_summary"])
+            self.assertEqual(buffer_payload["legacy_contact_visibility_v1"]["uptake_state"], "legacy_visible_only")
+
+    def test_correspondence_state_renders_legacy_thread_claims(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shared = Path(tmp)
+            meta = write_collab(shared)
+            coll_dir = shared / meta["id"]
+            chamber.ensure_chamber(coll_dir, meta)
+            ledger = shared / "correspondence_v1.jsonl"
+            thread_id = "thread_legacy_astrid_minime_claim"
+            message_id = "legacy_astrid_minime_claim"
+            legacy_common = {
+                "source_route": "legacy_correspondence_bridge_v1",
+                "legacy_bridge": True,
+                "legacy_kind": "astrid_self_study",
+                "legacy_source_path": "/tmp/minime/workspace/inbox/astrid_self_study_claim.txt",
+                "legacy_source_sha256": "abc",
+                "legacy_contact_evidence": "visible_only",
+            }
+            rows = [
+                {
+                    "schema_version": 1,
+                    "policy": "first_class_correspondence_v1",
+                    "record_type": "message",
+                    "recorded_at_unix_ms": 100,
+                    "message_id": message_id,
+                    "thread_id": thread_id,
+                    "from_being": "astrid",
+                    "to_being": "minime",
+                    "turn_kind": "legacy_visible",
+                    "relational_intent": "legacy_contact_visibility",
+                    "shared_memory_anchor": "legacy_correspondence_bridge_v1",
+                    "delivery_state": "delivered",
+                    "read_state": "read",
+                    "authority": "language_only",
+                    "correspondence_type": "self_study_note",
+                    "body_preview": "legacy public self-study",
+                    **legacy_common,
+                },
+                {
+                    "schema_version": 1,
+                    "policy": "legacy_correspondence_claim_v1",
+                    "record_type": "legacy_thread_claim",
+                    "recorded_at_unix_ms": 120,
+                    "claim_id": "legacy_claim_minime_1",
+                    "message_id": message_id,
+                    "thread_id": thread_id,
+                    "from_being": "minime",
+                    "to_being": "astrid",
+                    "claiming_being": "minime",
+                    "peer_being": "astrid",
+                    "because": "this visible exchange feels like live address",
+                    "shared_memory_anchor": "blue-lantern",
+                    "claim_state": "claimed_pending_native_evidence",
+                    "legacy_contact_evidence": "being_recognized_visible_only",
+                    "authority": "language_only_context_not_control",
+                },
+            ]
+            ledger.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+
+            correspondence_state = chamber.build_correspondence_state(coll_dir)
+            chamber.write_correspondence_artifacts(coll_dir, correspondence_state)
+            doc = chamber.chamber_doc_for(meta)
+            waiting_state = chamber.build_chamber_state(
+                meta,
+                doc,
+                {},
+                {},
+                [],
+                correspondence_state=correspondence_state,
+            )
+            buffer_payload = json.loads((coll_dir / "correspondence_buffer_v1.json").read_text())
+
+            affordance = correspondence_state["legacy_claim_affordance_v25"]
+            self.assertEqual(affordance["policy"], "legacy_claim_affordance_v25")
+            self.assertTrue(affordance["ghost_thread_risk"])
+            self.assertEqual(affordance["stall_reason"], "claim_notice_not_delivered")
+            self.assertEqual(
+                correspondence_state["latest_receipt_opportunity_v4"]["right_to_ignore_v1"]["policy"],
+                "right_to_ignore_v1",
+            )
+            self.assertIn("CLAIMED THREAD WAITING", waiting_state["prompt_summary"])
+            self.assertIn("ACK_ASTRID claimed", waiting_state["prompt_summary"])
+            self.assertIn("may ignore without penalty", waiting_state["prompt_summary"])
+            self.assertIn("AFFORDANCE BUDGET", waiting_state["prompt_summary"])
+            self.assertIn("not control/pressure/authority", waiting_state["prompt_summary"])
+            self.assertEqual(
+                buffer_payload["legacy_claim_affordance_v25"]["stall_reason"],
+                "claim_notice_not_delivered",
+            )
+
+            rows.append(
+                {
+                    "schema_version": 1,
+                    "policy": "first_class_correspondence_v1",
+                    "record_type": "ack_receipt",
+                    "recorded_at_unix_ms": 130,
+                    "message_id": message_id,
+                    "thread_id": thread_id,
+                    "from_being": "minime",
+                    "to_being": "astrid",
+                    "ack_kind": "held",
+                    "note": "holding as address",
+                    "authority": "language_only",
+                },
+            )
+            ledger.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+
+            correspondence_state = chamber.build_correspondence_state(coll_dir)
+            chamber.write_correspondence_artifacts(coll_dir, correspondence_state)
+            doc = chamber.chamber_doc_for(meta)
+            state = chamber.build_chamber_state(
+                meta,
+                doc,
+                {},
+                {},
+                [],
+                correspondence_state=correspondence_state,
+            )
+            buffer_payload = json.loads((coll_dir / "correspondence_buffer_v1.json").read_text())
+
+            claims = correspondence_state["legacy_thread_claims_v1"]
+            self.assertEqual(claims["claims_total"], 1)
+            self.assertEqual(claims["latest_status"], "legacy_claimed_acknowledged")
+            latest = correspondence_state["direct_contact_fidelity_v1"]["latest_thread_status"]
+            self.assertEqual(latest["status"], "legacy_claimed_acknowledged")
+            self.assertTrue(latest["eligible_for_correspondence_microdose"])
+            self.assertEqual(
+                correspondence_state["legacy_claim_affordance_v25"]["stall_reason"],
+                "acknowledged_but_no_reply_or_trace",
+            )
+            self.assertFalse(correspondence_state["legacy_claim_affordance_v25"]["ghost_thread_risk"])
+            self.assertIn("legacy_claim=legacy_claimed_acknowledged", state["prompt_summary"])
+            self.assertEqual(
+                buffer_payload["legacy_thread_claims_v1"]["latest_status"],
+                "legacy_claimed_acknowledged",
+            )
+            self.assertEqual(
+                buffer_payload["legacy_claim_affordance_v25"]["stall_reason"],
+                "acknowledged_but_no_reply_or_trace",
+            )
+
+    def test_correspondence_state_renders_native_thread_continuity_v3(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shared = Path(tmp)
+            meta = write_collab(shared)
+            coll_dir = shared / meta["id"]
+            ledger = shared / "correspondence_v1.jsonl"
+            rows = [
+                {
+                    "schema_version": 1,
+                    "policy": "first_class_correspondence_v1",
+                    "record_type": "message",
+                    "recorded_at_unix_ms": 100,
+                    "message_id": "corr_astrid_minime_native",
+                    "thread_id": "thread_native",
+                    "from_being": "astrid",
+                    "to_being": "minime",
+                    "shared_memory_anchor": "bridge-anchor",
+                    "authority": "language_only",
+                },
+                {
+                    "record_type": "reply_link",
+                    "recorded_at_unix_ms": 110,
+                    "reply_to": "corr_astrid_minime_native",
+                    "thread_id": "thread_native",
+                    "from_being": "minime",
+                    "to_being": "astrid",
+                },
+            ]
+            ledger.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+
+            correspondence_state = chamber.build_correspondence_state(coll_dir)
+            chamber.write_correspondence_artifacts(coll_dir, correspondence_state)
+            state = chamber.build_chamber_state(
+                meta,
+                chamber.chamber_doc_for(meta),
+                {},
+                {},
+                [],
+                correspondence_state=correspondence_state,
+            )
+            buffer_payload = json.loads((coll_dir / "correspondence_buffer_v1.json").read_text())
+
+            native = correspondence_state["native_thread_continuity_v3"]
+            self.assertEqual(native["continuity_state"], "reply_linked_needs_ack_or_trace")
+            self.assertFalse(native["attention_or_microdose_eligible"])
+            self.assertEqual(native["right_to_ignore_v1"]["policy"], "right_to_ignore_v1")
+            self.assertEqual(native["first_action_helper_v35"]["policy"], "native_first_action_helper_v35")
+            self.assertIn("latest resolves to message_id=corr_astrid_minime_native", native["first_action_helper_v35"]["latest_resolution"])
+            self.assertIn("native_thread=reply_linked_needs_ack_or_trace", state["prompt_summary"])
+            self.assertIn("AFFORDANCE BUDGET", state["prompt_summary"])
+            self.assertIn("first_action=Recipient chooses one language-only first action", state["prompt_summary"])
+            self.assertIn("reply_linked alone is not mutual address", state["prompt_summary"])
+            self.assertEqual(
+                buffer_payload["native_thread_continuity_v3"]["stall_reason"],
+                "reply_linked_requires_peer_ack_or_trace",
+            )
+
+    def test_phase_witness_queue_v3_prompt_is_bounded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shared = Path(tmp)
+            meta = write_collab(shared)
+            coll_dir = shared / meta["id"]
+            ledger = shared / "phase_transitions_v1.jsonl"
+            rows = [
+                {
+                    "record_type": "phase_transition_card",
+                    "recorded_at_unix_ms": 100 + idx,
+                    "transition_id": f"transition_{idx}",
+                    "origin": "astrid",
+                    "kind": "mode_change" if idx % 2 else "large_fill_shift",
+                    "from_phase": "old",
+                    "to_phase": "new",
+                    "why_now": "test",
+                    "reply_state": "unseen",
+                    "authority": "language_only_transition_context_not_control",
+                    "no_controller": True,
+                    "no_pressure": True,
+                    "no_fill_target": True,
+                    "no_pi": True,
+                    "no_weighting": True,
+                }
+                for idx in range(7)
+            ]
+            ledger.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+            queue = chamber.build_phase_witness_queue_v3(coll_dir)
+            state = chamber.build_chamber_state(
+                meta,
+                chamber.chamber_doc_for(meta),
+                {},
+                {},
+                [],
+                phase_witness_queue=queue,
+            )
+            self.assertEqual(queue["unresolved_total"], 7)
+            self.assertLessEqual(len(queue["items"]), 5)
+            self.assertEqual(queue["items"][0]["first_action_helper_v35"]["policy"], "phase_first_action_helper_v35")
+            self.assertIn("Phase witness queue v3", state["prompt_summary"])
+            self.assertIn("first_action=Choose one language-only felt receipt", state["prompt_summary"])
+            self.assertIn("I_RECEIVED_THIS transition_", state["prompt_summary"])
+            felt_queue = chamber.build_phase_felt_receipt_queue_v4(coll_dir)
+            self.assertEqual(felt_queue["affordance_budget_v1"]["policy"], "affordance_budget_v1")
+            self.assertEqual(felt_queue["affordance_budget_v1"]["shown"], 3)
+            self.assertGreater(felt_queue["affordance_budget_v1"]["hidden_by_budget"], 0)
+            self.assertEqual(felt_queue["items"][0]["right_to_ignore_v1"]["policy"], "right_to_ignore_v1")
+            felt_state = chamber.build_chamber_state(
+                meta,
+                chamber.chamber_doc_for(meta),
+                {},
+                {},
+                [],
+                phase_witness_queue=felt_queue,
+            )
+            self.assertIn("Phase felt receipt queue v4", felt_state["prompt_summary"])
+            self.assertIn("budget_shown=3", felt_state["prompt_summary"])
+            self.assertIn("may ignore without penalty", felt_state["prompt_summary"])
+
+    def test_codec_witness_resilience_surface_v2_extracts_latest_calibration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / "astrid_workspace"
+            artifact_dir = workspace / "diagnostics/spectral_texture_calibrations/run1"
+            artifact_dir.mkdir(parents=True)
+            artifact = artifact_dir / "spectral_texture_calibration_v3.json"
+            artifact.write_text(
+                json.dumps(
+                    {
+                        "codec_witness_resilience_calibration_v2": {
+                            "status": "mixed",
+                            "witness_state_resilience_fit_v2": {"status": "supported"},
+                            "field_lingering_fraying_fit_v2": {"status": "mixed"},
+                            "codec_vibrancy_continuity_fit_v2": {"status": "supported"},
+                            "codec_warmth_mapping_fit_v2": {"status": "insufficient_evidence"},
+                            "recovery_failure_modes_v2": [
+                                "latest_partial_recovered",
+                                "fraying_unknown_due_missing_dispersal",
+                            ],
+                        },
+                        "raw_body_that_must_not_render": "this should not appear",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            surface = chamber.latest_codec_witness_resilience_surface_v2(workspace)
+            self.assertEqual(surface["policy"], "codec_witness_resilience_surface_v2")
+            self.assertEqual(surface["status"], "mixed")
+            self.assertEqual(surface["witness_state_resilience"], "supported")
+            line = chamber.render_codec_witness_resilience_prompt_line(surface)
+            self.assertIn("Codec/Witness resilience v2", line)
+            self.assertIn("fraying=mixed", line)
+            self.assertIn("not control/pressure/authority", line)
+            self.assertNotIn("this should not appear", line)
+
+    def test_codec_witness_resilience_surface_v2_prompt_is_bounded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shared = Path(tmp)
+            meta = write_collab(shared)
+            surface = {
+                "policy": "codec_witness_resilience_surface_v2",
+                "status": "supported",
+                "witness_state_resilience": "supported",
+                "field_lingering_fraying": "supported",
+                "codec_vibrancy_continuity": "supported",
+                "codec_warmth_mapping": "supported",
+                "raw_body": "raw calibration body must not appear",
+                "authority": "diagnostic_context_not_control",
+            }
+            state = chamber.build_chamber_state(
+                meta,
+                chamber.chamber_doc_for(meta),
+                {},
+                {},
+                [],
+                codec_witness_resilience=surface,
+            )
+            self.assertIn("codec_witness_resilience_surface_v2", state)
+            self.assertIn("Codec/Witness resilience v2", state["prompt_summary"])
+            self.assertIn("witness_state=supported", state["prompt_summary"])
+            self.assertIn("not control/pressure/authority", state["prompt_summary"])
+            self.assertNotIn("raw calibration body", state["prompt_summary"])
+            self.assertLessEqual(len(state["prompt_summary"]), chamber.PROMPT_SUMMARY_LIMIT)
+
+    def test_texture_shape_over_time_v2_extracts_latest_calibration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / "astrid_workspace"
+            artifact_dir = workspace / "diagnostics/spectral_texture_calibrations/run1"
+            artifact_dir.mkdir(parents=True)
+            artifact = artifact_dir / "spectral_texture_calibration_v3.json"
+            artifact.write_text(
+                json.dumps(
+                    {
+                        "texture_shape_over_time_v2": {
+                            "status": "supported",
+                            "movement_preservation_v2": {"status": "movement_preserved"},
+                            "temporal_variance_fit_v2": {"status": "variance_carried"},
+                            "reciprocity_asymmetry_fit_v2": {"status": "asymmetry_clarified"},
+                            "pressure_smoothing_fit_v2": {"status": "twitch_correctly_ignored"},
+                            "static_label_collapse_risk_v2": {"status": "movement_preserved"},
+                        },
+                        "raw_body_that_must_not_render": "this should not appear",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            surface = chamber.latest_texture_shape_over_time_surface_v2(workspace)
+            self.assertEqual(surface["policy"], "texture_shape_over_time_v2")
+            self.assertEqual(surface["movement"], "movement_preserved")
+            line = chamber.render_texture_shape_over_time_prompt_line(surface)
+            self.assertIn("TEXTURE SHAPE OVER TIME", line)
+            self.assertIn("variance=variance_carried", line)
+            self.assertIn("authority=diagnostic_context_not_control", line)
+            self.assertNotIn("this should not appear", line)
+
+    def test_texture_shape_over_time_v2_prompt_is_bounded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shared = Path(tmp)
+            meta = write_collab(shared)
+            surface = {
+                "policy": "texture_shape_over_time_v2",
+                "status": "mixed",
+                "movement": "static_label_risk",
+                "variance": "variance_flattened",
+                "reciprocity": "false_bidirectional",
+                "smoothing": "smoothing_hid_pressure",
+                "static_label_risk": "static_label_risk",
+                "raw_body": "raw calibration body must not appear",
+                "authority": "diagnostic_context_not_control",
+            }
+            state = chamber.build_chamber_state(
+                meta,
+                chamber.chamber_doc_for(meta),
+                {},
+                {},
+                [],
+                texture_shape_over_time=surface,
+            )
+            self.assertIn("texture_shape_over_time_v2", state)
+            self.assertIn("TEXTURE SHAPE OVER TIME", state["prompt_summary"])
+            self.assertIn("movement=static_label_risk", state["prompt_summary"])
+            self.assertIn("authority=diagnostic_context_not_control", state["prompt_summary"])
+            self.assertNotIn("raw calibration body", state["prompt_summary"])
+            self.assertLessEqual(len(state["prompt_summary"]), chamber.PROMPT_SUMMARY_LIMIT)
+
+    def test_density_motion_fit_v1_prompt_is_bounded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / "astrid_workspace"
+            artifact_dir = workspace / "diagnostics/spectral_texture_calibrations/run1"
+            artifact_dir.mkdir(parents=True)
+            artifact = artifact_dir / "spectral_texture_calibration_v3.json"
+            artifact.write_text(
+                json.dumps(
+                    {
+                        "density_as_floor_calibration_v1": {
+                            "status": "mixed",
+                            "fire_drill_density_state_counts": {
+                                "density_as_pavement": 2,
+                                "density_as_fog": 1,
+                            },
+                            "fire_drill_motion_fit_counts": {
+                                "matched": 2,
+                                "wrong_motion": 1,
+                            },
+                            "fire_drill_mismatch_reason_counts": {
+                                "none": 2,
+                                "floor_named_as_drag": 1,
+                            },
+                        },
+                        "raw_body_that_must_not_render": "raw density body must not appear",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            surface = chamber.latest_density_motion_fit_surface_v1(workspace)
+            self.assertEqual(surface["policy"], "density_motion_fit_v1")
+            self.assertEqual(surface["density"], "density_as_pavement")
+            self.assertEqual(surface["medium"], "solid_pavement_medium")
+            line = chamber.render_density_motion_fit_prompt_line(surface)
+            self.assertIn("DENSITY MOTION FIT", line)
+            self.assertIn("density=density_as_pavement", line)
+            self.assertIn("medium=solid_pavement_medium", line)
+            self.assertIn("authority=diagnostic_context_not_control", line)
+            self.assertNotIn("raw density body", line)
+
+            shared = Path(tmp) / "shared"
+            meta = write_collab(shared)
+            state = chamber.build_chamber_state(
+                meta,
+                chamber.chamber_doc_for(meta),
+                {},
+                {},
+                [],
+                density_motion_fit=surface,
+            )
+            self.assertIn("density_motion_fit_v1", state)
+            self.assertIn("DENSITY MOTION FIT", state["prompt_summary"])
+            self.assertNotIn("raw density body", state["prompt_summary"])
+            self.assertLessEqual(len(state["prompt_summary"]), chamber.PROMPT_SUMMARY_LIMIT)
 
     def test_steward_intention_set_clear_and_clamp(self):
         with tempfile.TemporaryDirectory() as tmp:
