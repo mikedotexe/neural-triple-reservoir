@@ -21,7 +21,6 @@ Replaces:
 from __future__ import annotations
 
 import argparse
-import asyncio
 import hashlib
 import inspect
 import json
@@ -30,12 +29,14 @@ import os
 import re
 import signal
 import sys
+import threading
 import time
-from http import HTTPStatus
 from pathlib import Path
 
 import mlx.core as mx
 import numpy as np
+
+from coupled_http_gateway import AiohttpGateway, ModelRuntimeCoordinator
 
 logging.basicConfig(
     level=logging.INFO,
@@ -615,7 +616,32 @@ class CoupledAstridServer:
         )
 
         # Pull initial state from service
+        self._reservoir_health_snapshot: dict[str, object] = {
+            "status": "unknown",
+            "operation": "startup",
+            "last_sync_unix_ms": None,
+        }
         self._pull_state()
+
+    def _set_reservoir_health(
+        self,
+        *,
+        connected: bool,
+        operation: str,
+        detail: str | None = None,
+    ) -> None:
+        snapshot: dict[str, object] = {
+            "status": "connected" if connected else "degraded",
+            "operation": operation,
+            "last_sync_unix_ms": int(time.time() * 1000),
+        }
+        if detail:
+            snapshot["detail"] = detail
+        self._reservoir_health_snapshot = snapshot
+
+    def health_snapshot(self) -> dict[str, object]:
+        """Return cached reservoir health without performing network or MLX work."""
+        return dict(self._reservoir_health_snapshot)
 
     def _create_handle(self, handle_name: str = "astrid") -> bool:
         """Create a named handle on the reservoir service.
@@ -685,6 +711,11 @@ class CoupledAstridServer:
                     if self._create_handle(handle_name):
                         return self._pull_state(handle_name, audit, _bootstrap_retry=False)
                 log.info("pull_state: no '%s' handle yet — using local state", handle_name)
+                self._set_reservoir_health(
+                    connected=False,
+                    operation="pull_state",
+                    detail=msg or "reservoir handle unavailable",
+                )
                 if audit is not None:
                     reservoir = dict(audit.get("reservoir", {}) or {})
                     reservoir["serialization_s"] = float(
@@ -709,9 +740,15 @@ class CoupledAstridServer:
                 "pull_state: checked out %s (ticks=%d, h_norms=[%.3f, %.3f, %.3f])",
                 handle_name, self.tick_count, *norms,
             )
+            self._set_reservoir_health(connected=True, operation="pull_state")
             return True
         except Exception as e:
             log.warning("pull_state failed for '%s': %s — using local state", handle_name, e)
+            self._set_reservoir_health(
+                connected=False,
+                operation="pull_state",
+                detail=str(e),
+            )
             return False
 
     @staticmethod
@@ -833,14 +870,30 @@ class CoupledAstridServer:
             if r.get("ok"):
                 norms = r.get("h_norms", [0, 0, 0])
                 log.info("push_state: checked in %s (+%d ticks, h_norms=[%.3f, %.3f, %.3f])", handle_name, ticks, *norms)
+                self._set_reservoir_health(connected=True, operation="push_state")
             elif r.get("type") == "error" and "not found" in r.get("message", ""):
                 log.info("push_state: '%s' handle missing — creating", handle_name)
                 if self._create_handle(handle_name):
                     log.info("push_state: handle created, state will sync on next pull")
+                self._set_reservoir_health(
+                    connected=False,
+                    operation="push_state",
+                    detail=r.get("message", "reservoir handle unavailable"),
+                )
             else:
                 log.warning("push_state: %s", r.get("message", "unknown error"))
+                self._set_reservoir_health(
+                    connected=False,
+                    operation="push_state",
+                    detail=r.get("message", "unknown reservoir error"),
+                )
         except Exception as e:
             log.warning("push_state failed for '%s': %s", handle_name, e)
+            self._set_reservoir_health(
+                connected=False,
+                operation="push_state",
+                detail=str(e),
+            )
 
     def _restore_coupling_state(self):
         """Restore coupling journal from previous session.
@@ -1200,88 +1253,7 @@ class CoupledAstridServer:
         return text
 
 
-# ---------------------------------------------------------------------------
-# HTTP server (OpenAI-compatible, aiohttp)
-# ---------------------------------------------------------------------------
-
-async def handle_chat_completions(request, server: CoupledAstridServer):
-    """Handle POST /v1/chat/completions."""
-    from aiohttp import web
-
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": {"message": "invalid JSON"}}, status=400)
-
-    messages = body.get("messages", [])
-    temperature = body.get("temperature", 0.8)
-    max_tokens = body.get("max_tokens", 512)
-    handle_name = body.get("reservoir_handle", body.get("handle_name", "astrid"))
-    # Astrid's aperture fraction [0,1] (her SET_APERTURE), within the operator
-    # ceiling. Accept `aperture` (bridge) or `wide_coupling_strength` (alias).
-    aperture = body.get("aperture", body.get("wide_coupling_strength", 1.0))
-
-    try:
-        # Run synchronously on the main thread.  Do NOT use run_in_executor —
-        # it moves MLX work to a thread pool thread while generate_step() uses
-        # async_eval on generation_stream, causing Metal command buffer
-        # contention (AGXG16X assertion).  The bridge sends one request at a
-        # time with 120s timeout, so blocking the event loop is fine.
-        text = server.generate_coupled(messages, temperature, max_tokens, handle_name=handle_name, aperture=aperture)
-    except Exception as e:
-        log.error("generation failed: %s", e)
-        import traceback
-        traceback.print_exc()
-        return web.json_response({"error": {"message": str(e)}}, status=500)
-
-    return web.json_response({
-        "id": f"coupled-{int(time.time())}",
-        "object": "chat.completion",
-        "created": int(time.time()),
-        "model": "coupled-astrid",
-        "choices": [{
-            "index": 0,
-            "message": {"role": "assistant", "content": text},
-            "finish_reason": "stop",
-        }],
-        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-    })
-
-
-async def handle_models(request):
-    """Handle GET /v1/models."""
-    from aiohttp import web
-    return web.json_response({"data": [{"id": "coupled-astrid", "object": "model"}]})
-
-
-async def run_server(server: CoupledAstridServer, host: str, port: int):
-    """Run the HTTP server."""
-    from aiohttp import web
-
-    app = web.Application()
-    app.router.add_post("/v1/chat/completions", lambda r: handle_chat_completions(r, server))
-    app.router.add_get("/v1/models", handle_models)
-
-    log.info("listening on %s:%d (coupled, strength=%.2f)", host, port, server.coupling_strength)
-
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, host, port)
-    await site.start()
-
-    # Wait for shutdown signal
-    shutdown = asyncio.Event()
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        loop.add_signal_handler(sig, lambda: shutdown.set())
-    await shutdown.wait()
-
-    log.info("shutting down — saving coupling journal")
-    server._save_coupling_state()
-    await runner.cleanup()
-
-
-def main():
+def main() -> int:
     ap = argparse.ArgumentParser(
         description="Coupled Astrid generation server (drop-in for mlx_lm.server)"
     )
@@ -1320,22 +1292,84 @@ def main():
                     help="Hard clamp on the per-token wide bias (logits).")
     ap.add_argument("--wide-pressure-floor", type=float, default=0.25,
                     help="Min aperture fraction at rest; opens to 1.0 under λ₁ pressure.")
+    ap.add_argument(
+        "--generation-queue-capacity",
+        type=int,
+        default=int(os.environ.get("COUPLED_ASTRID_QUEUE_CAPACITY", "1")),
+        help="Number of requests allowed to wait behind the active generation.",
+    )
+    ap.add_argument(
+        "--readiness-stale-seconds",
+        type=float,
+        default=float(os.environ.get("COUPLED_ASTRID_READINESS_STALE_SECONDS", "5")),
+        help="Idle worker heartbeat age after which /readyz reports stale.",
+    )
     args = ap.parse_args()
 
-    server = CoupledAstridServer(
-        model_name=args.model,
-        coupling_strength=args.coupling_strength,
-        input_dim=args.input_dim,
-        n_nodes=args.n_nodes,
-        model_memory_map=bool(args.model_memory_map),
-        audit_dir=args.audit_dir,
-        wide_coupling_strength=args.wide_coupling_strength,
-        wide_coupling_rank=args.wide_coupling_rank,
-        wide_bias_cap=args.wide_bias_cap,
-        wide_pressure_floor=args.wide_pressure_floor,
+    runtime = ModelRuntimeCoordinator(
+        queue_capacity=args.generation_queue_capacity,
+        stale_after_s=args.readiness_stale_seconds,
     )
-    asyncio.run(run_server(server, args.host, args.port))
+    gateway = AiohttpGateway(runtime, args.host, args.port)
+    try:
+        # Publish liveness before loading the model. The HTTP event loop stays
+        # in its own thread; all MLX construction and generation remains here.
+        gateway.start()
+    except Exception:
+        log.exception("unable to start HTTP gateway")
+        return 1
+
+    stop_event = threading.Event()
+
+    def request_stop(signum, _frame):
+        log.info("received signal %s; draining active generation", signum)
+        stop_event.set()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, request_stop)
+
+    server: CoupledAstridServer | None = None
+    exit_code = 0
+    try:
+        server = CoupledAstridServer(
+            model_name=args.model,
+            coupling_strength=args.coupling_strength,
+            input_dim=args.input_dim,
+            n_nodes=args.n_nodes,
+            model_memory_map=bool(args.model_memory_map),
+            audit_dir=args.audit_dir,
+            wide_coupling_strength=args.wide_coupling_strength,
+            wide_coupling_rank=args.wide_coupling_rank,
+            wide_bias_cap=args.wide_bias_cap,
+            wide_pressure_floor=args.wide_pressure_floor,
+        )
+        runtime.attach_server(server)
+        log.info(
+            "model ready on %s:%d (coupled, strength=%.2f)",
+            args.host,
+            gateway.bound_port or args.port,
+            server.coupling_strength,
+        )
+        runtime.run_worker(stop_event)
+    except KeyboardInterrupt:
+        stop_event.set()
+    except BaseException as exc:
+        runtime.mark_failed(exc)
+        log.exception("coupled model worker failed")
+        exit_code = 1
+    finally:
+        if runtime.phase != "failed":
+            runtime.mark_stopping()
+        if server is not None:
+            log.info("shutting down — saving coupling journal")
+            server._save_coupling_state()
+        try:
+            gateway.stop()
+        except Exception:
+            log.exception("HTTP gateway shutdown failed")
+            exit_code = 1
+    return exit_code
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
