@@ -1295,8 +1295,22 @@ def main() -> int:
     ap.add_argument(
         "--generation-queue-capacity",
         type=int,
-        default=int(os.environ.get("COUPLED_ASTRID_QUEUE_CAPACITY", "1")),
+        default=int(os.environ.get("COUPLED_ASTRID_QUEUE_CAPACITY", "4")),
         help="Number of requests allowed to wait behind the active generation.",
+    )
+    ap.add_argument(
+        "--model-qos-mode",
+        choices=("shadow", "active"),
+        default=os.environ.get("COUPLED_ASTRID_QOS_MODE", "shadow"),
+        help="Pending-request scheduling mode. Shadow preserves FIFO.",
+    )
+    ap.add_argument(
+        "--model-qos-receipts",
+        default=os.environ.get(
+            "COUPLED_ASTRID_QOS_RECEIPTS",
+            str(Path(__file__).resolve().parent / "workspace" / "model_qos_receipts.jsonl"),
+        ),
+        help="Owner-only metadata receipt log; contains no prompts or responses.",
     )
     ap.add_argument(
         "--readiness-stale-seconds",
@@ -1309,6 +1323,8 @@ def main() -> int:
     runtime = ModelRuntimeCoordinator(
         queue_capacity=args.generation_queue_capacity,
         stale_after_s=args.readiness_stale_seconds,
+        qos_mode=args.model_qos_mode,
+        qos_receipt_path=args.model_qos_receipts,
     )
     gateway = AiohttpGateway(runtime, args.host, args.port)
     try:
