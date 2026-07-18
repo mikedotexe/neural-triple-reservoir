@@ -4,6 +4,7 @@ __pycache__/
 *.mlpackage/
 state/
 logs/
+workspace/
 tui/target/
 .DS_Store
 .claude/settings.local.json

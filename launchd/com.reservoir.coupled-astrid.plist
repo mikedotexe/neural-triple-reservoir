@@ -15,6 +15,8 @@
 		<string>--model-memory-map</string>
 		<string>--model</string>
 		<string>mlx-community/gemma-4-12B-it-5bit</string>
+		<string>--model-qos-mode</string>
+		<string>active</string>
 	</array>
 	<key>WorkingDirectory</key>
 	<string>/Users/v/other/neural-triple-reservoir</string>
