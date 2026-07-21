@@ -196,6 +196,19 @@ class GatewayTests(unittest.TestCase):
             payload["usage"],
             {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         )
+        timing = payload["model_qos_timing_v1"]
+        self.assertEqual(timing["schema"], "model_qos_timing_v1")
+        self.assertEqual(timing["schema_version"], 1)
+        self.assertGreaterEqual(timing["queue_wait_ms"], 0)
+        self.assertGreater(timing["active_generation_and_reservoir_ms"], 0)
+        self.assertEqual(
+            timing["queue_wait_scope"],
+            "request_enqueue_to_worker_selection_not_experiential_wait",
+        )
+        self.assertEqual(
+            timing["active_work_scope"],
+            "worker_selection_to_response_after_reservoir_checkin_not_cognitive_effort",
+        )
         self.assertEqual(gateway.runtime.phase, "ready")
 
     def test_readyz_reports_stale_worker(self):

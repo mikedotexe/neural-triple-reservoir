@@ -72,6 +72,8 @@ class GenerationJob:
     enqueued_monotonic: float
     qos: ModelQosV1 | None
     waiter_count: int = 1
+    selected_monotonic: float | None = None
+    queue_wait_ms: int | None = None
 
 
 class ModelRuntimeCoordinator:
@@ -227,16 +229,18 @@ class ModelRuntimeCoordinator:
                         fifo_index if self._qos_mode == "shadow" else qos_index
                     )
                     job = self._pending.pop(selected_index)
+                    job.selected_monotonic = now
+                    job.queue_wait_ms = max(
+                        0,
+                        round((now - job.enqueued_monotonic) * 1000),
+                    )
                     self._active = job
                     self._phase = "generating"
                     self._heartbeat_monotonic = now
                     self._append_receipt(
                         job,
                         "selected",
-                        queue_wait_ms=round(
-                            (now - job.enqueued_monotonic) * 1000,
-                            3,
-                        ),
+                        queue_wait_ms=job.queue_wait_ms,
                         actual_arrival_sequence=job.arrival_sequence,
                         hypothetical_arrival_sequence=self._pending_choice_sequence(
                             qos_index,
@@ -255,6 +259,7 @@ class ModelRuntimeCoordinator:
         if server is None:
             return False
         request = job.request
+        active_started_monotonic = job.selected_monotonic or time.monotonic()
         try:
             text = server.generate_coupled(
                 request.messages,
@@ -271,6 +276,19 @@ class ModelRuntimeCoordinator:
                 job.future.set_exception(exc)
             self._append_receipt(job, "completed", outcome="generation_error")
         else:
+            active_generation_and_reservoir_ms = max(
+                0,
+                round((time.monotonic() - active_started_monotonic) * 1000),
+            )
+            timing = {
+                "schema": "model_qos_timing_v1",
+                "schema_version": 1,
+                "queue_wait_ms": job.queue_wait_ms or 0,
+                "active_generation_and_reservoir_ms": active_generation_and_reservoir_ms,
+                "queue_wait_scope": "request_enqueue_to_worker_selection_not_experiential_wait",
+                "active_work_scope": "worker_selection_to_response_after_reservoir_checkin_not_cognitive_effort",
+            }
+            setattr(job.future, "_model_qos_timing_v1", timing)
             with self._lock:
                 self._last_generation_error = None
             if not job.future.cancelled():
@@ -278,7 +296,13 @@ class ModelRuntimeCoordinator:
                 outcome = "delivered"
             else:
                 outcome = "response_discarded_after_active_disconnect"
-            self._append_receipt(job, "completed", outcome=outcome)
+            self._append_receipt(
+                job,
+                "completed",
+                outcome=outcome,
+                queue_wait_ms=job.queue_wait_ms or 0,
+                active_generation_and_reservoir_ms=active_generation_and_reservoir_ms,
+            )
         finally:
             with self._condition:
                 self._active = None
@@ -451,22 +475,24 @@ async def _handle_chat(request, runtime: ModelRuntimeCoordinator):
         return web.json_response({"error": {"message": str(exc)}}, status=500)
 
     created = int(time.time())
-    return web.json_response(
-        {
-            "id": f"coupled-{created}",
-            "object": "chat.completion",
-            "created": created,
-            "model": "coupled-astrid",
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {"role": "assistant", "content": text},
-                    "finish_reason": "stop",
-                }
-            ],
-            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-        }
-    )
+    payload = {
+        "id": f"coupled-{created}",
+        "object": "chat.completion",
+        "created": created,
+        "model": "coupled-astrid",
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": text},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+    }
+    timing = getattr(future, "_model_qos_timing_v1", None)
+    if isinstance(timing, dict):
+        payload["model_qos_timing_v1"] = timing
+    return web.json_response(payload)
 
 
 def create_http_app(runtime: ModelRuntimeCoordinator):
