@@ -120,6 +120,26 @@ def request_json(url: str, *, body=None):
 
 
 class GatewayTests(unittest.TestCase):
+    def test_worker_stop_waits_for_active_generation_return(self):
+        runtime = ModelRuntimeCoordinator(enforce_main_thread=False)
+        server = BlockingFakeServer()
+        runtime.attach_server(server)
+        stop_event = threading.Event()
+        future = runtime.submit(generation_request("astrid"))
+        worker = threading.Thread(target=runtime.run_worker, args=(stop_event,))
+        worker.start()
+        self.addCleanup(lambda: (stop_event.set(), worker.join(2)))
+        self.addCleanup(server.release.set)
+        self.assertTrue(server.started.wait(2))
+        stop_event.set()
+        worker.join(0.05)
+        self.assertTrue(worker.is_alive(), "stop must not preempt active generation")
+        self.assertFalse(future.done())
+        server.release.set()
+        worker.join(2)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(future.result(timeout=1), "gateway-compatible response")
+
     def start_gateway(self, runtime):
         gateway = AiohttpGateway(runtime, "127.0.0.1", 0)
         gateway.start()

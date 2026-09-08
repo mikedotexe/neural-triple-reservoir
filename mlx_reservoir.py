@@ -301,14 +301,17 @@ class ReservoirLogitProcessor:
         # Negative y3 → exploratory/wide (let more tokens through)
         # Applied as scaling on the tail of the distribution
         sig3 = self._sigmoid(self._y3)
-        tail_scale = 1.0 - s * (2.0 * sig3 - 1.0) * 0.3  # ±3% tail scaling
+        tail_scale = 1.0 + s * (2.0 * sig3 - 1.0) * 0.3
         if tail_scale != 1.0:
-            # Scale logits below median down (or up) by tail_scale
+            # Scale distance from the median, not absolute logits: adding a
+            # constant must not change probabilities or reverse the direction.
             sync_start = time.perf_counter()
             median_val = float(mx.median(logits).item())
             self._observe_sync("median_item", time.perf_counter() - sync_start)
             mask = logits < median_val
-            logits = mx.where(mask, logits * tail_scale, logits)
+            logits = mx.where(
+                mask, median_val + (logits - median_val) * tail_scale, logits
+            )
 
         # Layer 4 (y4, WIDE): embedding-tied low-rank vocab bias — the reservoir
         # state nudges WHICH tokens are reachable along coherent semantic axes
