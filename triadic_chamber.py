@@ -262,7 +262,10 @@ def ensure_chamber(coll_dir: Path, meta: dict[str, Any]) -> dict[str, Any]:
         "correspondence_observations",
         "events",
     ):
-        paths[key].touch(exist_ok=True)
+        try:
+            paths[key].touch(exist_ok=False)
+        except FileExistsError:
+            pass
     return chamber
 
 

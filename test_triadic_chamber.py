@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import tempfile
 import time
 import unittest
@@ -190,6 +191,28 @@ class TriadicChamberFileTests(unittest.TestCase):
             self.assertEqual(len(chamber.unprocessed_steward_notes(coll_dir)), 1)
             chamber.mark_notes_processed(coll_dir, [note["id"]])
             self.assertEqual(chamber.unprocessed_steward_notes(coll_dir), [])
+
+    def test_ensure_chamber_does_not_touch_existing_journals(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shared = Path(tmp)
+            meta = write_collab(shared)
+            coll_dir = shared / meta["id"]
+            chamber.ensure_chamber(coll_dir, meta)
+            observation_path = chamber.chamber_paths(coll_dir)[
+                "correspondence_observations"
+            ]
+            observation_path.write_text('{"status":"observed"}\n', encoding="utf-8")
+            os.utime(observation_path, ns=(1_000_000_000, 1_000_000_000))
+            before = observation_path.stat()
+
+            chamber.ensure_chamber(coll_dir, meta)
+
+            after = observation_path.stat()
+            self.assertEqual(after.st_mtime_ns, before.st_mtime_ns)
+            self.assertEqual(
+                observation_path.read_text(encoding="utf-8"),
+                '{"status":"observed"}\n',
+            )
 
     def test_prompt_summary_marks_notes_as_non_commands(self):
         meta = {
