@@ -7,7 +7,10 @@ import unittest
 
 import numpy as np
 
-if "torch" not in sys.modules:
+_installed_torch_stub = False
+try:
+    import torch as _torch  # noqa: F401
+except ModuleNotFoundError:
     torch_stub = types.ModuleType("torch")
 
     class _Module:
@@ -26,6 +29,7 @@ if "torch" not in sys.modules:
     torch_stub.no_grad = _no_grad
     torch_stub.Tensor = object
     sys.modules["torch"] = torch_stub
+    _installed_torch_stub = True
 
 IMPORT_ERROR = None
 try:
@@ -35,6 +39,9 @@ except ModuleNotFoundError as exc:
     ReservoirBridge = None
     ReservoirConfig = None
     IMPORT_ERROR = exc
+finally:
+    if _installed_torch_stub:
+        sys.modules.pop("torch", None)
 
 
 @unittest.skipIf(IMPORT_ERROR is not None, f"optional dependency unavailable: {IMPORT_ERROR}")

@@ -403,6 +403,7 @@ async def refresh_chamber_state(ws, shared_dir: Path, meta: dict) -> bool:
         active_relational_supports=active_relational_supports,
         correspondence_state=correspondence_state,
         codec_witness_resilience=codec_witness_resilience,
+        coll_dir=coll_dir,
     )
     chamber.write_chamber_state(coll_dir, state)
     chamber.write_chamber_memory(coll_dir, state)
