@@ -1987,9 +1987,11 @@ def build_direct_contact_fidelity(
 ) -> dict[str, Any]:
     heartbeat = read_bridge_heartbeat_snapshot()
     thread_ids: list[str] = []
+    seen_thread_ids: set[str] = set()
     for row in records:
         thread_id = str(row.get("thread_id") or "").strip()
-        if thread_id and thread_id not in thread_ids:
+        if thread_id and thread_id not in seen_thread_ids:
+            seen_thread_ids.add(thread_id)
             thread_ids.append(thread_id)
     summaries = [
         summary
@@ -2530,15 +2532,63 @@ def build_correspondence_affordance_budget_v1(
 
 def build_correspondence_handshake_state(records: list[dict[str, Any]]) -> dict[str, Any]:
     latest_by_thread: dict[str, dict[str, Any]] = {}
-    for row in records:
-        if row.get("record_type") != "message":
-            continue
+    ack_by_message: dict[tuple[str, str, str], list[tuple[int, dict[str, Any]]]] = {}
+    ack_by_thread: dict[tuple[str, str, str], list[tuple[int, dict[str, Any]]]] = {}
+    heartbeat_by_thread: dict[str, list[tuple[int, dict[str, Any]]]] = {}
+    reply_by_message: dict[str, list[tuple[int, dict[str, Any]]]] = {}
+    reply_by_thread: dict[str, list[tuple[int, dict[str, Any]]]] = {}
+    read_message_ids: set[str] = set()
+    read_thread_ids: set[str] = set()
+    delivered_message_ids: set[str] = set()
+    legacy_directions: set[tuple[str, str]] = set()
+    latest_ack_any: dict[str, Any] | None = None
+    latest_heartbeat_any: dict[str, Any] | None = None
+
+    for index, row in enumerate(records):
+        record_type = row.get("record_type")
+        message_id = str(row.get("message_id") or "")
         thread_id = str(row.get("thread_id") or "").strip()
-        if not thread_id:
-            continue
-        existing = latest_by_thread.get(thread_id)
-        if existing is None or _row_time_ms(row) >= _row_time_ms(existing):
-            latest_by_thread[thread_id] = row
+        from_being = str(row.get("from_being") or "")
+        to_being = str(row.get("to_being") or "")
+        indexed_row = (index, row)
+
+        if record_type == "message":
+            if thread_id:
+                existing = latest_by_thread.get(thread_id)
+                if existing is None or _row_time_ms(row) >= _row_time_ms(existing):
+                    latest_by_thread[thread_id] = row
+            if _is_legacy_bridge_message(row):
+                legacy_directions.add((from_being, to_being))
+        elif record_type == "ack_receipt":
+            latest_ack_any = row
+            ack_by_message.setdefault((from_being, to_being, message_id), []).append(indexed_row)
+            ack_by_thread.setdefault((from_being, to_being, thread_id), []).append(indexed_row)
+        elif record_type == "presence_heartbeat":
+            latest_heartbeat_any = row
+            heartbeat_by_thread.setdefault(thread_id, []).append(indexed_row)
+        elif record_type == "reply_link":
+            reply_to = str(row.get("reply_to") or "")
+            reply_by_message.setdefault(reply_to, []).append(indexed_row)
+            reply_by_thread.setdefault(thread_id, []).append(indexed_row)
+        elif record_type == "read_receipt":
+            read_message_ids.add(message_id)
+            read_thread_ids.add(thread_id)
+        elif record_type == "delivery_receipt":
+            delivered_message_ids.add(message_id)
+
+    def latest_after(
+        groups: tuple[list[tuple[int, dict[str, Any]]], ...],
+        after_t_ms: int,
+    ) -> dict[str, Any] | None:
+        latest: tuple[int, dict[str, Any]] | None = None
+        for group in groups:
+            for candidate in group:
+                if _row_time_ms(candidate[1]) < after_t_ms:
+                    continue
+                if latest is None or candidate[0] > latest[0]:
+                    latest = candidate
+        return latest[1] if latest is not None else None
+
     active_threads: list[dict[str, Any]] = []
     current_t_ms = now_ms()
     for thread_id, message in latest_by_thread.items():
@@ -2546,57 +2596,32 @@ def build_correspondence_handshake_state(records: list[dict[str, Any]]) -> dict[
         message_t_ms = _row_time_ms(message)
         from_being = str(message.get("from_being") or "")
         to_being = str(message.get("to_being") or "")
-        ack_rows = [
-            row
-            for row in records
-            if row.get("record_type") == "ack_receipt"
-            and str(row.get("from_being") or "") == to_being
-            and str(row.get("to_being") or "") == from_being
-            and (
-                str(row.get("message_id") or "") == message_id
-                or str(row.get("thread_id") or "") == thread_id
-            )
-            and _row_time_ms(row) >= message_t_ms
-        ]
-        latest_ack = ack_rows[-1] if ack_rows else None
+        latest_ack = latest_after(
+            (
+                ack_by_message.get((to_being, from_being, message_id), []),
+                ack_by_thread.get((to_being, from_being, thread_id), []),
+            ),
+            message_t_ms,
+        )
         ack_kind = str((latest_ack or {}).get("ack_kind") or "").strip().lower().replace("-", "_")
         if ack_kind not in {"seen", "held", "unclear", "cannot_answer", "needs_time"}:
             ack_kind = "seen" if latest_ack else ""
-        heartbeat_rows = [
-            row
-            for row in records
-            if row.get("record_type") == "presence_heartbeat"
-            and str(row.get("thread_id") or "") == thread_id
-            and _row_time_ms(row) >= message_t_ms
-        ]
-        latest_heartbeat = heartbeat_rows[-1] if heartbeat_rows else None
-        reply_linked = any(
-            row.get("record_type") == "reply_link"
-            and (
-                str(row.get("reply_to") or "") == message_id
-                or str(row.get("thread_id") or "") == thread_id
-            )
-            and _row_time_ms(row) >= message_t_ms
-            for row in records
+        latest_heartbeat = latest_after(
+            (heartbeat_by_thread.get(thread_id, []),),
+            message_t_ms,
         )
-        read = any(
-            row.get("record_type") == "read_receipt"
-            and (
-                str(row.get("message_id") or "") == message_id
-                or str(row.get("thread_id") or "") == thread_id
-            )
-            for row in records
-        )
-        delivered = any(
-            row.get("record_type") == "delivery_receipt"
-            and str(row.get("message_id") or "") == message_id
-            for row in records
-        )
+        reply_linked = latest_after(
+            (
+                reply_by_message.get(message_id, []),
+                reply_by_thread.get(thread_id, []),
+            ),
+            message_t_ms,
+        ) is not None
+        read = message_id in read_message_ids or thread_id in read_thread_ids
+        delivered = message_id in delivered_message_ids
         legacy_bridge = _is_legacy_bridge_message(message)
-        legacy_bidirectional = legacy_bridge and _legacy_bidirectional_observed(
-            records,
-            from_being,
-            to_being,
+        legacy_bidirectional = legacy_bridge and (
+            (to_being, from_being) in legacy_directions
         )
         if latest_ack and ack_kind in {"held", "needs_time"}:
             status = "held_ack"
@@ -2632,8 +2657,6 @@ def build_correspondence_handshake_state(records: list[dict[str, Any]]) -> dict[
             "legacy_contact_evidence": message.get("legacy_contact_evidence"),
         })
     active_threads.sort(key=lambda row: int(row.get("stale_unacknowledged_thread_age_ms") or 0))
-    latest_ack_any = next((row for row in reversed(records) if row.get("record_type") == "ack_receipt"), None)
-    latest_heartbeat_any = next((row for row in reversed(records) if row.get("record_type") == "presence_heartbeat"), None)
     pending = [
         str(row.get("pending_ack_by"))
         for row in active_threads

@@ -55,8 +55,10 @@ DEFAULT_WS_URL = "ws://127.0.0.1:7881"
 DEFAULT_INTERVAL_S = 2.0
 FRESHNESS_FLOOR_S = 60.0  # skip blend if either source is older than this
 RECONNECT_BACKOFF_S = 3.0
+CORRESPONDENCE_STATE_CACHE_TTL_S = 30.0
 ASTRID_NAME = "astrid"
 MINIME_NAME = "minime"
+_correspondence_state_cache: dict[str, tuple[tuple[object, ...], float, dict]] = {}
 
 
 def _safe_array(values: list[float]) -> np.ndarray:
@@ -336,6 +338,44 @@ def steward_intention_tick_text(meta: dict, intention: dict) -> str:
     )
 
 
+def _path_revision(path: Path) -> tuple[int, int] | None:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return stat.st_size, stat.st_mtime_ns
+
+
+def correspondence_state_input_revision(coll_dir: Path) -> tuple[object, ...]:
+    paths = chamber.chamber_paths(coll_dir)
+    return (
+        _path_revision(chamber.correspondence_ledger_path(coll_dir.parent)),
+        _path_revision(paths["correspondence_observations"]),
+    )
+
+
+def cached_correspondence_state(
+    coll_dir: Path,
+    *,
+    monotonic_now: float | None = None,
+) -> dict:
+    """Reuse derived correspondence until source bytes or the refresh TTL change."""
+    current = time.monotonic() if monotonic_now is None else monotonic_now
+    key = str(coll_dir.resolve())
+    revision = correspondence_state_input_revision(coll_dir)
+    cached = _correspondence_state_cache.get(key)
+    if cached is not None:
+        cached_revision, cached_at, state = cached
+        if (
+            cached_revision == revision
+            and current - cached_at < CORRESPONDENCE_STATE_CACHE_TTL_S
+        ):
+            return state
+    state = chamber.build_correspondence_state(coll_dir)
+    _correspondence_state_cache[key] = (revision, current, state)
+    return state
+
+
 async def refresh_chamber_state(ws, shared_dir: Path, meta: dict) -> bool:
     coll_id = str(meta.get("id") or "")
     if not coll_id:
@@ -381,7 +421,7 @@ async def refresh_chamber_state(ws, shared_dir: Path, meta: dict) -> bool:
     annotation_lane = chamber.build_annotation_lane(coll_dir)
     consent_protocol = chamber.build_consent_protocol(coll_dir)
     active_relational_supports = chamber.build_active_relational_supports(consent_protocol)
-    correspondence_state = chamber.build_correspondence_state(coll_dir)
+    correspondence_state = cached_correspondence_state(coll_dir)
     chamber.write_correspondence_artifacts(coll_dir, correspondence_state)
     codec_witness_resilience = chamber.latest_codec_witness_resilience_surface_v2()
     state = chamber.build_chamber_state(

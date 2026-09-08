@@ -2203,6 +2203,101 @@ class TriadicChamberFeederTests(unittest.TestCase):
             self.assertIn("relational_metrics", state)
             self.assertIn("phase_cartography", state)
 
+    def test_handshake_state_indexes_large_ledger_in_one_pass(self):
+        class CountingRecords(list):
+            def __init__(self, values):
+                super().__init__(values)
+                self.iterations = 0
+
+            def __iter__(self):
+                self.iterations += 1
+                return super().__iter__()
+
+        records = []
+        for index in range(2_000):
+            message_id = f"message-{index}"
+            thread_id = f"thread-{index}"
+            records.extend([
+                {
+                    "record_type": "message",
+                    "message_id": message_id,
+                    "thread_id": thread_id,
+                    "from_being": "astrid",
+                    "to_being": "minime",
+                    "t_ms": index * 10 + 1,
+                },
+                {
+                    "record_type": "delivery_receipt",
+                    "message_id": message_id,
+                    "thread_id": thread_id,
+                    "t_ms": index * 10 + 2,
+                },
+                {
+                    "record_type": "read_receipt",
+                    "message_id": message_id,
+                    "thread_id": thread_id,
+                    "t_ms": index * 10 + 3,
+                },
+            ])
+        records.append({
+            "record_type": "ack_receipt",
+            "message_id": "message-1999",
+            "thread_id": "thread-1999",
+            "from_being": "minime",
+            "to_being": "astrid",
+            "ack_kind": "held",
+            "t_ms": 19_995,
+        })
+        counted = CountingRecords(records)
+
+        state = chamber.build_correspondence_handshake_state(counted)
+
+        self.assertEqual(counted.iterations, 1)
+        self.assertEqual(state["active_threads_total"], 2_000)
+        self.assertEqual(state["active_threads"][0]["thread_id"], "thread-0")
+        self.assertEqual(state["active_threads"][0]["status"], "read_unacknowledged")
+        self.assertEqual(state["last_acknowledged_reflection"]["ack_kind"], "held")
+
+    def test_correspondence_state_cache_invalidates_on_source_append_and_ttl(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shared = Path(tmp)
+            meta = write_collab(shared)
+            coll_dir = shared / meta["id"]
+            chamber.ensure_chamber(coll_dir, meta)
+            ledger = chamber.correspondence_ledger_path(shared)
+            ledger.write_text("", encoding="utf-8")
+            cache_key = str(coll_dir.resolve())
+            collab_feeder._correspondence_state_cache.pop(cache_key, None)
+
+            with patch.object(
+                chamber,
+                "build_correspondence_state",
+                side_effect=[{"build": 1}, {"build": 2}, {"build": 3}],
+            ) as build:
+                first = collab_feeder.cached_correspondence_state(
+                    coll_dir,
+                    monotonic_now=100.0,
+                )
+                unchanged = collab_feeder.cached_correspondence_state(
+                    coll_dir,
+                    monotonic_now=101.0,
+                )
+                ledger.write_text("{}\n", encoding="utf-8")
+                appended = collab_feeder.cached_correspondence_state(
+                    coll_dir,
+                    monotonic_now=102.0,
+                )
+                expired = collab_feeder.cached_correspondence_state(
+                    coll_dir,
+                    monotonic_now=102.0 + collab_feeder.CORRESPONDENCE_STATE_CACHE_TTL_S,
+                )
+
+            self.assertIs(first, unchanged)
+            self.assertEqual(appended, {"build": 2})
+            self.assertEqual(expired, {"build": 3})
+            self.assertEqual(build.call_count, 3)
+            collab_feeder._correspondence_state_cache.pop(cache_key, None)
+
     def test_presence_and_annotations_do_not_tick_reservoir(self):
         with tempfile.TemporaryDirectory() as tmp:
             shared = Path(tmp)
