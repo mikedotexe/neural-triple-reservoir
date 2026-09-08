@@ -1885,6 +1885,132 @@ class TriadicChamberFileTests(unittest.TestCase):
         self.assertIn("interpretive context, not authority", state["prompt_summary"])
         self.assertLessEqual(len(state["prompt_summary"]), chamber.PROMPT_SUMMARY_LIMIT)
 
+    def test_attention_projection_separates_material_and_volatile_revisions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shared = Path(tmp)
+            meta = write_collab(shared)
+            coll_dir = shared / meta["id"]
+            chamber.append_jsonl(
+                coll_dir / "timeline.jsonl",
+                {
+                    "id": "joined-1",
+                    "t_ms": 2_000,
+                    "actor": "minime",
+                    "event": "joined",
+                },
+            )
+            chamber.append_jsonl(
+                coll_dir / "shared_thoughts.jsonl",
+                {
+                    "id": "thought-1",
+                    "t_ms": 3_000,
+                    "actor": "astrid",
+                    "text": "A durable thought for the room.",
+                },
+            )
+
+            first = chamber.build_attention_projection_v1(
+                coll_dir,
+                meta,
+                {
+                    "prompt_summary": "first rendering",
+                    "reservoir": {"astrid": {"tick_count": 1}},
+                    "resonance": [{"pair": ["astrid", "minime"], "correlation": 0.1}],
+                },
+            )
+            changed_meta = dict(meta, updated_t_ms=99_999)
+            second = chamber.build_attention_projection_v1(
+                coll_dir,
+                changed_meta,
+                {
+                    "prompt_summary": "second rendering",
+                    "reservoir": {"astrid": {"tick_count": 9}},
+                    "resonance": [{"pair": ["astrid", "minime"], "correlation": 0.9}],
+                },
+            )
+
+        self.assertEqual(first["material_revision"], second["material_revision"])
+        self.assertNotEqual(first["volatile_revision"], second["volatile_revision"])
+        self.assertNotEqual(
+            first["status_summary_sha256"], second["status_summary_sha256"]
+        )
+        self.assertEqual(
+            first["audience_revisions"]["astrid"]["material_event_count"],
+            2,
+        )
+        self.assertEqual(
+            first["audience_revisions"]["minime"]["material_event_count"],
+            3,
+        )
+        self.assertEqual(
+            first["correspondence_scope"],
+            "protected_global_ledger_not_room_attributed",
+        )
+
+    def test_attention_projection_advances_only_the_relevant_audience(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shared = Path(tmp)
+            meta = write_collab(shared)
+            coll_dir = shared / meta["id"]
+            first = chamber.build_attention_projection_v1(coll_dir, meta, {})
+
+            chamber.append_jsonl(
+                coll_dir / "shared_thoughts.jsonl",
+                {
+                    "id": "astrid-thought-1",
+                    "t_ms": 3_000,
+                    "actor": "astrid",
+                    "text": "This should be new to Minime, not to Astrid.",
+                },
+            )
+            second = chamber.build_attention_projection_v1(coll_dir, meta, {})
+
+        self.assertEqual(
+            first["audience_revisions"]["astrid"]["material_revision"],
+            second["audience_revisions"]["astrid"]["material_revision"],
+        )
+        self.assertNotEqual(
+            first["audience_revisions"]["minime"]["material_revision"],
+            second["audience_revisions"]["minime"]["material_revision"],
+        )
+        latest = second["audience_revisions"]["minime"]["latest_material_event"]
+        self.assertEqual(latest["event_id"], "shared_thoughts.jsonl:astrid-thought-1")
+        self.assertEqual(latest["audiences"], ["minime"])
+
+    def test_build_chamber_state_embeds_attention_projection_when_room_is_known(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shared = Path(tmp)
+            meta = write_collab(shared)
+            coll_dir = shared / meta["id"]
+            doc = chamber.chamber_doc_for(meta)
+
+            first = chamber.build_chamber_state(
+                meta,
+                doc,
+                {},
+                {},
+                [],
+                coll_dir=coll_dir,
+            )
+            second = chamber.build_chamber_state(
+                meta,
+                doc,
+                {"astrid": {"tick_count": 77}},
+                {},
+                [],
+                coll_dir=coll_dir,
+            )
+
+        self.assertIn("attention_projection_v1", first)
+        self.assertEqual(
+            first["attention_projection_v1"]["material_revision"],
+            second["attention_projection_v1"]["material_revision"],
+        )
+        self.assertNotEqual(
+            first["attention_projection_v1"]["volatile_revision"],
+            second["attention_projection_v1"]["volatile_revision"],
+        )
+
     def test_metrics_weather_and_status_render_bounded_output(self):
         with tempfile.TemporaryDirectory() as tmp:
             shared = Path(tmp)

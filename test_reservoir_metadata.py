@@ -120,6 +120,24 @@ def load_reservoir_service_with_stubs():
 
 
 class ReservoirMetadataTests(unittest.TestCase):
+    _STUBBED_MODULES = (
+        "dual_ai_bridge",
+        "triple_reservoir_coreml",
+        "reservoir_service",
+    )
+
+    def setUp(self):
+        self._module_snapshot = {
+            name: sys.modules.get(name) for name in self._STUBBED_MODULES
+        }
+
+    def tearDown(self):
+        for name, module in self._module_snapshot.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
+
     def test_tick_metadata_is_visible_in_read_and_list(self):
         reservoir_service = load_reservoir_service_with_stubs()
         with tempfile.TemporaryDirectory() as tmp:

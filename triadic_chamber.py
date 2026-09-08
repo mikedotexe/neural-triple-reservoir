@@ -49,6 +49,9 @@ PROPOSAL_RATIONALE_LIMIT = 700
 CONSENT_NOTE_LIMIT = 500
 PROMPT_NOTE_LIMIT = 240
 PROMPT_SUMMARY_LIMIT = 2_300
+ATTENTION_PROJECTION_SCHEMA_VERSION = 1
+ATTENTION_EVENT_TAIL_LIMIT = 32
+ATTENTION_AUDIENCES = (ASTRID_HANDLE, MINIME_HANDLE)
 CURSOR_KEEP_LIMIT = 1_000
 MEMORY_TEXT_LIMIT = 500
 MEMORY_LIST_LIMIT = 5
@@ -5273,6 +5276,194 @@ def render_prompt_summary(
     return bounded_join(parts, PROMPT_SUMMARY_LIMIT)
 
 
+def _canonical_json_bytes(value: Any) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def _sha256_revision(value: Any) -> str:
+    return f"sha256:{hashlib.sha256(_canonical_json_bytes(value)).hexdigest()}"
+
+
+def _attention_event_audiences(actor: str, *, broadcast: bool) -> list[str]:
+    if broadcast or actor not in ATTENTION_AUDIENCES:
+        return list(ATTENTION_AUDIENCES)
+    return [audience for audience in ATTENTION_AUDIENCES if audience != actor]
+
+
+def _attention_event_id(source_name: str, row: dict[str, Any]) -> str:
+    for key in (
+        "event_id",
+        "message_id",
+        "id",
+        "receipt_id",
+        "proposal_id",
+        "annotation_id",
+        "intention_id",
+        "note_id",
+    ):
+        value = str(row.get(key) or "").strip()
+        if value:
+            return f"{source_name}:{value}"
+    return f"{source_name}:{_sha256_revision(row).removeprefix('sha256:')}"
+
+
+def _attention_event(
+    source_name: str,
+    source_path: Path,
+    row: dict[str, Any],
+    *,
+    category: str,
+    default_kind: str,
+    broadcast: bool = False,
+) -> dict[str, Any]:
+    actor = str(row.get("actor") or row.get("source") or "unknown").strip().lower()
+    kind = str(row.get("event") or default_kind).strip().lower() or default_kind
+    return {
+        "event_id": _attention_event_id(source_name, row),
+        "kind": kind,
+        "category": category,
+        "actor": actor,
+        "audiences": _attention_event_audiences(actor, broadcast=broadcast),
+        "t_ms": _row_time_ms(row),
+        "source_ref": str(source_path),
+    }
+
+
+def _attention_source_events(coll_dir: Path, meta: dict[str, Any]) -> list[dict[str, Any]]:
+    semantic_meta = {
+        "id": str(meta.get("id") or coll_dir.name),
+        "topic": str(meta.get("topic") or ""),
+        "rationale": meta.get("rationale"),
+        "inviter": str(meta.get("inviter") or ""),
+        "invitee": str(meta.get("invitee") or ""),
+        "status": str(meta.get("status") or ""),
+        "members": sorted(str(member) for member in (meta.get("members") or [])),
+    }
+    meta_event_id = f"meta.json:{_sha256_revision(semantic_meta).removeprefix('sha256:')}"
+    events: list[dict[str, Any]] = [{
+        "event_id": meta_event_id,
+        "kind": "collaboration_state",
+        "category": "collaboration",
+        "actor": "shared_state",
+        "audiences": list(ATTENTION_AUDIENCES),
+        "t_ms": int(meta.get("created_t_ms") or 0),
+        "source_ref": str(coll_dir / "meta.json"),
+    }]
+
+    source_specs = (
+        ("timeline.jsonl", "collaboration", "collaboration_transition", True),
+        ("shared_thoughts.jsonl", "shared_thought", "shared_thought", False),
+        ("steward_notes.jsonl", "steward_note", "steward_note", True),
+        ("steward_intentions.jsonl", "steward_intention", "steward_intention", True),
+        ("chamber_memory_edits.jsonl", "memory", "memory_edit", True),
+        ("chamber_presence.jsonl", "presence", "chamber_presence", False),
+        ("chamber_annotations.jsonl", "annotation", "chamber_annotation", False),
+        ("chamber_proposals.jsonl", "support_proposal", "support_proposal", True),
+        ("chamber_consent.jsonl", "consent", "consent_receipt", False),
+    )
+    for source_name, category, default_kind, broadcast in source_specs:
+        source_path = coll_dir / source_name
+        for row in read_jsonl_dicts(source_path):
+            events.append(
+                _attention_event(
+                    source_name,
+                    source_path,
+                    row,
+                    category=category,
+                    default_kind=default_kind,
+                    broadcast=broadcast,
+                )
+            )
+
+    chamber_events_path = chamber_paths(coll_dir)["events"]
+    for row in read_jsonl_dicts(chamber_events_path):
+        if str(row.get("event") or "") not in {"phase_set", "phase_cleared"}:
+            continue
+        events.append(
+            _attention_event(
+                "chamber_events.jsonl",
+                chamber_events_path,
+                row,
+                category="phase",
+                default_kind="phase_transition",
+                broadcast=True,
+            )
+        )
+
+    events.sort(key=lambda event: (int(event.get("t_ms") or 0), str(event["event_id"])))
+    return events
+
+
+def _attention_audience_projection(
+    events: list[dict[str, Any]], audience: str
+) -> dict[str, Any]:
+    relevant = [event for event in events if audience in (event.get("audiences") or [])]
+    event_ids = [str(event["event_id"]) for event in relevant]
+    latest = relevant[-1] if relevant else None
+    return {
+        "material_revision": _sha256_revision(event_ids),
+        "material_t_ms": int(latest.get("t_ms") or 0) if latest else 0,
+        "material_event_count": len(event_ids),
+        "material_event_ids": event_ids[-ATTENTION_EVENT_TAIL_LIMIT:],
+        "latest_material_event": latest,
+    }
+
+
+def build_attention_projection_v1(
+    coll_dir: Path,
+    meta: dict[str, Any],
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    """Project stable authored change separately from volatile chamber motion.
+
+    Direct correspondence is intentionally absent: its global ledger does not
+    carry a collaboration id and already has a protected sender-bound delivery
+    lane. Attaching those rows to whichever room happens to be newest would be
+    false provenance.
+    """
+    events = _attention_source_events(coll_dir, meta)
+    event_ids = [str(event["event_id"]) for event in events]
+    latest = events[-1] if events else None
+    volatile_payload = {
+        key: state.get(key)
+        for key in (
+            "reservoir",
+            "resonance",
+            "relational_metrics",
+            "phase_cartography",
+            "codec_witness_resilience_surface_v2",
+            "texture_shape_over_time_v2",
+            "density_motion_fit_v1",
+        )
+    }
+    return {
+        "schema_version": ATTENTION_PROJECTION_SCHEMA_VERSION,
+        "policy": "collaboration_attention_projection_v1",
+        "material_revision": _sha256_revision(event_ids),
+        "material_t_ms": int(latest.get("t_ms") or 0) if latest else 0,
+        "material_event_count": len(event_ids),
+        "material_event_ids": event_ids[-ATTENTION_EVENT_TAIL_LIMIT:],
+        "latest_material_event": latest,
+        "categories": sorted({str(event["category"]) for event in events}),
+        "audiences": list(ATTENTION_AUDIENCES),
+        "audience_revisions": {
+            audience: _attention_audience_projection(events, audience)
+            for audience in ATTENTION_AUDIENCES
+        },
+        "volatile_revision": _sha256_revision(volatile_payload),
+        "status_summary_sha256": _sha256_revision(str(state.get("prompt_summary") or "")),
+        "correspondence_scope": "protected_global_ledger_not_room_attributed",
+        "optional": True,
+        "silence_means": "neutral_no_inference",
+        "authority": "language_context_not_control",
+    }
+
+
 def build_chamber_state(
     meta: dict[str, Any],
     chamber_doc: dict[str, Any],
@@ -5296,6 +5487,7 @@ def build_chamber_state(
     codec_witness_resilience: dict[str, Any] | None = None,
     texture_shape_over_time: dict[str, Any] | None = None,
     density_motion_fit: dict[str, Any] | None = None,
+    coll_dir: Path | None = None,
 ) -> dict[str, Any]:
     if resonance_rows is None:
         resonance_rows = build_resonance_rows(resonance_payloads)
@@ -5366,6 +5558,12 @@ def build_chamber_state(
         texture_shape_over_time=texture_shape_over_time,
         density_motion_fit=density_motion_fit,
     )
+    if coll_dir is not None:
+        state["attention_projection_v1"] = build_attention_projection_v1(
+            coll_dir,
+            meta,
+            state,
+        )
     return state
 
 
