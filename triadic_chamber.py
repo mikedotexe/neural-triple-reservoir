@@ -58,6 +58,7 @@ MEMORY_LIST_LIMIT = 5
 RELATIONAL_WINDOW_LIMIT = 30
 RELATIONAL_INERTIA_DECAY = 0.85
 RESONANCE_JOURNAL_MIN_INTERVAL_MS = 5 * 60 * 1000
+JSONL_TAIL_BLOCK_BYTES = 64 * 1024
 PRESENCE_ATTENTION_LEVELS = {"unknown", "low", "medium", "high"}
 ANNOTATION_STANCES = {"notice", "affirm", "question", "correct", "refine", "contest"}
 ANNOTATION_TARGETS = {
@@ -1294,6 +1295,49 @@ def read_jsonl_dicts(path: Path) -> list[dict[str, Any]]:
             continue
         if isinstance(payload, dict):
             rows.append(payload)
+    rows.sort(key=lambda row: int(row.get("t_ms") or 0))
+    return rows
+
+
+def read_jsonl_dicts_tail(path: Path, limit: int) -> list[dict[str, Any]]:
+    """Read the newest valid JSON objects without loading an append-only log.
+
+    Rows are collected from the physical tail, then sorted by their event time
+    to retain ``read_jsonl_dicts(...)[-limit:]`` semantics for chronological
+    journals. Malformed or partial rows are skipped and do not consume the
+    requested limit.
+    """
+    if limit <= 0 or not path.is_file():
+        return []
+
+    rows: list[dict[str, Any]] = []
+    with path.open("rb") as source:
+        source.seek(0, 2)
+        position = source.tell()
+        remainder = b""
+        while position > 0 and len(rows) < limit:
+            block_size = min(JSONL_TAIL_BLOCK_BYTES, position)
+            position -= block_size
+            source.seek(position)
+            parts = (source.read(block_size) + remainder).split(b"\n")
+            if position > 0:
+                remainder = parts[0]
+                complete_lines = parts[1:]
+            else:
+                remainder = b""
+                complete_lines = parts
+            for raw_line in reversed(complete_lines):
+                if not raw_line.strip():
+                    continue
+                try:
+                    payload = json.loads(raw_line)
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    continue
+                if isinstance(payload, dict):
+                    rows.append(payload)
+                    if len(rows) >= limit:
+                        break
+
     rows.sort(key=lambda row: int(row.get("t_ms") or 0))
     return rows
 
@@ -4148,7 +4192,10 @@ def build_relational_metrics(
     history_rows: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     history_rows = (
-        read_jsonl_dicts(chamber_paths(coll_dir)["resonance_journal"])
+        read_jsonl_dicts_tail(
+            chamber_paths(coll_dir)["resonance_journal"],
+            RELATIONAL_WINDOW_LIMIT,
+        )
         if history_rows is None
         else history_rows
     )
@@ -4441,7 +4488,10 @@ def build_phase_cartography(
     history_rows: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     history = (
-        read_jsonl_dicts(chamber_paths(coll_dir)["resonance_journal"])
+        read_jsonl_dicts_tail(
+            chamber_paths(coll_dir)["resonance_journal"],
+            RELATIONAL_WINDOW_LIMIT,
+        )
         if history_rows is None
         else history_rows
     )
@@ -4615,7 +4665,10 @@ def write_phase_cartography_artifacts(
 ) -> dict[str, Any]:
     paths = chamber_paths(coll_dir)
     history = (
-        read_jsonl_dicts(paths["resonance_journal"])
+        read_jsonl_dicts_tail(
+            paths["resonance_journal"],
+            RELATIONAL_WINDOW_LIMIT,
+        )
         if history_rows is None
         else history_rows
     )
@@ -5105,7 +5158,7 @@ def maybe_append_resonance_journal(
     if not signature:
         return
     path = chamber_paths(coll_dir)["resonance_journal"]
-    rows = read_jsonl_dicts(path)
+    rows = read_jsonl_dicts_tail(path, 1)
     latest = rows[-1] if rows else {}
     now = now_ms()
     last_t = int(latest.get("t_ms") or 0)
@@ -6337,8 +6390,7 @@ def render_cartography(shared_dir: Path, target: str = "latest", limit: int = 12
     coll_dir = shared_dir / str(meta["id"])
     cartography = _current_phase_cartography(shared_dir, target)
     paths = chamber_paths(coll_dir)
-    rows = read_jsonl_dicts(paths["resonance_journal"])
-    tail = rows[-limit:] if len(rows) > limit else rows
+    tail = read_jsonl_dicts_tail(paths["resonance_journal"], limit)
     lines = [f"Triadic phase cartography: {meta['id']}"]
     lines.append(render_phase_cartography_line(cartography))
     if cartography.get("transition_hint"):
@@ -6536,8 +6588,7 @@ def render_proposal_status(
 def render_weather(shared_dir: Path, target: str = "latest", limit: int = 12) -> str:
     meta = select_collab(shared_dir, target, joined_only=False)
     coll_dir = shared_dir / str(meta["id"])
-    rows = read_jsonl_dicts(chamber_paths(coll_dir)["resonance_journal"])
-    tail = rows[-limit:] if len(rows) > limit else rows
+    tail = read_jsonl_dicts_tail(chamber_paths(coll_dir)["resonance_journal"], limit)
     if not tail:
         return "(no chamber weather timeline yet)"
     lines = [f"Triadic weather timeline: {meta['id']}"]

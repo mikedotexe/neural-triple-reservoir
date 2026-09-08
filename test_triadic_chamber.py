@@ -1617,6 +1617,42 @@ class TriadicChamberFileTests(unittest.TestCase):
             self.assertEqual(metrics["pair_matrix"][0]["delta_correlation"], 0.15)
             self.assertIn("relational_inertia", metrics)
 
+    def test_jsonl_tail_reader_bounds_large_history_and_skips_malformed_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "large_history.jsonl"
+            rows = [
+                {"t_ms": index, "id": f"row-{index}", "padding": "x" * 2_000}
+                for index in range(80)
+            ]
+            rows[-3]["padding"] = "y" * (chamber.JSONL_TAIL_BLOCK_BYTES + 17)
+            body = "\n".join(json.dumps(row) for row in rows)
+            path.write_text(body + "\n{malformed tail\n")
+
+            with patch.object(Path, "read_text", side_effect=AssertionError("full read")):
+                tail = chamber.read_jsonl_dicts_tail(path, 3)
+
+            self.assertEqual([row["id"] for row in tail], ["row-77", "row-78", "row-79"])
+            self.assertGreater(path.stat().st_size, chamber.JSONL_TAIL_BLOCK_BYTES)
+
+    def test_jsonl_tail_reader_preserves_timestamp_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "out_of_order_tail.jsonl"
+            path.write_text(
+                "\n".join(
+                    json.dumps(row)
+                    for row in (
+                        {"t_ms": 1, "id": "old"},
+                        {"t_ms": 3, "id": "third"},
+                        {"t_ms": 2, "id": "second"},
+                    )
+                )
+                + "\n"
+            )
+
+            tail = chamber.read_jsonl_dicts_tail(path, 2)
+
+            self.assertEqual([row["id"] for row in tail], ["second", "third"])
+
     def test_resonance_timeline_appends_signature_changes_without_spam(self):
         with tempfile.TemporaryDirectory() as tmp:
             shared = Path(tmp)
