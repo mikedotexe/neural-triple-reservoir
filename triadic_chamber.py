@@ -14,7 +14,7 @@ import hashlib
 import json
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 DEFAULT_SHARED_DIR = Path("/Users/v/other/shared/collaborations")
 ASTRID_BRIDGE_WORKSPACE = Path("/Users/v/other/astrid/capsules/spectral-bridge/workspace")
@@ -1302,7 +1302,12 @@ def read_jsonl_dicts(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
-def read_jsonl_dicts_tail(path: Path, limit: int) -> list[dict[str, Any]]:
+def read_jsonl_dicts_tail(
+    path: Path,
+    limit: int,
+    *,
+    predicate: Callable[[dict[str, Any]], bool] | None = None,
+) -> list[dict[str, Any]]:
     """Read the newest valid JSON objects without loading an append-only log.
 
     Rows are collected from the physical tail, then sorted by their event time
@@ -1336,7 +1341,9 @@ def read_jsonl_dicts_tail(path: Path, limit: int) -> list[dict[str, Any]]:
                     payload = json.loads(raw_line)
                 except (UnicodeDecodeError, json.JSONDecodeError):
                     continue
-                if isinstance(payload, dict):
+                if isinstance(payload, dict) and (
+                    predicate is None or predicate(payload)
+                ):
                     rows.append(payload)
                     if len(rows) >= limit:
                         break
@@ -2947,7 +2954,7 @@ def build_correspondence_state(coll_dir: Path) -> dict[str, Any]:
         ),
         "active_thread_id": active_thread_id,
         "shared_lexicon_anchor": shared_anchor,
-        "recent_direct_markers": markers[-6:],
+        "recent_direct_markers": markers[-12:],
         "direct_address_survival": {
             "schema_version": CORRESPONDENCE_STATE_SCHEMA_VERSION,
             "status": survival_status,
@@ -3001,10 +3008,15 @@ def build_correspondence_state(coll_dir: Path) -> dict[str, Any]:
 
 def write_correspondence_artifacts(coll_dir: Path, correspondence_state: dict[str, Any]) -> dict[str, Any]:
     paths = chamber_paths(coll_dir)
-    records = read_correspondence_ledger(coll_dir.parent)
+    messages = read_jsonl_dicts_tail(
+        correspondence_ledger_path(coll_dir.parent),
+        12,
+        predicate=lambda row: row.get("record_type") == "message",
+    )
     observations = read_jsonl_dicts(paths["correspondence_observations"])
-    messages = [row for row in records if row.get("record_type") == "message"]
-    direct_traces = _correspondence_marker_records(records)
+    direct_traces = correspondence_state.get("recent_direct_markers")
+    if not isinstance(direct_traces, list):
+        direct_traces = []
     buffer = {
         "schema_version": CORRESPONDENCE_STATE_SCHEMA_VERSION,
         "collab_id": coll_dir.name,
@@ -3012,9 +3024,9 @@ def write_correspondence_artifacts(coll_dir: Path, correspondence_state: dict[st
         "source": "correspondence_v1_ledger",
         "recent_messages": [
             compact_correspondence_record(row)
-            for row in messages[-12:]
+            for row in messages
         ],
-        "recent_direct_traces": direct_traces[-12:],
+        "recent_direct_traces": direct_traces,
         "recent_trace_observations": [
             compact_correspondence_record(row, include_preview=False)
             for row in observations[-12:]

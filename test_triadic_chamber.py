@@ -1676,6 +1676,26 @@ class TriadicChamberFileTests(unittest.TestCase):
 
             self.assertEqual([row["id"] for row in tail], ["second", "third"])
 
+    def test_jsonl_tail_reader_filters_before_counting_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "mixed_history.jsonl"
+            rows = []
+            for index in range(20):
+                rows.append({"t_ms": index * 2, "record_type": "message", "id": index})
+                rows.append({"t_ms": index * 2 + 1, "record_type": "read_receipt"})
+            path.write_text(
+                "\n".join(json.dumps(row) for row in rows) + "\n",
+                encoding="utf-8",
+            )
+
+            tail = chamber.read_jsonl_dicts_tail(
+                path,
+                12,
+                predicate=lambda row: row.get("record_type") == "message",
+            )
+
+            self.assertEqual([row["id"] for row in tail], list(range(8, 20)))
+
     def test_resonance_timeline_appends_signature_changes_without_spam(self):
         with tempfile.TemporaryDirectory() as tmp:
             shared = Path(tmp)
