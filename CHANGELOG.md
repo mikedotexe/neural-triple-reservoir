@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Preserve a missing contextual prerequisite as an unavailable shuffled-replay cell, including admission failures with no model result. Never rerun the failed source cell or change frozen generation inputs.
+
 - Retain native finish and token counts in the coupled control receipt itself, including the pre-cleanup scope of detokenized pieces; reject oversized numeric inputs with a validation error.
 - Add isolated Gemma 4 hidden-vector observation and a frozen, resumable 32D feedback comparison with explicit resource guards, provenance, position alignment and offline-only authority. No activation instrumentation enters the live server.
 

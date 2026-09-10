@@ -66,6 +66,16 @@ def freeze(root, research, model, snapshot, device="cpu"):
     private_write(root / 'protocol.json', (json.dumps(protocol, indent=2)+'\n').encode(), immutable=True)
 
 
+
+def shuffled_feedback(baseline, token_count):
+    """A missing/partial contextual cell is not an available shuffled control."""
+    vectors=[row['contextual_projected'] for row in (baseline.get('result') or {}).get('trace', [])]
+    if len(vectors)!=token_count:
+        return None, None
+    permutation=np.random.default_rng(137).permutation(len(vectors))
+    return np.array(vectors)[permutation], permutation
+
+
 def run(root):
     os.environ['HF_HUB_OFFLINE'] = '1'
     os.environ['TRANSFORMERS_OFFLINE'] = '1'
@@ -266,11 +276,9 @@ def run(root):
         shuffle=None
         if spec['arm']=='shuffled':
             baseline=json.loads((root/f"fixed-{spec['case']}-{spec['state']}-contextual.json").read_text())
-            vectors=[r['contextual_projected'] for r in baseline['result']['trace']]
-            if len(vectors)!=len(fixed_teacher):
+            shuffle, permutation=shuffled_feedback(baseline,len(fixed_teacher))
+            if shuffle is None:
                 write_json(path,dict(spec=spec,result=None,outcome='missing_complete_contextual_replay'));continue
-            permutation=np.random.default_rng(137).permutation(len(vectors))
-            shuffle=np.array(vectors)[permutation]
         try:
             result,_=trial(messages,arm=spec['arm'],seed=spec['seed'],state=spec['state'],
                 teacher=fixed_teacher if spec['kind']=='fixed' else None,scale=scale,shuffled=shuffle)
