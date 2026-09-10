@@ -115,6 +115,7 @@ class GenerationResult:
     terminal_tokens: int
     raw_content_chars: int
     controls: dict[str, Any]
+    termination: dict[str, Any] | None = None
 
     def usage(self):
         return dict(prompt_tokens=self.prompt_tokens, completion_tokens=self.completion_tokens,
@@ -125,6 +126,8 @@ class GenerationResult:
                     finish_reason=self.finish_reason, prompt_tokens=self.prompt_tokens,
                     completion_tokens=self.completion_tokens,
                     filtered_tokens=self.filtered_tokens, terminal_tokens=self.terminal_tokens,
+                    terminal_tokens_scope='server_stop_policy_including_non_eos_boundaries',
+                    termination=self.termination,
                     visible_tokens=self.completion_tokens - self.filtered_tokens - self.terminal_tokens,
                     visible_tokens_scope='detokenizer_input_before_text_cleanup_not_retokenized_prose',
                     raw_content_chars=self.raw_content_chars, content_chars=len(self.content),

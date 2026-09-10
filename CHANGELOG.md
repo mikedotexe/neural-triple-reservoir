@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Distinguish model EOS, inherited channel-boundary stops and output exhaustion in completion evidence. Preserve existing stop tokens and thinking policy; the legacy terminal-token count is explicitly scoped to server-selected stop tokens.
+
 - Preserve a missing contextual prerequisite as an unavailable shuffled-replay cell, including admission failures with no model result. Never rerun the failed source cell or change frozen generation inputs.
 
 - Retain native finish and token counts in the coupled control receipt itself, including the pre-cleanup scope of detokenized pieces; reject oversized numeric inputs with a validation error.

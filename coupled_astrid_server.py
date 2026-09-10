@@ -179,6 +179,22 @@ def _token_to_int(token) -> int:
         return int(np.array(token).item())
 
 
+def _termination_evidence(tokenizer, token_id: int | None) -> dict:
+    """Distinguish model EOS from the inherited server stop-token policy."""
+    if token_id is None:
+        return dict(kind="output_allowance", model_eos_reached=False,
+                    stop_token_id=None, stop_special=None)
+    eos_ids = _tokenizer_id_set(tokenizer, "eos_token_ids")
+    eos_ids.update(_tokenizer_id_set(tokenizer, "eos_token_id"))
+    special = next((text for text in GENERATION_STOP_SPECIALS
+                    if _single_token_id(tokenizer, text) == token_id), None)
+    native = token_id in eos_ids
+    kind = ("model_eos" if native else "channel_boundary"
+            if special == "<channel|>" else "server_stop_special")
+    return dict(kind=kind, model_eos_reached=native,
+                stop_token_id=token_id, stop_special=special)
+
+
 def _clean_generated_text(text: str) -> str:
     cleaned = text or ""
     cleaned = re.sub(r"<think>.*?</think>\s*", "", cleaned, flags=re.DOTALL | re.I)
@@ -1125,6 +1141,7 @@ class CoupledAstridServer:
         ticks = 0
         completion_tokens = filtered_tokens = terminal_tokens = 0
         finish_reason = "length"
+        stop_token_id = None
         last_r_input = None
         decode_start = time.monotonic()
         first_token_seconds = None
@@ -1141,6 +1158,7 @@ class CoupledAstridServer:
             completion_tokens += 1
             if token_id in self._stop_token_ids:
                 terminal_tokens += 1
+                stop_token_id = token_id
                 finish_reason = "stop"
                 break
             if token_id in self._skip_token_ids:
@@ -1264,7 +1282,8 @@ class CoupledAstridServer:
                                        reservoir_coupling_strength=coupling_used, aperture=processor.aperture,
                                        wide_coupling_strength=self.wide_coupling_strength,
                                        processor_order=["reservoir", "additional_repetition"],
-                                       runtime=self.runtime_audit))
+                                       runtime=self.runtime_audit),
+                                  termination=_termination_evidence(self.tokenizer, stop_token_id))
         generation.update(result.evidence())
         generation.update(result.usage())
         generation["finish_reason"] = finish_reason

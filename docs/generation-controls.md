@@ -21,9 +21,18 @@ this is not a persistent response cache.
 Completion usage counts yielded tokens, including terminal and filtered tokens,
 not the unused lookahead sample. `coupled_generation_v1` separates those counts,
 visible token pieces, raw/cleaned characters, resolved controls, reservoir settings
-and loaded source identity. Stop means a configured terminal token was observed;
+and loaded source identity. Stop means a configured server stop token was observed;
 length means the output allowance ended. Errors remain failed requests. Empty
 prose is possible even with nonzero completion-token usage.
+
+The termination receipt distinguishes `model_eos`, `channel_boundary`,
+`server_stop_special` and `output_allowance`, with the observed stop token ID and
+whether it belongs to the tokenizer's EOS set. The inherited policy includes
+Gemma's channel-closing marker, which is not a model end-of-turn token. An API
+`stop` therefore does not by itself establish that a final answer was produced.
+The legacy `terminal_tokens` count is explicitly scoped to the server stop policy;
+`visible_tokens` counts detokenizer inputs before cleanup, not final prose tokens.
+These diagnostics do not change the stop policy or enable thinking.
 
 Consumers must retain caller requests, serialized adapter choices and this server
 receipt as separate evidence. Ollama does not echo all applied settings; its sent
