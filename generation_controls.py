@@ -14,7 +14,11 @@ class InvalidGenerationControls(ValueError):
 
 def number(name, value, low, high=None, *, integer=False):
     kind = int if integer else (int, float)
-    if isinstance(value, bool) or not isinstance(value, kind) or not math.isfinite(value):
+    try:
+        finite = math.isfinite(value) if isinstance(value, (int, float)) else False
+    except OverflowError:
+        finite = False
+    if isinstance(value, bool) or not isinstance(value, kind) or not finite:
         raise InvalidGenerationControls(f"{name} must be a finite {'integer' if integer else 'number'}")
     if value < low or (high is not None and value > high):
         raise InvalidGenerationControls(f"{name} must be in [{low}, {high if high is not None else 'infinity'})")
@@ -118,8 +122,11 @@ class GenerationResult:
 
     def evidence(self):
         return dict(schema='coupled_generation_v1', source='server_reported', controls=self.controls,
+                    finish_reason=self.finish_reason, prompt_tokens=self.prompt_tokens,
+                    completion_tokens=self.completion_tokens,
                     filtered_tokens=self.filtered_tokens, terminal_tokens=self.terminal_tokens,
                     visible_tokens=self.completion_tokens - self.filtered_tokens - self.terminal_tokens,
+                    visible_tokens_scope='detokenizer_input_before_text_cleanup_not_retokenized_prose',
                     raw_content_chars=self.raw_content_chars, content_chars=len(self.content),
                     cleanup_removed_chars=self.raw_content_chars - len(self.content),
                     token_count_scope='yielded_tokens_including_filtered_and_terminal_excluding_unyielded_lookahead')

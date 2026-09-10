@@ -31,6 +31,8 @@ class CompletionTests(unittest.TestCase):
             with patch('mlx_lm.generate.generate_step',return_value=iter((t,None) for t in tokens)):
                 result=server.generate_coupled([],max_tokens=2)
             self.assertEqual(result.finish_reason,reason)
+            self.assertEqual(result.evidence()["finish_reason"],reason)
+            self.assertEqual(result.evidence()["completion_tokens"],len(tokens))
             self.assertEqual(result.completion_tokens,len(tokens));self.assertEqual(result.prompt_tokens,3)
             self.assertEqual(result.filtered_tokens,filtered);self.assertEqual(result.terminal_tokens,terminal)
             self.assertEqual(server.tick_count,visible)

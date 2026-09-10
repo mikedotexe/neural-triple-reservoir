@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Retain native finish and token counts in the coupled control receipt itself, including the pre-cleanup scope of detokenized pieces; reject oversized numeric inputs with a validation error.
+
 - Honor validated explicit MLX sampling and repetition controls, reject unsupported controls and conflicting in-flight retry keys, and return native stop/length with yielded-token usage and applied controls. Omitted defaults and reservoir feedback timing remain unchanged.
 
 - **[codex / deployment] Aligns the live chamber feeder with event-scoped collaboration attention.** Feeder PID `95420` publishes stable global and per-being material revisions for the current joined room while volatile reservoir observations remain on their own diagnostic revision. Rollout observation confirmed the 678 MiB resonance journal and 61 MiB correspondence ledger remain append-only while bounded reverse reads, one-pass indexing, source-revision caching, create-only journal initialization, and bounded buffer refresh prevent unchanged history from monopolizing the feeder. Astrid's consumer silently baselined its existing audience revision; Minime's baseline awaits his first naturally eligible ordinary turn. Cross-repository process, revision, test, and authority evidence: `/Users/v/other/astrid/docs/steward-notes/2026-09-08-collaboration-attention-live-rollout.md`. No room event, message, reservoir tick, control, pressure, fill, PI, or felt-state claim was authored.

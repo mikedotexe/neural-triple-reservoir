@@ -47,7 +47,7 @@ class ControlDeliveryTests(GatewayTests):
 class SamplingTests(unittest.TestCase):
     def test_invalid_values_and_defaults(self):
         self.assertEqual(validate_body({}),SamplingControls())
-        for body in ({'temperature':-1},{'top_k':False},{'top_k':-1},{'top_p':None},{'repetition_penalty':float('inf')},{'messages':'oops'},{'aperture':2}):
+        for body in ({'temperature':-1},{'top_k':False},{'top_k':-1},{'top_p':None},{'repetition_penalty':float('inf')},{'messages':'oops'},{'aperture':2},{'max_tokens':10**400}):
             with self.assertRaises(InvalidGenerationControls):validate_body(body)
         self.assertEqual(SamplingControls(temperature=0,top_p=.5).receipt()['active_filters'],[])
 
