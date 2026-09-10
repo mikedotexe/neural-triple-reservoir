@@ -114,6 +114,8 @@ def _runtime_identity() -> dict[str, object]:
         runtime["mlx_lm_path"] = inspect.getfile(mlx_lm)
     except Exception as exc:  # pragma: no cover - defensive
         runtime["mlx_lm_path_error"] = str(exc)
+    runtime["loaded_source_sha256"] = {name: hashlib.sha256((Path(__file__).parent / name).read_bytes()).hexdigest()
+        for name in ("coupled_astrid_server.py", "coupled_http_gateway.py", "generation_controls.py", "mlx_reservoir.py")}
     return runtime
 
 
@@ -1042,6 +1044,11 @@ class CoupledAstridServer:
         parts.append("<|im_start|>assistant\n")
         return "\n".join(parts)
 
+    @property
+    def vocab_size(self):
+        language = getattr(self.model, "language_model", self.model)
+        return language.args.vocab_size
+
     def generate_coupled(
         self,
         messages: list[dict],
@@ -1049,7 +1056,8 @@ class CoupledAstridServer:
         max_tokens: int = 512,
         handle_name: str = "astrid",
         aperture: float = 1.0,
-    ) -> str:
+        sampling=None,
+    ):
         """Run coupled generation with unified reservoir state.
 
         Before: pull full h1/h2/h3 from the reservoir service (the state
@@ -1060,7 +1068,7 @@ class CoupledAstridServer:
         dynamical imprint of what was said.
         """
         from mlx_lm.generate import generate_step, generation_stream
-        from mlx_lm.sample_utils import make_sampler
+        from generation_controls import GenerationResult, SamplingControls
         from mlx_reservoir import ReservoirLogitProcessor
 
         request_start = time.perf_counter()
@@ -1094,7 +1102,9 @@ class CoupledAstridServer:
         request_audit["request"] = request_info
         prompt_tokens = mx.array(self.tokenizer.encode(prompt_text))
 
-        sampler = make_sampler(temp=temperature)
+        sampling = sampling or SamplingControls(temperature=temperature)
+        sampler, extra_processors = sampling.build()
+        request_audit["generation_controls"] = sampling.receipt()
         processor = ReservoirLogitProcessor(
             coupling_strength=self.coupling_strength,
             sync_observer=lambda kind, elapsed: _record_host_sync(
@@ -1113,6 +1123,8 @@ class CoupledAstridServer:
         detokenizer.reset()
 
         ticks = 0
+        completion_tokens = filtered_tokens = terminal_tokens = 0
+        finish_reason = "length"
         last_r_input = None
         decode_start = time.monotonic()
         first_token_seconds = None
@@ -1121,14 +1133,18 @@ class CoupledAstridServer:
             prompt_tokens,
             self.model,
             max_tokens=max_tokens,
-            logits_processors=[processor],
+            logits_processors=[processor, *extra_processors],
             sampler=sampler,
         ):
             now = time.monotonic()
             token_id = _token_to_int(token)
+            completion_tokens += 1
             if token_id in self._stop_token_ids:
+                terminal_tokens += 1
+                finish_reason = "stop"
                 break
             if token_id in self._skip_token_ids:
+                filtered_tokens += 1
                 continue
             if first_token_seconds is None:
                 first_token_seconds = now - decode_start
@@ -1242,6 +1258,16 @@ class CoupledAstridServer:
         )
 
         generation = dict(request_audit.get("generation", {}) or {})
+        result = GenerationResult(text, finish_reason, len(prompt_tokens), completion_tokens,
+                                  filtered_tokens, terminal_tokens, len(detokenizer.text),
+                                  dict(sampling.receipt(), max_tokens=max_tokens, thinking=False,
+                                       reservoir_coupling_strength=coupling_used, aperture=processor.aperture,
+                                       wide_coupling_strength=self.wide_coupling_strength,
+                                       processor_order=["reservoir", "additional_repetition"],
+                                       runtime=self.runtime_audit))
+        generation.update(result.evidence())
+        generation.update(result.usage())
+        generation["finish_reason"] = finish_reason
         generation["generated_tokens"] = int(ticks)
         generation["first_token_s"] = first_token_seconds
         generation["steady_tok_s"] = steady_tok_s
@@ -1250,7 +1276,7 @@ class CoupledAstridServer:
         request_audit["generation"] = generation
         self._write_request_audit(request_audit)
 
-        return text
+        return result
 
 
 def main() -> int:

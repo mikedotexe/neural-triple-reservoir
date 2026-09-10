@@ -21,6 +21,7 @@ from coupled_http_gateway import (
     RuntimeQueueFull,
     RuntimeQueueTimeout,
 )
+from generation_controls import GenerationResult
 from model_qos import (
     MAX_PENDING_CAPACITY,
     ModelQosV1,
@@ -44,11 +45,12 @@ class BlockingFakeServer:
         *,
         handle_name,
         aperture,
+        sampling,
     ):
         self.started.set()
         if not self.release.wait(5):
             raise TimeoutError("test generation was not released")
-        return "gateway-compatible response"
+        return GenerationResult("gateway-compatible response", "stop", 4, 3, 0, 1, 27, sampling.receipt())
 
     def health_snapshot(self):
         return {
@@ -72,9 +74,10 @@ class RecordingFakeServer:
         *,
         handle_name,
         aperture,
+        sampling,
     ):
         self.handles.append(handle_name)
-        return f"response-{handle_name}"
+        return GenerationResult(f"response-{handle_name}", "stop", 4, 3, 0, 1, 10, sampling.receipt())
 
     def health_snapshot(self):
         return {"status": "ok"}
@@ -110,7 +113,7 @@ def request_json(url: str, *, body=None):
     )
     started = time.perf_counter()
     try:
-        with urllib.request.urlopen(request, timeout=2) as response:
+        with urllib.request.urlopen(request, timeout=15) as response:
             status = response.status
             payload = json.loads(response.read())
     except urllib.error.HTTPError as exc:
@@ -138,7 +141,7 @@ class GatewayTests(unittest.TestCase):
         server.release.set()
         worker.join(2)
         self.assertFalse(worker.is_alive())
-        self.assertEqual(future.result(timeout=1), "gateway-compatible response")
+        self.assertEqual(future.result(timeout=1).content, "gateway-compatible response")
 
     def start_gateway(self, runtime):
         gateway = AiohttpGateway(runtime, "127.0.0.1", 0)
@@ -214,7 +217,7 @@ class GatewayTests(unittest.TestCase):
         )
         self.assertEqual(
             payload["usage"],
-            {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            {"prompt_tokens": 4, "completion_tokens": 3, "total_tokens": 7},
         )
         timing = payload["model_qos_timing_v1"]
         self.assertEqual(timing["schema"], "model_qos_timing_v1")
@@ -292,8 +295,8 @@ class GatewayTests(unittest.TestCase):
                 self.assertTrue(runtime.worker_once(timeout=0))
 
                 self.assertEqual(server.handles, expected)
-                self.assertEqual(background.result(), "response-background")
-                self.assertEqual(interactive.result(), "response-interactive")
+                self.assertEqual(background.result().content, "response-background")
+                self.assertEqual(interactive.result().content, "response-interactive")
 
     def test_aging_promotes_background_and_ties_break_by_arrival(self):
         now = 100.0

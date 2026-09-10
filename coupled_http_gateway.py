@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import copy
 import asyncio
 import concurrent.futures
 import logging
 import threading
 import time
 from dataclasses import dataclass
+from generation_controls import (GenerationResult, SamplingControls, InvalidGenerationControls, validate_body, identity)
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -37,7 +39,8 @@ class GenerationServer(Protocol):
         *,
         handle_name: str,
         aperture: float,
-    ) -> str: ...
+        sampling: SamplingControls,
+    ) -> GenerationResult: ...
 
     def health_snapshot(self) -> dict[str, Any]: ...
 
@@ -54,6 +57,10 @@ class RuntimeQueueTimeout(RuntimeError):
     """Raised when a request exceeds its bounded pending-queue wait."""
 
 
+class ConflictingRetry(ValueError):
+    pass
+
+
 @dataclass(frozen=True)
 class GenerationRequest:
     messages: list[dict[str, Any]]
@@ -62,15 +69,21 @@ class GenerationRequest:
     handle_name: str
     aperture: float
     qos: ModelQosV1 | None = None
+    sampling: SamplingControls | None = None
+    model: str | None = None
+
+    def fingerprint(self):
+        return identity(dict(messages=self.messages, sampling=(self.sampling or SamplingControls(temperature=self.temperature)).receipt(), max_tokens=self.max_tokens, handle=self.handle_name, aperture=self.aperture, model=self.model))
 
 
 @dataclass
 class GenerationJob:
     request: GenerationRequest
-    future: concurrent.futures.Future[str]
+    future: concurrent.futures.Future[GenerationResult]
     arrival_sequence: int
     enqueued_monotonic: float
     qos: ModelQosV1 | None
+    fingerprint: str = ""
     waiter_count: int = 1
     selected_monotonic: float | None = None
     queue_wait_ms: int | None = None
@@ -140,7 +153,13 @@ class ModelRuntimeCoordinator:
             self._condition.notify_all()
         self._fail_pending(RuntimeNotReady("model server is stopping"))
 
-    def submit(self, request: GenerationRequest) -> concurrent.futures.Future[str]:
+    def submit(self, request: GenerationRequest) -> concurrent.futures.Future[GenerationResult]:
+        request = copy.deepcopy(request)
+        fingerprint = request.fingerprint()
+        sampling = request.sampling or SamplingControls(temperature=request.temperature)
+        vocab_size = getattr(self._server, "vocab_size", None)
+        if vocab_size is not None and sampling.top_k >= vocab_size:
+            raise InvalidGenerationControls(f"top_k must be smaller than model vocabulary ({vocab_size})")
         with self._condition:
             phase = self._phase
             if phase not in {"ready", "generating"}:
@@ -148,6 +167,8 @@ class ModelRuntimeCoordinator:
             key = None if request.qos is None else request.qos.idempotency_key
             if key is not None and key in self._inflight:
                 existing = self._inflight[key]
+                if existing.fingerprint != fingerprint:
+                    raise ConflictingRetry("idempotency key already in flight with different generation inputs")
                 existing.waiter_count += 1
                 self._append_receipt(
                     existing,
@@ -161,6 +182,7 @@ class ModelRuntimeCoordinator:
             self._arrival_sequence += 1
             job = GenerationJob(
                 request=request,
+                fingerprint=fingerprint,
                 future=concurrent.futures.Future(),
                 arrival_sequence=self._arrival_sequence,
                 enqueued_monotonic=time.monotonic(),
@@ -173,7 +195,7 @@ class ModelRuntimeCoordinator:
             self._condition.notify()
             return job.future
 
-    def release_waiter(self, future: concurrent.futures.Future[str]) -> None:
+    def release_waiter(self, future: concurrent.futures.Future[GenerationResult]) -> None:
         """Drop one disconnected HTTP waiter without preempting active work."""
         with self._condition:
             job = next(
@@ -267,6 +289,7 @@ class ModelRuntimeCoordinator:
                 request.max_tokens,
                 handle_name=request.handle_name,
                 aperture=request.aperture,
+                sampling=request.sampling or SamplingControls(temperature=request.temperature),
             )
         except BaseException as exc:  # propagate model failures to the request
             log.exception("generation failed")
@@ -439,6 +462,7 @@ async def _handle_chat(request, runtime: ModelRuntimeCoordinator):
         return web.json_response({"error": {"message": "invalid JSON"}}, status=400)
 
     try:
+        sampling = validate_body(body)
         qos = ModelQosV1.from_payload(body.get("model_qos_v1"))
         generation_request = GenerationRequest(
             messages=body.get("messages", []),
@@ -450,11 +474,17 @@ async def _handle_chat(request, runtime: ModelRuntimeCoordinator):
             ),
             aperture=body.get("aperture", body.get("wide_coupling_strength", 1.0)),
             qos=qos,
+            sampling=sampling,
+            model=body.get("model"),
         )
-    except InvalidModelQos as exc:
+    except (InvalidModelQos, InvalidGenerationControls) as exc:
         return web.json_response({"error": {"message": str(exc)}}, status=400)
     try:
         future = runtime.submit(generation_request)
+    except InvalidGenerationControls as exc:
+        return web.json_response({"error": {"message": str(exc)}}, status=400)
+    except ConflictingRetry as exc:
+        return web.json_response({"error": {"message": str(exc)}}, status=409)
     except RuntimeNotReady as exc:
         return web.json_response({"error": {"message": str(exc)}}, status=503)
     except RuntimeQueueFull as exc:
@@ -465,7 +495,7 @@ async def _handle_chat(request, runtime: ModelRuntimeCoordinator):
         )
 
     try:
-        text = await asyncio.shield(asyncio.wrap_future(future))
+        result = await asyncio.shield(asyncio.wrap_future(future))
     except asyncio.CancelledError:
         runtime.release_waiter(future)
         raise
@@ -483,11 +513,12 @@ async def _handle_chat(request, runtime: ModelRuntimeCoordinator):
         "choices": [
             {
                 "index": 0,
-                "message": {"role": "assistant", "content": text},
-                "finish_reason": "stop",
+                "message": {"role": "assistant", "content": result.content},
+                "finish_reason": result.finish_reason,
             }
         ],
-        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        "usage": result.usage(),
+        "coupled_generation_v1": result.evidence(),
     }
     timing = getattr(future, "_model_qos_timing_v1", None)
     if isinstance(timing, dict):
