@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 - Retain native finish and token counts in the coupled control receipt itself, including the pre-cleanup scope of detokenized pieces; reject oversized numeric inputs with a validation error.
+- Add isolated Gemma 4 hidden-vector observation and a frozen, resumable 32D feedback comparison with explicit resource guards, provenance, position alignment and offline-only authority. No activation instrumentation enters the live server.
 
 - Honor validated explicit MLX sampling and repetition controls, reject unsupported controls and conflicting in-flight retry keys, and return native stop/length with yielded-token usage and applied controls. Omitted defaults and reservoir feedback timing remain unchanged.
 
