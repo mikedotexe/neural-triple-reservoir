@@ -1083,6 +1083,22 @@ class ReservoirService:
             except Exception as e:
                 log.error("snapshot_all failed for '%s': %s", name, e)
 
+    async def snapshot_all_cooperative(self):
+        """Autosnapshot batch with scheduling points between captured handles.
+
+        Each handle still uses the synchronous writer on the event-loop thread.
+        One slow handle can still block; the batch is not an atomic cross-handle
+        snapshot because other tasks may run between handles.
+        """
+        names = list(self.handles)
+        for index, name in enumerate(names):
+            try:
+                self.snapshot_handle(name)
+            except Exception as e:
+                log.error("snapshot_all failed for '%s': %s", name, e)
+            if index + 1 < len(names):
+                await asyncio.sleep(0)
+
     def restore_all(self):
         """Restore all handles from saved snapshots."""
         names = self.persistence.list_snapshots()
@@ -1421,7 +1437,7 @@ class ReservoirService:
             except asyncio.TimeoutError:
                 pass
             if self.handles:
-                self.snapshot_all()
+                await self.snapshot_all_cooperative()
 
     # ------------------------------------------------------------------
     # Main

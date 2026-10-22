@@ -2,31 +2,25 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<key>KeepAlive</key>
+	<true/>
 	<key>Label</key>
 	<string>com.reservoir.coupled-astrid</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>/Users/v/other/neural-triple-reservoir/.venv/bin/python</string>
-		<string>/Users/v/other/neural-triple-reservoir/coupled_astrid_server.py</string>
-		<string>--port</string>
-		<string>8090</string>
-		<string>--coupling-strength</string>
-		<string>0.1</string>
-		<string>--model-memory-map</string>
-		<string>--model</string>
-		<string>mlx-community/gemma-4-12B-it-5bit</string>
-		<string>--model-qos-mode</string>
-		<string>active</string>
+		<string>/opt/homebrew/Cellar/python@3.14/3.14.3_1/Frameworks/Python.framework/Versions/3.14/bin/python3.14</string>
+		<string>/Users/v/other/astrid/scripts/model_environment.py</string>
+		<string>launch</string>
+		<string>--control-root</string>
+		<string>/Users/v/other/astrid/.runtime/model-environment</string>
 	</array>
-	<key>WorkingDirectory</key>
-	<string>/Users/v/other/neural-triple-reservoir</string>
-	<key>KeepAlive</key>
-	<true/>
 	<key>RunAtLoad</key>
 	<true/>
-	<key>StandardOutPath</key>
-	<string>/Users/v/other/neural-triple-reservoir/logs/coupled-astrid.log</string>
 	<key>StandardErrorPath</key>
 	<string>/Users/v/other/neural-triple-reservoir/logs/coupled-astrid.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/v/other/neural-triple-reservoir/logs/coupled-astrid.log</string>
+	<key>WorkingDirectory</key>
+	<string>/Users/v/other/neural-triple-reservoir</string>
 </dict>
 </plist>

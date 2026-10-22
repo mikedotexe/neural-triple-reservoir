@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Integrate the already-live cooperative periodic autosnapshot batch and model-environment launcher from the completed MLX maintenance. Yield only between captured handles; retain synchronous per-handle writes and synchronous shutdown snapshots, without claiming an atomic cross-handle view. The machine-local LaunchAgent selects the reviewed Astrid manifest launcher rather than the former direct provider command. Exact source hashes match production42 maintenance and the installed LaunchAgent; no restart, state restoration, model/capacity change or maintenance replay is performed for this Git integration. Model-free regression coverage is in `test_cooperative_autosnapshot.py`; coordinated evidence and limitations are recorded in `/Users/v/other/astrid/docs/steward-notes/2026-10-22-mlx-perception-integration.md`.
+
 - Distinguish model EOS, inherited channel-boundary stops and output exhaustion in completion evidence. Preserve existing stop tokens and thinking policy; the legacy terminal-token count is explicitly scoped to server-selected stop tokens.
 
 - Preserve a missing contextual prerequisite as an unavailable shuffled-replay cell, including admission failures with no model result. Never rerun the failed source cell or change frozen generation inputs.
